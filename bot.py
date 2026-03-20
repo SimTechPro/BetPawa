@@ -9260,6 +9260,7 @@ async def _run_auto_post(bot, bot_data: dict):
         sections      = []
         round_ids     = []
         matchday_nums = []
+        _had_events   = False  # tracks if any league had new events to evaluate
 
         for lid in LEAGUES:
             try:
@@ -9274,8 +9275,7 @@ async def _run_auto_post(bot, bot_data: dict):
                 if not events or not round_id:
                     continue
 
-                # Skip if this league+round was already sent — prevents resending
-                # when other leagues advance to new rounds
+                # Skip if this league+round was already sent
                 _sent_map_check = bot_data.get("auto_sent_per_league", {})
                 if _sent_map_check.get(str(lid)) == str(round_id):
                     round_ids.append(f"{lid}:{round_id}")
@@ -9285,9 +9285,10 @@ async def _run_auto_post(bot, bot_data: dict):
                 round_ids.append(f"{lid}:{round_id}")
                 matchday_nums.append(str(round_name))
                 agreed = total = 0
-                body        = ""
-                match_cards = []   # one card string per qualifying match
-                round_preds = []   # store for self-learning
+                body           = ""
+                match_cards    = []
+                round_preds    = []
+                _had_events    = True  # this league had events to evaluate
 
                 # Get learned model for this league
                 league_model = _get_model(bot_data, lid)
@@ -9611,7 +9612,30 @@ async def _run_auto_post(bot, bot_data: dict):
                 log.warning(f"auto_post lid={lid}: {exc}\n{traceback.format_exc()}")
 
     if not sections:
-        log.info("auto_post: no qualifying picks yet, skipping send")
+        if not _had_events:
+            # All leagues were already sent this round — silent, nothing to do
+            return
+        # Events existed but none passed the filters — send one skip notice
+        # only if this round hasn't been skip-notified already
+        _skip_key = f"auto_skip_notified_{tuple(sorted(round_ids))}"
+        if not bot_data.get(_skip_key):
+            bot_data[_skip_key] = True
+            _skip_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
+            _skip_md = Counter(matchday_nums).most_common(1)[0][0] if matchday_nums else "?"
+            _skip_msg = (f"🤖 *MD{_skip_md}*  |  _{_skip_ts}_\n"
+                         f"⏭️ No picks this round — no matches passed all filters")
+            acc_s = _access(bot_data)
+            _st_s = set()
+            if ADMIN_ID: _st_s.add(str(ADMIN_ID))
+            if CHANNEL_ID: _st_s.add(CHANNEL_ID)
+            _st_s.update(acc_s.get("allowed_channels", set()))
+            for _chat_s in _st_s:
+                try:
+                    await bot.send_message(chat_id=_chat_s, text=_skip_msg,
+                                           parse_mode="Markdown")
+                except Exception:
+                    pass
+        log.info("auto_post: no qualifying picks — skip notice sent")
         return
 
     # One string per league for change detection
@@ -9752,34 +9776,64 @@ async def _run_auto_post(bot, bot_data: dict):
 async def _standings_job(context):
     """
     Dedicated standings refresh job — runs every 5 minutes independently.
-    Kept separate from auto_post so it never blocks button responses or predictions.
+    Computes standings from fp_db match_log (self-calculated, no API needed).
+    Falls back to API only if fp_db has no data yet.
     """
     bot_data = context.bot_data
-    now_ts   = time.time()
-    async with httpx.AsyncClient() as client:
-        for lid in LEAGUES:
-            _model_rds = (bot_data.get(f"model_{lid}") or {}).get("rounds_learned", 0)
-            _std_rds   = bot_data.get(f"standings_rounds_{lid}", 0)
-            _last_fail = bot_data.get(f"standings_fail_ts_{lid}", 0)
-            # 10 min cooldown after failure
-            if now_ts - _last_fail < 600:
-                continue
-            _needs = (not bot_data.get(f"standings_{lid}") or
-                      _model_rds - _std_rds >= 30)
-            if not _needs:
-                continue
-            try:
-                _sn, _rn, _rows = await fetch_standings(client, lid)
-                if _rows:
-                    bot_data[f"standings_{lid}"]        = {r["name"]: r for r in _rows}
-                    bot_data[f"standings_rounds_{lid}"] = _model_rds
-                    bot_data.pop(f"standings_fail_ts_{lid}", None)
-                    log.info(f"📊 Standings refreshed [{lid}]: {len(_rows)} teams")
-                else:
-                    bot_data[f"standings_fail_ts_{lid}"] = now_ts
-            except Exception as _e:
-                bot_data[f"standings_fail_ts_{lid}"] = now_ts
-                log.debug(f"standings_job [{lid}]: {_e}")
+
+    for lid in LEAGUES:
+        _model_rds = (bot_data.get(f"model_{lid}") or {}).get("rounds_learned", 0)
+        _std_rds   = bot_data.get(f"standings_rounds_{lid}", 0)
+        _needs = (not bot_data.get(f"standings_{lid}") or
+                  _model_rds - _std_rds >= 10)
+        if not _needs:
+            continue
+
+        try:
+            league_model = _get_model(bot_data, lid)
+            fp_db        = league_model.get("fingerprint_db", {})
+            _ml          = league_model.get("match_log", [])
+
+            # Filter to this league's teams only
+            league_codes = LEAGUE_TEAMS.get(lid, set())
+            if league_codes:
+                fp_db = {
+                    fk: recs for fk, recs in fp_db.items()
+                    if all(p in league_codes for p in fk.split("|"))
+                }
+
+            # Compute standings from stored match data
+            computed = _compute_standings_from_fp_db(fp_db, match_log=_ml)
+            rows = list(computed.values()) if computed else []
+
+            # Fallback: use stats if fp_db empty
+            if not rows:
+                stats = bot_data.get(f"stats_{lid}", {})
+                if stats:
+                    _lcodes = LEAGUE_TEAMS.get(lid, set())
+                    rows = []
+                    for i, (name, st) in enumerate(
+                        sorted(
+                            ((n, s) for n, s in stats.items()
+                             if not _lcodes or n.upper() in _lcodes),
+                            key=lambda x: (-(x[1]["w"]*3 + x[1]["d"]),
+                                           -(x[1]["gf"] - x[1]["ga"]))
+                        ), 1
+                    ):
+                        rows.append(dict(pos=i, name=name,
+                                         pts=st["w"]*3+st["d"],
+                                         w=st["w"], d=st["d"],
+                                         l=st.get("l",0),
+                                         gf=st["gf"], ga=st["ga"],
+                                         form=[]))
+
+            if rows:
+                bot_data[f"standings_{lid}"]        = {r["name"]: r for r in rows}
+                bot_data[f"standings_rounds_{lid}"] = _model_rds
+                log.info(f"📊 Standings computed [{lid}]: {len(rows)} teams "
+                         f"(from {'fp_db' if computed else 'stats'})")
+        except Exception as _e:
+            log.debug(f"standings_job [{lid}]: {_e}")
 
 
 async def _auto_send_job(context):
