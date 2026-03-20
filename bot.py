@@ -9292,6 +9292,14 @@ async def _run_auto_post(bot, bot_data: dict):
                 if not events or not round_id:
                     continue
 
+                # Skip if this league+round was already sent — prevents resending
+                # when other leagues advance to new rounds
+                _sent_map_check = bot_data.get("auto_sent_per_league", {})
+                if _sent_map_check.get(str(lid)) == str(round_id):
+                    round_ids.append(f"{lid}:{round_id}")
+                    matchday_nums.append(str(round_name))
+                    continue
+
                 round_ids.append(f"{lid}:{round_id}")
                 matchday_nums.append(str(round_name))
                 agreed = total = 0
@@ -9424,6 +9432,11 @@ async def _run_auto_post(bot, bot_data: dict):
                                 _loser_trend == "FALLING" and _loser_mom <= 33):
                             _valid = True
                         if not _valid:
+                            continue
+                    else:
+                        # No momentum data yet — only allow if history strongly confirms
+                        # (3+ meetings with winner leading clearly)
+                        if _fc_n_g < 3 or _winner_hist <= _loser_hist:
                             continue
 
                     # ── GATE 3: S-W tier check (last, only when standings exist) ──
