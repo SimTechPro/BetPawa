@@ -2017,6 +2017,363 @@ def _is_strong_vs_weak(home: str, away: str, standings: dict,
     return (home_tier, away_tier) in valid_pairs
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── STRATEGY ENGINE ────────────────────────────────────────────────────────────
+# Implements the user's betting strategy:
+#   Strong team that LOST last game → expected to recover → tip WIN
+#   Weak team that WON last game    → expected to lose next → tip OPPONENT WIN
+#
+# Each prediction is cross-confirmed with historical learnt data.
+# Only shown when strategy direction matches history direction.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _strategy_get_last_game(team: str, model: dict) -> dict | None:
+    """Get the most recent completed game for a team from match_log."""
+    tl = team.lower()
+    ml = model.get("match_log", [])
+    games = []
+    for entry in ml:
+        eh = (entry.get("home") or "").lower()
+        ea = (entry.get("away") or "").lower()
+        sh = entry.get("score_h")
+        sa = entry.get("score_a")
+        if sh is None or sa is None:
+            continue
+        if tl in eh or eh.startswith(tl[:3]):
+            games.append({
+                "gf": sh, "ga": sa, "role": "HOME",
+                "opponent": entry.get("away", ""),
+                "opp_pos": None,
+                "round_id": entry.get("round_id", 0),
+            })
+        elif tl in ea or ea.startswith(tl[:3]):
+            games.append({
+                "gf": sa, "ga": sh, "role": "AWAY",
+                "opponent": entry.get("home", ""),
+                "opp_pos": None,
+                "round_id": entry.get("round_id", 0),
+            })
+    if not games:
+        return None
+    games.sort(key=lambda g: g["round_id"])
+    g = games[-1]
+    if g["gf"] > g["ga"]:   g["result"] = "WIN"
+    elif g["gf"] == g["ga"]: g["result"] = "DRAW"
+    else:                    g["result"] = "LOSS"
+    return g
+
+
+def _strategy_analyze_match(home: str, away: str,
+                              standings: dict, model: dict,
+                              hist_home_win_pct: float,
+                              hist_away_win_pct: float,
+                              hist_draw_pct: float,
+                              hist_n: int,
+                              hist_btts_pct: float,
+                              ) -> dict | None:
+    """
+    Apply the user's strategy to a match.
+
+    Returns a dict with:
+      strategy_tip:   "HOME" | "AWAY" | "SKIP" | None
+      market:         "1X2" | "DC" | "BTTS" | "SKIP"
+      strategy_pct:   float 0-100
+      history_pct:    float 0-100
+      history_agrees: bool
+      reason:         str explanation
+      card_line:      str formatted card line
+
+    Returns None if match doesn't qualify for strategy filter.
+    """
+    if not standings or not model:
+        return None
+
+    tier_map   = _get_all_tiers(standings)
+    home_tier  = _find_tier(home, tier_map)
+    away_tier  = _find_tier(away, tier_map)
+    home_pos   = (standings.get(home) or {}).get("pos", 99)
+    away_pos   = (standings.get(away) or {}).get("pos", 99)
+
+    # Must involve at least one strong (1-5) or weak (16+) team
+    if home_tier not in ("STRONG","WEAK") and away_tier not in ("STRONG","WEAK"):
+        return None
+
+    home_last = _strategy_get_last_game(home, model)
+    away_last = _strategy_get_last_game(away, model)
+
+    if not home_last or not away_last:
+        return None
+
+    # Skip draws — no direction
+    if home_last["result"] == "DRAW" or away_last["result"] == "DRAW":
+        return None
+
+    home_lost = home_last["result"] == "LOSS"
+    home_won  = home_last["result"] == "WIN"
+    away_lost = away_last["result"] == "LOSS"
+    away_won  = away_last["result"] == "WIN"
+
+    # ── Get opponent positions from standings ─────────────────────────────────
+    def _opp_pos(opp_name: str) -> int:
+        for k, v in standings.items():
+            if k.lower() == opp_name.lower() or k.lower().startswith(opp_name.lower()[:3]):
+                return v.get("pos", 99)
+        return 99
+
+    home_last_opp_pos = _opp_pos(home_last.get("opponent",""))
+    away_last_opp_pos = _opp_pos(away_last.get("opponent",""))
+
+    # ── Strategy rules ────────────────────────────────────────────────────────
+    strategy_tip = None
+    market       = "1X2"
+    strategy_pct = 0.0
+    reason       = ""
+
+    # STRONG team LOST → expect recovery
+    if home_tier == "STRONG" and home_lost:
+        if away_tier in ("WEAK", "MODERATE"):
+            # Strong lost, plays weak/moderate → strong WIN
+            # Check if same strength range
+            if away_tier == "STRONG":
+                market = "DC"; strategy_tip = "HOME"
+                strategy_pct = 70.0
+                reason = f"{home} pos{home_pos} STRONG lost, plays same-range {away} pos{away_pos}"
+            else:
+                strategy_tip = "HOME"
+                # Goals context: how many goals in last game
+                gap = abs(home_pos - away_pos)
+                if home_last["gf"] == 0:
+                    strategy_pct = 62.0  # scored nothing — slightly less confident
+                else:
+                    strategy_pct = 72.0
+                if away_tier == "WEAK" and gap >= 10:
+                    strategy_pct = min(strategy_pct + 8, 88.0)
+                reason = (f"{home} pos{home_pos} STRONG lost {home_last['gf']}-{home_last['ga']} "
+                          f"vs pos{home_last_opp_pos}, plays {away} pos{away_pos} {away_tier}")
+
+    elif away_tier == "STRONG" and away_lost:
+        if home_tier in ("WEAK", "MODERATE"):
+            strategy_tip = "AWAY"
+            gap = abs(away_pos - home_pos)
+            if away_last["gf"] == 0:
+                strategy_pct = 62.0
+            else:
+                strategy_pct = 72.0
+            if home_tier == "WEAK" and gap >= 10:
+                strategy_pct = min(strategy_pct + 8, 88.0)
+            reason = (f"{away} pos{away_pos} STRONG lost {away_last['gf']}-{away_last['ga']} "
+                      f"vs pos{away_last_opp_pos}, plays {home} pos{home_pos} {home_tier}")
+
+    # WEAK team WON → check if opponent confirms it will lose
+    elif home_tier == "WEAK" and home_won:
+        if away_tier == "STRONG" and away_lost:
+            # Weak won, strong also lost → strong recovers → AWAY WIN
+            strategy_tip = "AWAY"
+            strategy_pct = 68.0
+            reason = (f"{home} pos{home_pos} WEAK won vs pos{home_last_opp_pos}, "
+                      f"{away} pos{away_pos} STRONG lost — strong recovers")
+        elif away_tier == "STRONG" and away_won:
+            # Weak won, strong also won → strong confirmed → AWAY WIN straight
+            strategy_tip = "AWAY"
+            strategy_pct = 75.0
+            reason = (f"{home} pos{home_pos} WEAK won vs pos{home_last_opp_pos}, "
+                      f"{away} pos{away_pos} STRONG won — strong dominant")
+        elif away_tier in ("MODERATE","WEAK"):
+            # Both weak/moderate range → X2 or skip
+            if abs(home_pos - away_pos) <= 2:
+                return {"strategy_tip": "SKIP", "market": "SKIP",
+                        "strategy_pct": 0, "history_pct": 0,
+                        "history_agrees": False,
+                        "reason": "Neighboring weak positions — too close",
+                        "card_line": ""}
+            strategy_tip = "AWAY"
+            market = "DC"
+            strategy_pct = 60.0
+            reason = f"Weak {home} pos{home_pos} won, plays {away} pos{away_pos} — same range"
+
+    elif away_tier == "WEAK" and away_won:
+        if home_tier == "STRONG" and home_lost:
+            strategy_tip = "HOME"
+            strategy_pct = 68.0
+            reason = (f"{away} pos{away_pos} WEAK won vs pos{away_last_opp_pos}, "
+                      f"{home} pos{home_pos} STRONG lost — strong recovers")
+        elif home_tier == "STRONG" and home_won:
+            strategy_tip = "HOME"
+            strategy_pct = 75.0
+            reason = (f"{away} pos{away_pos} WEAK won, "
+                      f"{home} pos{home_pos} STRONG won — strong dominant")
+        elif home_tier in ("MODERATE","WEAK"):
+            if abs(home_pos - away_pos) <= 2:
+                return {"strategy_tip": "SKIP", "market": "SKIP",
+                        "strategy_pct": 0, "history_pct": 0,
+                        "history_agrees": False,
+                        "reason": "Neighboring weak positions — too close",
+                        "card_line": ""}
+            strategy_tip = "HOME"
+            market = "DC"
+            strategy_pct = 60.0
+            reason = f"Weak {away} pos{away_pos} won, plays {home} pos{home_pos} — same range"
+
+    # BTTS check — when both teams showed goals in last game
+    # and game context suggests both will score
+    if strategy_tip in ("HOME","AWAY"):
+        winner     = home if strategy_tip=="HOME" else away
+        loser      = away if strategy_tip=="HOME" else home
+        winner_last = home_last if strategy_tip=="HOME" else away_last
+        loser_last  = away_last if strategy_tip=="HOME" else home_last
+
+        # Both teams scored in last game + same strong range = BTTS
+        if (winner_last["gf"] >= 1 and loser_last["gf"] >= 1 and
+                home_tier == away_tier == "STRONG"):
+            market = "BTTS"
+            strategy_pct = max(strategy_pct - 5, 55.0)
+            reason += " — both scored last game"
+
+        # Weak team won with 3+ goals against strong → BTTS with strong opponent
+        if (home_tier == "WEAK" and home_won and home_last["gf"] >= 3 and
+                home_last_opp_pos <= 5):
+            market = "BTTS"
+            strategy_pct = 65.0
+            reason += f" — weak team scored {home_last['gf']} vs strong"
+        elif (away_tier == "WEAK" and away_won and away_last["gf"] >= 3 and
+                away_last_opp_pos <= 5):
+            market = "BTTS"
+            strategy_pct = 65.0
+            reason += f" — weak team scored {away_last['gf']} vs strong"
+
+    if not strategy_tip or strategy_tip == "SKIP":
+        return None
+
+    # ── Cross-confirm with history ────────────────────────────────────────────
+    history_pct = 0.0
+    history_agrees = False
+
+    if strategy_tip == "HOME":
+        history_pct = hist_home_win_pct
+        history_agrees = hist_home_win_pct > hist_away_win_pct and hist_home_win_pct > hist_draw_pct
+    elif strategy_tip == "AWAY":
+        history_pct = hist_away_win_pct
+        history_agrees = hist_away_win_pct > hist_home_win_pct and hist_away_win_pct > hist_draw_pct
+
+    if market == "BTTS":
+        history_pct = hist_btts_pct
+        history_agrees = hist_btts_pct >= 50.0
+    elif market == "DC":
+        if strategy_tip == "HOME":
+            history_pct = hist_home_win_pct + hist_draw_pct
+        else:
+            history_pct = hist_away_win_pct + hist_draw_pct
+        history_agrees = history_pct >= 50.0
+
+    # Only show if history agrees
+    if not history_agrees:
+        return {
+            "strategy_tip": strategy_tip,
+            "market": market,
+            "strategy_pct": round(strategy_pct, 1),
+            "history_pct": round(history_pct, 1),
+            "history_agrees": False,
+            "reason": reason,
+            "card_line": "",
+        }
+
+    # ── Format card line ──────────────────────────────────────────────────────
+    mkt_label = {
+        "1X2": f"{'1' if strategy_tip=='HOME' else '2'}",
+        "DC":  f"{'1X' if strategy_tip=='HOME' else 'X2'}",
+        "BTTS": "Yes",
+    }.get(market, "?")
+
+    card_line = (
+        f"┆ 🎯 *Strategy*: ({market}) {mkt_label} "
+        f"· {strategy_pct:.0f}% + {history_pct:.0f}%\n"
+    )
+
+    return {
+        "strategy_tip":   strategy_tip,
+        "market":         market,
+        "mkt_label":      mkt_label,
+        "strategy_pct":   round(strategy_pct, 1),
+        "history_pct":    round(history_pct, 1),
+        "history_agrees": True,
+        "reason":         reason,
+        "card_line":      card_line,
+        "home_last":      home_last,
+        "away_last":      away_last,
+        "home_pos":       home_pos,
+        "away_pos":       away_pos,
+        "home_tier":      home_tier,
+        "away_tier":      away_tier,
+    }
+
+
+def _strategy_brain_summary(bot_data: dict) -> str:
+    """
+    Generate strategy performance summary for Brain Status report.
+    Tracks strategy predictions vs actual results.
+    """
+    stats = bot_data.get("strategy_stats", {})
+    if not stats:
+        return "📋 *Strategy Stats*: No data yet\n"
+
+    total    = stats.get("total", 0)
+    correct  = stats.get("correct", 0)
+    skipped  = stats.get("skipped", 0)
+    btts_tot = stats.get("btts_total", 0)
+    btts_cor = stats.get("btts_correct", 0)
+    dc_tot   = stats.get("dc_total", 0)
+    dc_cor   = stats.get("dc_correct", 0)
+    win_tot  = stats.get("win_total", 0)
+    win_cor  = stats.get("win_correct", 0)
+
+    acc     = round(correct/total*100) if total else 0
+    b_acc   = round(btts_cor/btts_tot*100) if btts_tot else 0
+    dc_acc  = round(dc_cor/dc_tot*100) if dc_tot else 0
+    win_acc = round(win_cor/win_tot*100) if win_tot else 0
+
+    lines = [
+        f"📋 *Strategy Performance*",
+        f"   Overall: {correct}/{total} = {acc}%",
+        f"   1X2 WIN: {win_cor}/{win_tot} = {win_acc}%",
+        f"   DC:      {dc_cor}/{dc_tot} = {dc_acc}%",
+        f"   BTTS:    {btts_cor}/{btts_tot} = {b_acc}%",
+        f"   Skipped (no history agree): {skipped}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _strategy_update_stats(bot_data: dict, market: str,
+                             strategy_tip: str, actual: str):
+    """Update strategy stats after result is known."""
+    stats = bot_data.setdefault("strategy_stats", {
+        "total":0,"correct":0,"skipped":0,
+        "btts_total":0,"btts_correct":0,
+        "dc_total":0,"dc_correct":0,
+        "win_total":0,"win_correct":0,
+    })
+    stats["total"] = stats.get("total",0) + 1
+
+    if market == "1X2":
+        stats["win_total"] = stats.get("win_total",0) + 1
+        if strategy_tip == actual:
+            stats["correct"]   = stats.get("correct",0) + 1
+            stats["win_correct"] = stats.get("win_correct",0) + 1
+
+    elif market == "DC":
+        stats["dc_total"] = stats.get("dc_total",0) + 1
+        # DC: HOME = 1X, AWAY = X2
+        dc_ok = (strategy_tip=="HOME" and actual in ("HOME","DRAW")) or \
+                (strategy_tip=="AWAY" and actual in ("AWAY","DRAW"))
+        if dc_ok:
+            stats["correct"]  = stats.get("correct",0) + 1
+            stats["dc_correct"] = stats.get("dc_correct",0) + 1
+
+    elif market == "BTTS":
+        stats["btts_total"] = stats.get("btts_total",0) + 1
+        if actual == "BTTS_YES":
+            stats["correct"]     = stats.get("correct",0) + 1
+            stats["btts_correct"] = stats.get("btts_correct",0) + 1
+
 
 def _standings_signal(home: str, away: str,
                        standings: dict) -> tuple[float, float, float, float]:
@@ -7339,6 +7696,17 @@ def _learn_from_round(bot_data: dict, league_id: int,
                 # Also track per-actual-outcome distribution (how often each result occurs)
                 _hdist = model.setdefault("htft_dist", {})
                 _hdist[_htft_actual] = _hdist.get(_htft_actual, 0) + 1
+
+            # ── Strategy stats learning ───────────────────────────────────────
+            _strat_tip = pred.get("strategy_tip")
+            _strat_mkt = pred.get("strategy_market")
+            if _strat_tip and _strat_mkt:
+                # Determine actual outcome
+                _actual_out = ft_out  # "HOME" / "AWAY" / "DRAW"
+                # For BTTS: check if both teams scored
+                _btts_actual = "BTTS_YES" if (ah > 0 and aa > 0) else "BTTS_NO"
+                _learn_actual = _btts_actual if _strat_mkt == "BTTS" else _actual_out
+                _strategy_update_stats(bot_data, _strat_mkt, _strat_tip, _learn_actual)
             ota = model.setdefault("outcome_type_acc", {
                 "HOME": {"correct":0,"total":0},
                 "DRAW": {"correct":0,"total":0},
@@ -9559,6 +9927,27 @@ async def _run_auto_post(bot, bot_data: dict):
                             f"┆ {m['away']} → {_ati} {_awp:.0f}% wins\n"
                         )
 
+                    # ── Strategy analysis ─────────────────────────────────────
+                    _strategy_line = ""
+                    _strategy_result = _strategy_analyze_match(
+                        home         = m["home"],
+                        away         = m["away"],
+                        standings    = _standings_now,
+                        model        = league_model,
+                        hist_home_win_pct = _fc.get("home_win_pct", 0) if _fc_n >= 3 else 0,
+                        hist_away_win_pct = _fc.get("away_win_pct", 0) if _fc_n >= 3 else 0,
+                        hist_draw_pct     = _fc.get("draw_pct", 0)     if _fc_n >= 3 else 0,
+                        hist_n            = _fc_n,
+                        hist_btts_pct     = _rate("btts_result") or 0,
+                    )
+                    if _strategy_result and _strategy_result.get("history_agrees"):
+                        _strategy_line = _strategy_result.get("card_line", "")
+                        # Store for learning
+                        round_preds[-1]["strategy_tip"]    = _strategy_result.get("strategy_tip")
+                        round_preds[-1]["strategy_market"] = _strategy_result.get("market")
+                        round_preds[-1]["strategy_pct"]    = _strategy_result.get("strategy_pct")
+                        round_preds[-1]["history_pct"]     = _strategy_result.get("history_pct")
+
                     # ── Final card ────────────────────────────────────────────
                     card = (
                         f"*{m['home']}  v  {m['away']}*\n"
@@ -9567,6 +9956,7 @@ async def _run_auto_post(bot, bot_data: dict):
                         + market_lines
                         + _fc_line
                         + _mom_line
+                        + _strategy_line
                         + f"{result_str}\n"
                     )
                     body += card + "─────────────────\n"
@@ -10703,11 +11093,16 @@ async def _do_brainstat(message, c):
     overall_pct = total_correct / total_preds if total_preds > 0 else 0.0
     icon        = _status_icon(sum(league_scores) / active if active else 0)
 
+    # Strategy performance summary
+    _strat_summary = _strategy_brain_summary(_bd)
+
     header = (
         f"🧠 *Brain Training Report*\n"
         f"{'━'*26}\n"
         f"{icon} *Overall: {total_correct}/{total_preds} correct ({overall_pct:.1%})*\n"
         f"📚 {active}/{len(LEAGUES)} leagues active\n"
+        f"{'━'*26}\n\n"
+        f"{_strat_summary}"
         f"{'━'*26}\n\n"
     )
 
@@ -10855,6 +11250,7 @@ async def _do_backup_inner(message, c):
         "auto_chats":          chats,
         "allowed_channels":    channels,
         "pending_predictions": bd.get("pending_predictions", {}),
+        "strategy_stats":      bd.get("strategy_stats", {}),
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -11125,6 +11521,11 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
             for preds in rounds.values()
         )
         log.info(f"✅ Restored {total_pending} pending predictions from backup")
+
+    # Restore strategy stats
+    if "strategy_stats" in data and data["strategy_stats"]:
+        bot_data["strategy_stats"] = data["strategy_stats"]
+        log.info(f"✅ Restored strategy_stats from backup")
 
     models = data.get("models", {})
     users  = data.get("users", {})
