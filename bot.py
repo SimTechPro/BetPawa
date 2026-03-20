@@ -9261,24 +9261,6 @@ async def _run_auto_post(bot, bot_data: dict):
         round_ids     = []
         matchday_nums = []
 
-        # Auto-fetch standings for any league that doesn't have them cached yet.
-        # Also refresh if standings are stale (model has learned 30+ new rounds since last fetch).
-        # Standings are required for the S-W gate — without them no predictions show.
-        for lid in LEAGUES:
-            _model_rds  = (bot_data.get(f"model_{lid}") or {}).get("rounds_learned", 0)
-            _std_rds    = bot_data.get(f"standings_rounds_{lid}", 0)
-            _needs_std  = (not bot_data.get(f"standings_{lid}") or
-                           _model_rds - _std_rds >= 30)
-            if _needs_std:
-                try:
-                    _sn, _rn, _std_rows = await fetch_standings(client, lid)
-                    if _std_rows:
-                        bot_data[f"standings_{lid}"]        = {r["name"]: r for r in _std_rows}
-                        bot_data[f"standings_rounds_{lid}"] = _model_rds
-                        log.info(f"📊 Standings refreshed for {lid}: {len(_std_rows)} teams")
-                except Exception as _se:
-                    log.debug(f"auto_post: standings fetch failed for {lid}: {_se}")
-
         for lid in LEAGUES:
             try:
                 # Only use already-cached stats — skip if not loaded yet
@@ -9765,6 +9747,39 @@ async def _run_auto_post(bot, bot_data: dict):
             log.info(f"✏️  Match cards updated with scores → {chat}")
         bot_data["auto_last_body"] = body_text
         bot_data["auto_last_body"] = body_text
+
+
+async def _standings_job(context):
+    """
+    Dedicated standings refresh job — runs every 5 minutes independently.
+    Kept separate from auto_post so it never blocks button responses or predictions.
+    """
+    bot_data = context.bot_data
+    now_ts   = time.time()
+    async with httpx.AsyncClient() as client:
+        for lid in LEAGUES:
+            _model_rds = (bot_data.get(f"model_{lid}") or {}).get("rounds_learned", 0)
+            _std_rds   = bot_data.get(f"standings_rounds_{lid}", 0)
+            _last_fail = bot_data.get(f"standings_fail_ts_{lid}", 0)
+            # 10 min cooldown after failure
+            if now_ts - _last_fail < 600:
+                continue
+            _needs = (not bot_data.get(f"standings_{lid}") or
+                      _model_rds - _std_rds >= 30)
+            if not _needs:
+                continue
+            try:
+                _sn, _rn, _rows = await fetch_standings(client, lid)
+                if _rows:
+                    bot_data[f"standings_{lid}"]        = {r["name"]: r for r in _rows}
+                    bot_data[f"standings_rounds_{lid}"] = _model_rds
+                    bot_data.pop(f"standings_fail_ts_{lid}", None)
+                    log.info(f"📊 Standings refreshed [{lid}]: {len(_rows)} teams")
+                else:
+                    bot_data[f"standings_fail_ts_{lid}"] = now_ts
+            except Exception as _e:
+                bot_data[f"standings_fail_ts_{lid}"] = now_ts
+                log.debug(f"standings_job [{lid}]: {_e}")
 
 
 async def _auto_send_job(context):
@@ -11770,6 +11785,9 @@ def main():
     # ── Data collector — saves every match/odds/result, runs every 4 min ───────
     # Completely independent of the display engine. No filtering. Every match saved.
     app.job_queue.run_repeating(_data_collector_job, interval=240, first=300)  # 5min delay — gives time to restore brain before backfill runs
+
+    # ── Standings refresh job — runs every 5 minutes independently ──────────────
+    app.job_queue.run_repeating(_standings_job, interval=300, first=60)
 
     # ── Self-learning job — checks for new results every 6 min ─────────────────
     app.job_queue.run_repeating(_learning_job, interval=360, first=90)
