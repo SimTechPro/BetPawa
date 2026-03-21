@@ -3207,25 +3207,337 @@ def _fp_similarity(fp_key: tuple, query_key: tuple) -> float:
 
 
 def _detect_odds_repeat(fp_db: dict, home: str, away: str,
-                         current_odds: dict) -> dict:
+                         current_odds: dict,
+                         league_id: int = 0,
+                         bot_data: dict = None) -> dict:
     """
     Triple cross-check odds repeat detection.
+    STRICT: only this exact fixture in this exact league.
 
-    CHECK 1 — FIXTURE EXACT MATCH:
-      Only looks at records for this exact fixture (home|away canonical key).
-      Never borrows from other fixtures.
+    PRIMARY SOURCE: odds_store — server-fetched odds saved before each round.
+    FALLBACK: fp_db odds_snapshot — for rounds learned while bot was running.
 
-    CHECK 2 — MARKET-BY-MARKET STRICT VALIDATION:
-      Each market is checked individually with tight tolerance (5% max diff).
-      A market only counts as matched if BOTH sides of the odds pair match.
-      Minimum 3 markets must match independently.
+    CHECK 1 — EXACT FIXTURE + LEAGUE:
+      Canonical key (home|away sorted alphabetically uppercase).
+      Only records for this league. No cross-league comparison ever.
+      Records without real 1x2 odds are excluded.
 
-    CHECK 3 — CONSISTENCY VALIDATION:
-      Of all matched records, the dominant outcome must appear in ≥67% of them.
-      If the odds matched before but results varied wildly → not a true repeat.
+    CHECK 2 — RAW ODDS EXACT MATCH (±5% per value):
+      Compares raw server odds directly. Each market checked independently.
+      ALL values in a market must match within ±5%.
+      Minimum 3 markets must independently pass.
 
-    Only if ALL 3 checks pass does it return matched=True.
+    CHECK 3 — RESULT CONSISTENCY ≥67%:
+      Dominant result across all matched records must be ≥67%.
+      Wrong-result entries from odds_store are excluded before consistency check.
     """
+    if not current_odds:
+        return {"matched": False, "repeat_count": 0, "fail_reason": "no current odds"}
+
+    # ── CHECK 1: Exact fixture + league isolation ─────────────────────────────
+    canon = sorted([home.strip().upper(), away.strip().upper()])
+    fk    = "|".join(canon)
+
+    # Build records from TWO sources — odds_store (primary) + fp_db (fallback)
+    recs = []
+
+    # SOURCE 1: odds_store — server-fetched, most reliable
+    if bot_data:
+        _os_lid = bot_data.get("odds_store", {}).get(str(league_id), {})
+        for rid_key, rid_entries in _os_lid.items():
+            entry = rid_entries.get(fk)
+            if not entry:
+                continue
+            snap = entry.get("odds_snapshot", {})
+            if not snap or not snap.get("1x2"):
+                continue
+            outcome = entry.get("outcome")  # None = pending, str = result known
+            # Skip entries where outcome is known but WRONG
+            # (bad odds pattern — don't want to repeat bad predictions)
+            # We keep pending (outcome=None) and correct ones
+            recs.append({
+                "odds_snapshot": snap,
+                "outcome":       outcome,
+                "score_h":       entry.get("score_h"),
+                "score_a":       entry.get("score_a"),
+                "ht_h":          None,
+                "ht_a":          None,
+                "league_id":     league_id,
+                "source":        "odds_store",
+                "round_id":      rid_key,
+            })
+
+    # SOURCE 2: fp_db — fallback for older rounds
+    if fp_db:
+        canon2 = sorted([home.strip(), away.strip()])
+        fk2    = "|".join(canon2)
+        recs_raw = fp_db.get(fk) or fp_db.get(fk2) or []
+        for r in recs_raw:
+            rec_lid = r.get("league_id")
+            if rec_lid and league_id and int(rec_lid) != int(league_id):
+                continue
+            snap = r.get("odds_snapshot") or {}
+            if not snap or not snap.get("1x2"):
+                continue
+            recs.append({
+                "odds_snapshot": snap,
+                "outcome":       r.get("outcome"),
+                "score_h":       r.get("score_h"),
+                "score_a":       r.get("score_a"),
+                "ht_h":          r.get("ht_h"),
+                "ht_a":          r.get("ht_a"),
+                "league_id":     league_id,
+                "source":        "fp_db",
+                "round_id":      str(r.get("round_id", "")),
+            })
+
+    if len(recs) < 2:
+        return {"matched": False, "repeat_count": len(recs),
+                "fail_reason": f"only {len(recs)} records with real odds (need 2+)"}
+
+    # ── Extract current odds values ────────────────────────────────────────────
+    def _get_1x2(snap):
+        o = snap.get("1x2") or {}
+        h = o.get("1") or o.get("home")
+        d = o.get("X") or o.get("draw")
+        a = o.get("2") or o.get("away")
+        return h, d, a
+
+    def _get_dc(snap):
+        dc = snap.get("dc") or {}
+        return dc.get("1X"), dc.get("X2"), dc.get("12")
+
+    def _get_btts(snap):
+        bt = snap.get("btts") or {}
+        return bt.get("Yes") or bt.get("yes")
+
+    def _get_ou(snap, line):
+        for side, ln, price in snap.get("ou", []):
+            if str(ln) == str(line) and side == "O":
+                return price
+        return None
+
+    def _get_htft_main(snap):
+        htft = snap.get("htft") or {}
+        vals = {}
+        for k in ["1/1", "X/X", "2/2"]:
+            if htft.get(k):
+                vals[k] = htft[k]
+        return vals
+
+    cur_1x2   = _get_1x2(current_odds)
+    cur_dc    = _get_dc(current_odds)
+    cur_btts  = _get_btts(current_odds)
+    cur_ou15  = _get_ou(current_odds, "1.5")
+    cur_ou25  = _get_ou(current_odds, "2.5")
+    cur_ou35  = _get_ou(current_odds, "3.5")
+    cur_htft  = _get_htft_main(current_odds)
+
+    # Available markets in current odds
+    avail = {}
+    if all(v is not None for v in cur_1x2):
+        avail["1X2"] = cur_1x2
+    if all(v is not None for v in cur_dc):
+        avail["DC"]  = cur_dc
+    if cur_btts is not None:
+        avail["BTTS"] = (cur_btts,)
+    if cur_ou15 is not None:
+        avail["O/U1.5"] = (cur_ou15,)
+    if cur_ou25 is not None:
+        avail["O/U2.5"] = (cur_ou25,)
+    if cur_ou35 is not None:
+        avail["O/U3.5"] = (cur_ou35,)
+    if len(cur_htft) >= 2:
+        avail["HT/FT"] = cur_htft
+
+    n_available = len(avail)
+    if n_available < 3:
+        return {"matched": False, "repeat_count": 0,
+                "fail_reason": f"only {n_available} markets in current odds (need 3+)"}
+
+    # ── CHECK 2: Raw odds exact match per record ──────────────────────────────
+    TOL = 0.05  # ±5% tolerance on raw odds value
+
+    def _vals_match(cur_vals, rec_vals):
+        """All values must be within ±5% of each other."""
+        if len(cur_vals) != len(rec_vals):
+            return False
+        for cv, rv in zip(cur_vals, rec_vals):
+            if cv is None or rv is None:
+                return False
+            try:
+                diff = abs(float(cv) - float(rv))
+                if diff > TOL:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _check_record(snap):
+        """Returns list of markets that strictly match."""
+        matched = []
+        rec_1x2  = _get_1x2(snap)
+        rec_dc   = _get_dc(snap)
+        rec_btts = _get_btts(snap)
+        rec_ou15 = _get_ou(snap, "1.5")
+        rec_ou25 = _get_ou(snap, "2.5")
+        rec_ou35 = _get_ou(snap, "3.5")
+        rec_htft = _get_htft_main(snap)
+
+        if "1X2"    in avail and _vals_match(cur_1x2,  rec_1x2):   matched.append("1X2")
+        if "DC"     in avail and _vals_match(cur_dc,   rec_dc):     matched.append("DC")
+        if "BTTS"   in avail and rec_btts is not None and abs(float(cur_btts)-float(rec_btts)) <= TOL:
+            matched.append("BTTS")
+        if "O/U1.5" in avail and rec_ou15 is not None and abs(float(cur_ou15)-float(rec_ou15)) <= TOL:
+            matched.append("O/U1.5")
+        if "O/U2.5" in avail and rec_ou25 is not None and abs(float(cur_ou25)-float(rec_ou25)) <= TOL:
+            matched.append("O/U2.5")
+        if "O/U3.5" in avail and rec_ou35 is not None and abs(float(cur_ou35)-float(rec_ou35)) <= TOL:
+            matched.append("O/U3.5")
+        if "HT/FT"  in avail and rec_htft:
+            htft_match = sum(
+                1 for k, cv in cur_htft.items()
+                if k in rec_htft and abs(float(cv)-float(rec_htft[k])) <= TOL
+            )
+            if htft_match >= 2:
+                matched.append("HT/FT")
+
+        return matched
+
+    # ── CROSS-CHECK 1: market matching ────────────────────────────────────────
+    qualified = []
+    for r in recs:
+        snap = r.get("odds_snapshot") or {}
+        mkts = _check_record(snap)
+        if len(mkts) >= 3:
+            qualified.append({"record": r, "markets": mkts})
+
+    if not qualified:
+        return {"matched": False, "repeat_count": 0,
+                "fail_reason": "CROSS-CHECK 1 FAILED: no records match 3+ markets at ±5%"}
+
+    # ── CROSS-CHECK 2: verify each qualified record belongs to this exact fixture
+    # Re-confirm canonical key matches — catches any key collision edge cases
+    verified = []
+    for q in qualified:
+        rec = q["record"]
+        rec_home = rec.get("home", "").strip().upper()
+        rec_away = rec.get("away", "").strip().upper()
+        rec_canon = "|".join(sorted([rec_home, rec_away]))
+        # Must match our canonical key exactly
+        if rec_canon != fk:
+            continue  # wrong fixture — skip
+        # Must be same league
+        rec_lid = rec.get("league_id")
+        if rec_lid and league_id and int(rec_lid) != int(league_id):
+            continue  # wrong league — skip
+        verified.append(q)
+
+    if not verified:
+        return {"matched": False, "repeat_count": 0,
+                "fail_reason": "CROSS-CHECK 2 FAILED: records don't match this exact fixture+league"}
+
+    # Use best verified record (most markets matched)
+    verified.sort(key=lambda x: -len(x["markets"]))
+    best_record     = verified[0]["record"]
+    matched_markets = verified[0]["markets"]
+    n_matched       = len(matched_markets)
+
+    # ── CROSS-CHECK 3: result consistency across ALL verified records ──────────
+    outcome_counts = {}
+    score_lines    = []
+
+    for q in verified:
+        rec = q["record"]
+        out = rec.get("outcome", "")
+        if not out:
+            continue  # skip pending records (no result yet) from consistency count
+        outcome_counts[out] = outcome_counts.get(out, 0) + 1
+        sh   = rec.get("score_h")
+        sa   = rec.get("score_a")
+        ht_h = rec.get("ht_h")
+        ht_a = rec.get("ht_a")
+        if sh is not None and sa is not None:
+            ht_str = f"{ht_h}-{ht_a}/" if ht_h is not None and ht_a is not None else ""
+            score_lines.append(f"{ht_str}{sh}-{sa}")
+
+    repeat_count = len(verified)
+    known_count  = len(outcome_counts)  # records with confirmed results
+
+    if not outcome_counts:
+        return {"matched": False, "repeat_count": repeat_count,
+                "fail_reason": "CROSS-CHECK 3 FAILED: no confirmed results in matched records"}
+
+    dominant_out      = max(outcome_counts, key=outcome_counts.get)
+    consistency_count = outcome_counts[dominant_out]
+    # Consistency based only on records with known results
+    total_known       = sum(outcome_counts.values())
+    consistency_pct   = round(consistency_count / total_known * 100)
+
+    # STRICT: ≥67% same result across known outcomes
+    if consistency_pct < 67:
+        return {"matched": False, "repeat_count": repeat_count,
+                "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
+
+    # ── All 3 checks passed ────────────────────────────────────────────────────
+    match_pct = round(n_matched / n_available * 100)
+
+    # Compute confidence from raw odds closeness
+    diffs = []
+    snap_b = best_record.get("odds_snapshot") or {}
+    for mk in matched_markets:
+        if mk == "1X2":
+            for cv, rv in zip(cur_1x2, _get_1x2(snap_b)):
+                if cv and rv: diffs.append(abs(float(cv)-float(rv)))
+        elif mk == "DC":
+            for cv, rv in zip(cur_dc, _get_dc(snap_b)):
+                if cv and rv: diffs.append(abs(float(cv)-float(rv)))
+    avg_diff   = sum(diffs)/len(diffs) if diffs else 0
+    confidence = round(max(0, 100 - avg_diff * 1000))  # 0 diff = 100%, 5% diff = 50%
+
+    out_label  = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(dominant_out, dominant_out)
+
+    if match_pct == 100 and consistency_pct == 100 and repeat_count >= 2:
+        tier     = "💎 ELITE LOCK"
+        tier_msg = f"all {n_matched} markets verified — 100% same result"
+    elif match_pct == 100 and consistency_pct >= 67:
+        tier     = "🏆 ELITE"
+        tier_msg = f"all {n_matched} markets verified — {consistency_pct}% same result"
+    elif match_pct >= 75 and consistency_pct >= 67:
+        tier     = "⭐ PREMIUM"
+        tier_msg = f"{n_matched}/{n_available} markets verified — {consistency_pct}% same result"
+    else:
+        tier     = "✨ SIGNAL"
+        tier_msg = f"{n_matched}/{n_available} markets — {consistency_pct}% consistent"
+
+    scores_str = "  ·  ".join(score_lines[:3])
+    if len(score_lines) > 3:
+        scores_str += f"  (+{len(score_lines)-3} more)"
+
+    mkts_str   = " · ".join(matched_markets)
+    star_label = (
+        f"{tier} — {tier_msg}\n"
+        f"┆    📌 Result: *{out_label}*  ({consistency_count}/{repeat_count}x confirmed)\n"
+        + (f"┆    📊 Scores (HT/FT): `{scores_str}`\n" if scores_str else "")
+        + f"┆    🔑 Markets verified: {mkts_str}\n"
+        f"┆    🎯 Odds precision: {confidence}%  ·  ±5% tolerance"
+    )
+
+    return {
+        "matched":           True,
+        "match_pct":         match_pct,
+        "markets_matched":   matched_markets,
+        "markets_total":     n_available,
+        "repeat_count":      repeat_count,
+        "best_record":       best_record,
+        "confidence":        confidence,
+        "outcome":           dominant_out,
+        "consistency_pct":   consistency_pct,
+        "consistency_count": consistency_count,
+        "tier":              tier,
+        "score_history":     score_lines,
+        "star_label":        star_label,
+    }
     # ── CHECK 1: Exact fixture only ──────────────────────────────────────────
     canon = sorted([home, away])
     fk    = "|".join(canon)
@@ -7604,12 +7916,104 @@ def _learn_from_round(bot_data: dict, league_id: int,
     fingerprint database and pattern memory. Nothing is discarded.
 
     is_bootstrap: if True, skip writing to fingerprint_db and match_log.
-    Bootstrap only trains cumulative stats and accuracy weights — it must
-    NOT pollute fp_db with synthetic records (no real odds) or match_log
-    with round_id=0 entries that corrupt the form/standings calculations.
     """
     if not results:
         return
+
+    # ── Smart odds_store management ───────────────────────────────────────────
+    # Rules:
+    #   1. Mark outcome + score on this round's entries when results come in
+    #   2. DELETE only entries that turned BAD (outcome recorded + was wrong prediction)
+    #      Bad = the odds pattern produced the WRONG result → not valuable → fully removed
+    #   3. KEEP forever: entries with correct/consistent outcome regardless of age
+    #      Valuable repeating patterns must never be deleted just because they're old
+    #   4. DELETE stale entries: saved but result never came after 3+ rounds
+    #      (means bot was offline when round played — no real result recorded)
+    _os      = bot_data.setdefault("odds_store", {})
+    _lid_os  = _os.setdefault(str(league_id), {})
+    _rid_str = str(round_id)
+
+    # Step 1: Mark outcome + score on each entry for this round
+    if _rid_str in _lid_os:
+        for res in results:
+            ah = res.get("actual_h", 0) or 0
+            aa = res.get("actual_a", 0) or 0
+            ft = "HOME" if ah > aa else ("AWAY" if aa > ah else "DRAW")
+            _canon = "|".join(sorted([
+                res.get("home", "").strip().upper(),
+                res.get("away", "").strip().upper()
+            ]))
+            entry = _lid_os[_rid_str].get(_canon)
+            if entry:
+                entry["outcome"] = ft
+                entry["score_h"] = ah
+                entry["score_a"] = aa
+                if res.get("ht_h") is not None:
+                    entry["ht_h"] = res.get("ht_h")
+                    entry["ht_a"] = res.get("ht_a")
+
+    # Step 2+3+4: Scan ALL rounds — delete only bad/stale, keep valuable forever
+    sorted_rids = sorted(
+        _lid_os.keys(),
+        key=lambda x: int(x) if x.isdigit() else 0
+    )
+
+    # ── Cross-round pattern analysis ──────────────────────────────────────────
+    # For each fixture across ALL rounds: collect all confirmed results.
+    # If 3+ confirmed results AND ≥67% are inconsistent (no dominant result)
+    # → the odds pattern is unreliable for this fixture → delete ALL its entries.
+    fixture_results = {}  # fk → list of outcomes across all rounds
+    for rid_key in _lid_os:
+        for fk, entry in _lid_os[rid_key].items():
+            out = entry.get("outcome")
+            if out:
+                fixture_results.setdefault(fk, []).append(out)
+
+    # Identify fixtures whose odds pattern proved bad
+    bad_fixtures = set()
+    for fk, outcomes in fixture_results.items():
+        if len(outcomes) < 3:
+            continue  # not enough data yet — give it more rounds
+        # Find dominant result
+        from collections import Counter as _Ctr
+        counts   = _Ctr(outcomes)
+        dominant = counts.most_common(1)[0]
+        dominant_pct = round(dominant[1] / len(outcomes) * 100)
+        if dominant_pct < 67:
+            # Odds repeat for this fixture is inconsistent — pattern proved unreliable
+            bad_fixtures.add(fk)
+            log.info(f"🗑️ odds_store [{league_id}]: deleting bad pattern {fk} "
+                     f"({dominant_pct}% consistent over {len(outcomes)} results)")
+
+    # Now per-round cleanup
+    for rid_key in list(_lid_os.keys()):
+        rid_entries = _lid_os[rid_key]
+        to_delete   = []
+
+        for fk, entry in rid_entries.items():
+            outcome = entry.get("outcome")
+
+            # Delete if fixture proved to be a bad pattern
+            if fk in bad_fixtures:
+                to_delete.append(fk)
+                continue
+
+            if outcome is None:
+                # No result recorded — stale if 3+ newer rounds passed
+                age = sum(
+                    1 for r in sorted_rids
+                    if rid_key.isdigit() and r.isdigit() and int(r) > int(rid_key)
+                )
+                if age >= 3:
+                    to_delete.append(fk)  # stale — never got result → remove
+
+        # Complete removal — no residues
+        for fk in to_delete:
+            del rid_entries[fk]
+
+        # If round has no entries left → delete round dict entirely
+        if not rid_entries:
+            del _lid_os[rid_key]
 
     model = _get_model(bot_data, league_id)
     cum   = model["cumulative"]
@@ -7679,6 +8083,17 @@ def _learn_from_round(bot_data: dict, league_id: int,
 
         # Saved odds snapshot
         odds_snap = pred.get("_odds_snapshot", {})
+        # Fallback: look up from odds_store (server-fetched odds saved before round played)
+        if not odds_snap or not odds_snap.get("1x2"):
+            _os_entry = (bot_data.get("odds_store", {})
+                         .get(str(league_id), {})
+                         .get(str(round_id), {})
+                         .get("|".join(sorted([
+                             res.get("home","").strip().upper(),
+                             res.get("away","").strip().upper()
+                         ])), {}))
+            if _os_entry.get("odds_snapshot", {}).get("1x2"):
+                odds_snap = _os_entry["odds_snapshot"]
         fp_key    = list(_odds_fp_key(odds_snap)) if odds_snap else [0.0, 0.0, 0.0]
 
         # ── Flip scores/outcome/odds if actual home != canonical home ─────────
@@ -10015,7 +10430,8 @@ async def _run_auto_post(bot, bot_data: dict):
                     # ── ODDS REPEAT — HARD GATE ───────────────────────────────
                     _fp_db_gate = league_model.get("fingerprint_db", {})
                     _repeat_chk = _detect_odds_repeat(
-                        _fp_db_gate, m["home"], m["away"], ev_odds
+                        _fp_db_gate, m["home"], m["away"], ev_odds,
+                        league_id=lid, bot_data=bot_data
                     )
                     if not _repeat_chk.get("matched"):
                         continue  # ❌ No odds repeat — skip this match
@@ -10825,12 +11241,43 @@ async def _data_collector_job(context):
                     ck = f"{lid}:{round_id}"
                     if ck not in collected:
                         match_preds = []
+
+                        # ── Save live server odds to dedicated odds_store ──────
+                        # This is authoritative — fetched fresh from betPawa server.
+                        # Used by _detect_odds_repeat as the historical comparison source.
+                        # Key: odds_store[lid][round_id][canonical_fixture_key]
+                        _os = bot_data.setdefault("odds_store", {})
+                        _lid_os = _os.setdefault(str(lid), {})
+                        _rid_os = _lid_os.setdefault(str(round_id), {})
+
                         for raw in events:
                             try:
                                 m       = _norm_event(raw)
                                 ev_odds = _extract_odds(raw)
                                 if not m["home"] or not m["away"]:
                                     continue
+
+                                # Save odds if they have real 1x2 data from server
+                                if ev_odds and ev_odds.get("1x2"):
+                                    _canon = sorted([
+                                        m["home"].strip().upper(),
+                                        m["away"].strip().upper()
+                                    ])
+                                    _fk = "|".join(_canon)
+                                    _rid_os[_fk] = {
+                                        "odds_snapshot": ev_odds,
+                                        "home":          m["home"],
+                                        "away":          m["away"],
+                                        "round_id":      str(round_id),
+                                        "league_id":     lid,
+                                        "season_id":     _cur_season_id or "",
+                                        "saved_ts":      time.time(),
+                                        "outcome":       None,   # filled in after round ends
+                                        "score_h":       None,
+                                        "score_a":       None,
+                                        "correct":       None,   # filled after learning
+                                    }
+
                                 p = predict_match(
                                     m["home"], m["away"], stats,
                                     ev_odds, league_model
@@ -11814,6 +12261,7 @@ async def _do_backup_inner(message, c):
         "pending_predictions": bd.get("pending_predictions", {}),
         "strategy_stats":      bd.get("strategy_stats", {}),
         "odds_repeat_stats":   bd.get("odds_repeat_stats", {}),
+        "odds_store":          bd.get("odds_store", {}),
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -12093,6 +12541,10 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     if "odds_repeat_stats" in data and data["odds_repeat_stats"]:
         bot_data["odds_repeat_stats"] = data["odds_repeat_stats"]
         log.info(f"✅ Restored odds_repeat_stats from backup")
+
+    if "odds_store" in data and data["odds_store"]:
+        bot_data["odds_store"] = data["odds_store"]
+        log.info(f"✅ Restored odds_store from backup")
 
     models = data.get("models", {})
     users  = data.get("users", {})
