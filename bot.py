@@ -3225,7 +3225,7 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     CHECK 2 — RAW ODDS EXACT MATCH (±5% per value):
       Compares raw server odds directly. Each market checked independently.
       ALL values in a market must match within ±5%.
-      Minimum 3 markets must independently pass.
+      Minimum 4 markets must independently pass.
 
     CHECK 3 — RESULT CONSISTENCY ≥67%:
       Dominant result across all matched records must be ≥67%.
@@ -3351,9 +3351,9 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         avail["HT/FT"] = cur_htft
 
     n_available = len(avail)
-    if n_available < 3:
+    if n_available < 4:
         return {"matched": False, "repeat_count": 0,
-                "fail_reason": f"only {n_available} markets in current odds (need 3+)"}
+                "fail_reason": f"only {n_available} markets in current odds (need 4+)"}
 
     # ── CHECK 2: Raw odds exact match per record ──────────────────────────────
     TOL = 0.05  # ±5% tolerance on raw odds value
@@ -3409,12 +3409,12 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     for r in recs:
         snap = r.get("odds_snapshot") or {}
         mkts = _check_record(snap)
-        if len(mkts) >= 3:
+        if len(mkts) >= 4:
             qualified.append({"record": r, "markets": mkts})
 
     if not qualified:
         return {"matched": False, "repeat_count": 0,
-                "fail_reason": "CROSS-CHECK 1 FAILED: no records match 3+ markets at ±5%"}
+                "fail_reason": "CROSS-CHECK 1 FAILED: no records match 4+ markets at ±5%"}
 
     # ── CROSS-CHECK 2: verify each qualified record belongs to this exact fixture
     # Re-confirm canonical key matches — catches any key collision edge cases
@@ -3479,10 +3479,14 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         return {"matched": False, "repeat_count": repeat_count,
                 "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
 
-    # ── All 3 checks passed ────────────────────────────────────────────────────
+    # ── Final check: ALL markets must match — no partial allowed ──────────────
     match_pct = round(n_matched / n_available * 100)
+    if n_matched < n_available:
+        return {"matched": False, "repeat_count": repeat_count,
+                "fail_reason": f"only {n_matched}/{n_available} markets matched — need ALL {n_available}"}
 
-    # Compute confidence from raw odds closeness
+    # ── All checks passed — all markets confirmed ──────────────────────────────
+    # Compute confidence from raw odds closeness across all matched markets
     diffs = []
     snap_b = best_record.get("odds_snapshot") or {}
     for mk in matched_markets:
@@ -3492,23 +3496,20 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         elif mk == "DC":
             for cv, rv in zip(cur_dc, _get_dc(snap_b)):
                 if cv and rv: diffs.append(abs(float(cv)-float(rv)))
+        elif mk == "BTTS":
+            if cur_btts and _get_btts(snap_b):
+                diffs.append(abs(float(cur_btts) - float(_get_btts(snap_b))))
     avg_diff   = sum(diffs)/len(diffs) if diffs else 0
-    confidence = round(max(0, 100 - avg_diff * 1000))  # 0 diff = 100%, 5% diff = 50%
+    confidence = round(max(0, 100 - avg_diff * 1000))
 
-    out_label  = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(dominant_out, dominant_out)
+    out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(dominant_out, dominant_out)
 
-    if match_pct == 100 and consistency_pct == 100 and repeat_count >= 2:
+    if consistency_pct == 100 and repeat_count >= 2:
         tier     = "💎 ELITE LOCK"
-        tier_msg = f"all {n_matched} markets verified — 100% same result"
-    elif match_pct == 100 and consistency_pct >= 67:
+        tier_msg = f"all {n_matched} markets identical — 100% same result every time"
+    elif consistency_pct >= 67:
         tier     = "🏆 ELITE"
-        tier_msg = f"all {n_matched} markets verified — {consistency_pct}% same result"
-    elif match_pct >= 75 and consistency_pct >= 67:
-        tier     = "⭐ PREMIUM"
-        tier_msg = f"{n_matched}/{n_available} markets verified — {consistency_pct}% same result"
-    else:
-        tier     = "✨ SIGNAL"
-        tier_msg = f"{n_matched}/{n_available} markets — {consistency_pct}% consistent"
+        tier_msg = f"all {n_matched} markets confirmed — {consistency_pct}% same result"
 
     scores_str = "  ·  ".join(score_lines[:3])
     if len(score_lines) > 3:
@@ -3538,190 +3539,6 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         "score_history":     score_lines,
         "star_label":        star_label,
     }
-    # ── CHECK 1: Exact fixture only ──────────────────────────────────────────
-    canon = sorted([home, away])
-    fk    = "|".join(canon)
-    recs  = fp_db.get(fk, [])
-
-    if len(recs) < 2:  # need at least 2 historical records to detect a pattern
-        return {"matched": False, "match_pct": 0, "repeat_count": 0,
-                "fail_reason": "insufficient history"}
-
-    if not current_odds:
-        return {"matched": False, "match_pct": 0, "repeat_count": 0,
-                "fail_reason": "no current odds"}
-
-    cur_fp = list(_odds_fp_key(current_odds))
-    if not any(v > 0 for v in cur_fp):
-        return {"matched": False, "match_pct": 0, "repeat_count": 0,
-                "fail_reason": "no odds fingerprint"}
-
-    # ── CHECK 2: Market-by-market strict validation ───────────────────────────
-    # Each market group defined with its fp_key indices AND tolerance
-    # Tolerance is tight: 5% max difference per value
-    STRICT_TOL = 0.05
-
-    market_defs = {
-        "1X2":    {"indices": [0, 1, 2],    "need_all": True,  "min_vals": 2},
-        "DC":     {"indices": [7, 8, 9],    "need_all": True,  "min_vals": 2},
-        "BTTS":   {"indices": [6],          "need_all": True,  "min_vals": 1},
-        "O/U1.5": {"indices": [3],          "need_all": True,  "min_vals": 1},
-        "O/U2.5": {"indices": [4],          "need_all": True,  "min_vals": 1},
-        "O/U3.5": {"indices": [5],          "need_all": True,  "min_vals": 1},
-        "HT/FT":  {"indices": [10,11,12,13],"need_all": False, "min_vals": 2},
-    }
-
-    # Find which markets have real data in current odds
-    available_markets = {}
-    for mkt, mdef in market_defs.items():
-        vals = [(i, cur_fp[i]) for i in mdef["indices"]
-                if i < len(cur_fp) and cur_fp[i] > 0]
-        if len(vals) >= mdef["min_vals"]:
-            available_markets[mkt] = vals
-
-    n_available = len(available_markets)
-    if n_available < 3:  # need at least 3 distinct markets available
-        return {"matched": False, "match_pct": 0, "repeat_count": 0,
-                "fail_reason": f"only {n_available} markets available (need 3+)"}
-
-    # For each historical record: check how many markets genuinely match
-    def _check_record_markets(rec_fp_tuple):
-        """Returns list of market names that strictly match."""
-        rec_fp = list(rec_fp_tuple)
-        matched = []
-        for mkt, vals in available_markets.items():
-            mdef = market_defs[mkt]
-            all_match = True
-            matched_count = 0
-            for idx, cur_val in vals:
-                if idx >= len(rec_fp) or rec_fp[idx] == 0.0:
-                    all_match = False
-                    break
-                diff = abs(cur_val - rec_fp[idx])
-                if diff <= STRICT_TOL:
-                    matched_count += 1
-                else:
-                    all_match = False
-                    break
-            if all_match and matched_count >= mdef["min_vals"]:
-                matched.append(mkt)
-        return matched
-
-    # Find all records where at least 3 markets strictly match
-    qualified_records = []
-    for rec in recs:
-        rec_fp = tuple(rec.get("fp_key", []))
-        if not rec_fp or not any(v > 0 for v in rec_fp):
-            continue
-        mkts = _check_record_markets(rec_fp)
-        if len(mkts) >= 3:
-            # Also compute overall similarity for confidence score
-            sim = _fp_similarity(rec_fp, tuple(cur_fp))
-            qualified_records.append({
-                "record":   rec,
-                "markets":  mkts,
-                "sim":      sim,
-                "n_matched": len(mkts),
-            })
-
-    if not qualified_records:
-        return {"matched": False, "match_pct": 0, "repeat_count": 0,
-                "fail_reason": "no records match 3+ markets strictly"}
-
-    # Use the record with most markets matched (then highest sim)
-    qualified_records.sort(key=lambda x: (-x["n_matched"], -x["sim"]))
-    best = qualified_records[0]
-    best_record   = best["record"]
-    best_sim      = best["sim"]
-    matched_markets = best["markets"]
-    n_matched     = len(matched_markets)
-
-    # ── CHECK 3: Consistency validation ───────────────────────────────────────
-    # Count outcomes across all qualified records
-    outcome_counts = {}
-    score_lines    = []
-
-    for q in qualified_records:
-        rec = q["record"]
-        out = rec.get("outcome", "")
-        if out:
-            outcome_counts[out] = outcome_counts.get(out, 0) + 1
-        sh = rec.get("score_h")
-        sa = rec.get("score_a")
-        ht_h = rec.get("ht_h")
-        ht_a = rec.get("ht_a")
-        if sh is not None and sa is not None:
-            ft_str = f"{sh}-{sa}"
-            ht_str = f"{ht_h}-{ht_a}/" if ht_h is not None and ht_a is not None else ""
-            score_lines.append(f"{ht_str}{ft_str}")
-
-    repeat_count = len(qualified_records)
-
-    if not outcome_counts:
-        return {"matched": False, "match_pct": 0, "repeat_count": 0,
-                "fail_reason": "no outcome data in matched records"}
-
-    dominant_outcome  = max(outcome_counts, key=outcome_counts.get)
-    consistency_count = outcome_counts[dominant_outcome]
-    consistency_pct   = round(consistency_count / repeat_count * 100)
-
-    # CHECK 3 STRICT: dominant outcome must appear in ≥67% of matched records
-    if consistency_pct < 67:
-        return {"matched": False, "match_pct": 0, "repeat_count": repeat_count,
-                "fail_reason": f"inconsistent results ({consistency_pct}% consistent, need 67%+)"}
-
-    # ── All 3 checks passed — build premium signal ────────────────────────────
-    match_pct  = round(n_matched / n_available * 100)
-    confidence = round(best_sim * 100)
-
-    out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(
-        dominant_outcome, dominant_outcome)
-
-    # Tier based on match_pct + consistency
-    if match_pct == 100 and consistency_pct == 100 and repeat_count >= 2:
-        tier     = "💎 ELITE LOCK"
-        tier_msg = f"all {n_matched} markets confirmed — 100% same result every time"
-    elif match_pct == 100 and consistency_pct >= 67:
-        tier     = "🏆 ELITE"
-        tier_msg = f"all {n_matched} markets confirmed — {consistency_pct}% same result"
-    elif match_pct >= 75 and consistency_pct >= 67:
-        tier     = "⭐ PREMIUM"
-        tier_msg = f"{n_matched}/{n_available} markets confirmed — {consistency_pct}% same result"
-    else:
-        tier     = "✨ SIGNAL"
-        tier_msg = f"{n_matched}/{n_available} markets match — {consistency_pct}% consistent"
-
-    scores_str = "  ·  ".join(score_lines[:3])
-    if len(score_lines) > 3:
-        scores_str += f"  (+{len(score_lines)-3} more)"
-
-    mkts_str   = " · ".join(matched_markets)
-    star_label = (
-        f"{tier} — {tier_msg}\n"
-        f"┆    📌 Result: *{out_label}*  ({consistency_count}/{repeat_count}x confirmed)\n"
-        + (f"┆    📊 Scores (HT/FT): `{scores_str}`\n" if scores_str else "")
-        + f"┆    🔑 Markets verified: {mkts_str}\n"
-        f"┆    🎯 Odds match: {confidence}%  ·  Strict tolerance ±5%"
-    )
-
-    return {
-        "matched":           True,
-        "match_pct":         match_pct,
-        "markets_matched":   matched_markets,
-        "markets_total":     n_available,
-        "repeat_count":      repeat_count,
-        "best_record":       best_record,
-        "confidence":        confidence,
-        "outcome":           dominant_outcome,
-        "consistency_pct":   consistency_pct,
-        "consistency_count": consistency_count,
-        "tier":              tier,
-        "score_history":     score_lines,
-        "star_label":        star_label,
-        "best_sim":          best_sim,
-    }
-
-
     """
     Full H2H analysis between two teams — used when odds don't match well.
 
