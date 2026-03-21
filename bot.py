@@ -3209,130 +3209,204 @@ def _fp_similarity(fp_key: tuple, query_key: tuple) -> float:
 def _detect_odds_repeat(fp_db: dict, home: str, away: str,
                          current_odds: dict) -> dict:
     """
-    Detect if current match odds match any historical record for this fixture.
+    Triple cross-check odds repeat detection.
 
-    Checks each market independently:
-      - 1X2 (home/draw/away odds)
-      - DC  (1X / X2 / 12 odds)
-      - BTTS (yes/no odds)
-      - O/U 1.5, 2.5, 3.5
-      - HT/FT (main outcomes)
+    CHECK 1 — FIXTURE EXACT MATCH:
+      Only looks at records for this exact fixture (home|away canonical key).
+      Never borrows from other fixtures.
 
-    Returns:
-      matched:       bool — at least 2 markets matched
-      match_pct:     float 0-100 — % of available markets that matched
-      markets_matched: list of matched market names
-      markets_total:   int — total markets available in current odds
-      repeat_count:  int — how many historical records matched
-      best_record:   dict — the closest matching historical record
-      confidence:    float 0-100 — how confident this is a true repeat
-      outcome:       str — what result happened last time (from best_record)
-      star_label:    str — formatted label for card display
+    CHECK 2 — MARKET-BY-MARKET STRICT VALIDATION:
+      Each market is checked individually with tight tolerance (5% max diff).
+      A market only counts as matched if BOTH sides of the odds pair match.
+      Minimum 3 markets must match independently.
+
+    CHECK 3 — CONSISTENCY VALIDATION:
+      Of all matched records, the dominant outcome must appear in ≥67% of them.
+      If the odds matched before but results varied wildly → not a true repeat.
+
+    Only if ALL 3 checks pass does it return matched=True.
     """
+    # ── CHECK 1: Exact fixture only ──────────────────────────────────────────
     canon = sorted([home, away])
     fk    = "|".join(canon)
     recs  = fp_db.get(fk, [])
 
-    if not recs or not current_odds:
-        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+    if len(recs) < 2:  # need at least 2 historical records to detect a pattern
+        return {"matched": False, "match_pct": 0, "repeat_count": 0,
+                "fail_reason": "insufficient history"}
+
+    if not current_odds:
+        return {"matched": False, "match_pct": 0, "repeat_count": 0,
+                "fail_reason": "no current odds"}
 
     cur_fp = list(_odds_fp_key(current_odds))
-    if not any(cur_fp):
-        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+    if not any(v > 0 for v in cur_fp):
+        return {"matched": False, "match_pct": 0, "repeat_count": 0,
+                "fail_reason": "no odds fingerprint"}
 
-    # Market groups and which fp_key indices they use
-    market_groups = {
-        "1X2":   [0, 1, 2],
-        "DC":    [7, 8, 9],
-        "BTTS":  [6],
-        "O/U1.5":[3],
-        "O/U2.5":[4],
-        "O/U3.5":[5],
-        "HT/FT": [10, 11, 12, 13],
+    # ── CHECK 2: Market-by-market strict validation ───────────────────────────
+    # Each market group defined with its fp_key indices AND tolerance
+    # Tolerance is tight: 5% max difference per value
+    STRICT_TOL = 0.05
+
+    market_defs = {
+        "1X2":    {"indices": [0, 1, 2],    "need_all": True,  "min_vals": 2},
+        "DC":     {"indices": [7, 8, 9],    "need_all": True,  "min_vals": 2},
+        "BTTS":   {"indices": [6],          "need_all": True,  "min_vals": 1},
+        "O/U1.5": {"indices": [3],          "need_all": True,  "min_vals": 1},
+        "O/U2.5": {"indices": [4],          "need_all": True,  "min_vals": 1},
+        "O/U3.5": {"indices": [5],          "need_all": True,  "min_vals": 1},
+        "HT/FT":  {"indices": [10,11,12,13],"need_all": False, "min_vals": 2},
     }
 
-    # Which markets have data in current odds
-    available_markets = []
-    for mkt, indices in market_groups.items():
-        if any(cur_fp[i] > 0 for i in indices if i < len(cur_fp)):
-            available_markets.append(mkt)
+    # Find which markets have real data in current odds
+    available_markets = {}
+    for mkt, mdef in market_defs.items():
+        vals = [(i, cur_fp[i]) for i in mdef["indices"]
+                if i < len(cur_fp) and cur_fp[i] > 0]
+        if len(vals) >= mdef["min_vals"]:
+            available_markets[mkt] = vals
 
     n_available = len(available_markets)
-    if n_available == 0:
-        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+    if n_available < 3:  # need at least 3 distinct markets available
+        return {"matched": False, "match_pct": 0, "repeat_count": 0,
+                "fail_reason": f"only {n_available} markets available (need 3+)"}
 
-    best_sim    = 0.0
-    best_record = None
-    matched_records = []
+    # For each historical record: check how many markets genuinely match
+    def _check_record_markets(rec_fp_tuple):
+        """Returns list of market names that strictly match."""
+        rec_fp = list(rec_fp_tuple)
+        matched = []
+        for mkt, vals in available_markets.items():
+            mdef = market_defs[mkt]
+            all_match = True
+            matched_count = 0
+            for idx, cur_val in vals:
+                if idx >= len(rec_fp) or rec_fp[idx] == 0.0:
+                    all_match = False
+                    break
+                diff = abs(cur_val - rec_fp[idx])
+                if diff <= STRICT_TOL:
+                    matched_count += 1
+                else:
+                    all_match = False
+                    break
+            if all_match and matched_count >= mdef["min_vals"]:
+                matched.append(mkt)
+        return matched
 
+    # Find all records where at least 3 markets strictly match
+    qualified_records = []
     for rec in recs:
         rec_fp = tuple(rec.get("fp_key", []))
-        if not rec_fp:
+        if not rec_fp or not any(v > 0 for v in rec_fp):
             continue
-        sim = _fp_similarity(rec_fp, tuple(cur_fp))
-        if sim >= 0.85:  # high similarity threshold
-            matched_records.append((sim, rec))
-            if sim > best_sim:
-                best_sim    = sim
-                best_record = rec
+        mkts = _check_record_markets(rec_fp)
+        if len(mkts) >= 3:
+            # Also compute overall similarity for confidence score
+            sim = _fp_similarity(rec_fp, tuple(cur_fp))
+            qualified_records.append({
+                "record":   rec,
+                "markets":  mkts,
+                "sim":      sim,
+                "n_matched": len(mkts),
+            })
 
-    if not best_record:
-        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+    if not qualified_records:
+        return {"matched": False, "match_pct": 0, "repeat_count": 0,
+                "fail_reason": "no records match 3+ markets strictly"}
 
-    # Count which individual markets matched in the best record
-    best_fp = tuple(best_record.get("fp_key", []))
-    matched_markets = []
-    for mkt, indices in market_groups.items():
-        if mkt not in available_markets:
-            continue
-        # Check if this market's odds are close enough in the best record
-        mkt_match = True
-        mkt_has_data = False
-        for i in indices:
-            if i >= len(cur_fp) or i >= len(best_fp):
-                continue
-            if cur_fp[i] == 0.0 or best_fp[i] == 0.0:
-                continue
-            mkt_has_data = True
-            # Tolerance: within 10% of odds value
-            tol = 0.10
-            if abs(cur_fp[i] - best_fp[i]) > tol:
-                mkt_match = False
-                break
-        if mkt_has_data and mkt_match:
-            matched_markets.append(mkt)
+    # Use the record with most markets matched (then highest sim)
+    qualified_records.sort(key=lambda x: (-x["n_matched"], -x["sim"]))
+    best = qualified_records[0]
+    best_record   = best["record"]
+    best_sim      = best["sim"]
+    matched_markets = best["markets"]
+    n_matched     = len(matched_markets)
 
-    n_matched = len(matched_markets)
-    if n_matched < 2:  # require at least 2 markets to match
-        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+    # ── CHECK 3: Consistency validation ───────────────────────────────────────
+    # Count outcomes across all qualified records
+    outcome_counts = {}
+    score_lines    = []
 
-    match_pct   = round(n_matched / n_available * 100)
-    repeat_count = len(matched_records)
-    outcome      = best_record.get("outcome", "?")
-    confidence   = round(best_sim * 100)
+    for q in qualified_records:
+        rec = q["record"]
+        out = rec.get("outcome", "")
+        if out:
+            outcome_counts[out] = outcome_counts.get(out, 0) + 1
+        sh = rec.get("score_h")
+        sa = rec.get("score_a")
+        ht_h = rec.get("ht_h")
+        ht_a = rec.get("ht_a")
+        if sh is not None and sa is not None:
+            ft_str = f"{sh}-{sa}"
+            ht_str = f"{ht_h}-{ht_a}/" if ht_h is not None and ht_a is not None else ""
+            score_lines.append(f"{ht_str}{ft_str}")
 
-    # Build star label
-    mkts_str = " + ".join(matched_markets)
-    if match_pct == 100:
-        star_label = (f"⭐ *ODDS REPEAT* — all {n_matched} markets match!\n"
-                      f"┆    Happened {repeat_count}x before → result: *{outcome}*\n"
-                      f"┆    Markets: {mkts_str}  ({confidence}% match)")
+    repeat_count = len(qualified_records)
+
+    if not outcome_counts:
+        return {"matched": False, "match_pct": 0, "repeat_count": 0,
+                "fail_reason": "no outcome data in matched records"}
+
+    dominant_outcome  = max(outcome_counts, key=outcome_counts.get)
+    consistency_count = outcome_counts[dominant_outcome]
+    consistency_pct   = round(consistency_count / repeat_count * 100)
+
+    # CHECK 3 STRICT: dominant outcome must appear in ≥67% of matched records
+    if consistency_pct < 67:
+        return {"matched": False, "match_pct": 0, "repeat_count": repeat_count,
+                "fail_reason": f"inconsistent results ({consistency_pct}% consistent, need 67%+)"}
+
+    # ── All 3 checks passed — build premium signal ────────────────────────────
+    match_pct  = round(n_matched / n_available * 100)
+    confidence = round(best_sim * 100)
+
+    out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(
+        dominant_outcome, dominant_outcome)
+
+    # Tier based on match_pct + consistency
+    if match_pct == 100 and consistency_pct == 100 and repeat_count >= 2:
+        tier     = "💎 ELITE LOCK"
+        tier_msg = f"all {n_matched} markets confirmed — 100% same result every time"
+    elif match_pct == 100 and consistency_pct >= 67:
+        tier     = "🏆 ELITE"
+        tier_msg = f"all {n_matched} markets confirmed — {consistency_pct}% same result"
+    elif match_pct >= 75 and consistency_pct >= 67:
+        tier     = "⭐ PREMIUM"
+        tier_msg = f"{n_matched}/{n_available} markets confirmed — {consistency_pct}% same result"
     else:
-        star_label = (f"⭐ *ODDS REPEAT* — {n_matched}/{n_available} markets ({match_pct}%)\n"
-                      f"┆    Happened {repeat_count}x → result: *{outcome}*\n"
-                      f"┆    Matched: {mkts_str}  ({confidence}% sim)")
+        tier     = "✨ SIGNAL"
+        tier_msg = f"{n_matched}/{n_available} markets match — {consistency_pct}% consistent"
+
+    scores_str = "  ·  ".join(score_lines[:3])
+    if len(score_lines) > 3:
+        scores_str += f"  (+{len(score_lines)-3} more)"
+
+    mkts_str   = " · ".join(matched_markets)
+    star_label = (
+        f"{tier} — {tier_msg}\n"
+        f"┆    📌 Result: *{out_label}*  ({consistency_count}/{repeat_count}x confirmed)\n"
+        + (f"┆    📊 Scores (HT/FT): `{scores_str}`\n" if scores_str else "")
+        + f"┆    🔑 Markets verified: {mkts_str}\n"
+        f"┆    🎯 Odds match: {confidence}%  ·  Strict tolerance ±5%"
+    )
 
     return {
-        "matched":          True,
-        "match_pct":        match_pct,
-        "markets_matched":  matched_markets,
-        "markets_total":    n_available,
-        "repeat_count":     repeat_count,
-        "best_record":      best_record,
-        "confidence":       confidence,
-        "outcome":          outcome,
-        "star_label":       star_label,
-        "best_sim":         best_sim,
+        "matched":           True,
+        "match_pct":         match_pct,
+        "markets_matched":   matched_markets,
+        "markets_total":     n_available,
+        "repeat_count":      repeat_count,
+        "best_record":       best_record,
+        "confidence":        confidence,
+        "outcome":           dominant_outcome,
+        "consistency_pct":   consistency_pct,
+        "consistency_count": consistency_count,
+        "tier":              tier,
+        "score_history":     score_lines,
+        "star_label":        star_label,
+        "best_sim":          best_sim,
     }
 
 
@@ -7850,16 +7924,36 @@ def _learn_from_round(bot_data: dict, league_id: int,
             # ── Odds repeat learning ──────────────────────────────────────────
             if pred.get("odds_repeat"):
                 _or_stats = bot_data.setdefault("odds_repeat_stats", {
-                    "total": 0, "correct": 0,
-                    "full_match_total": 0, "full_match_correct": 0,
-                    "partial_match_total": 0, "partial_match_correct": 0,
+                    "total":0,"correct":0,"skipped":0,
+                    "full_match_total":0,"full_match_correct":0,
+                    "partial_match_total":0,"partial_match_correct":0,
+                    "elite_lock_total":0,"elite_lock_correct":0,
+                    "elite_total":0,"elite_correct":0,
+                    "premium_total":0,"premium_correct":0,
                 })
                 _or_pct      = pred.get("odds_repeat_pct", 0)
                 _or_outcome  = pred.get("odds_repeat_outcome", "")
+                _or_consist  = pred.get("odds_repeat_consistency", 0)
+                _or_tier     = pred.get("odds_repeat_tier", "")
                 _or_correct  = (_or_outcome == ft_out)
+
                 _or_stats["total"]   = _or_stats.get("total", 0) + 1
                 if _or_correct:
                     _or_stats["correct"] = _or_stats.get("correct", 0) + 1
+
+                if _or_pct == 100 and _or_consist == 100:
+                    _or_stats["elite_lock_total"]   = _or_stats.get("elite_lock_total", 0) + 1
+                    if _or_correct:
+                        _or_stats["elite_lock_correct"] = _or_stats.get("elite_lock_correct", 0) + 1
+                elif _or_pct == 100:
+                    _or_stats["elite_total"]   = _or_stats.get("elite_total", 0) + 1
+                    if _or_correct:
+                        _or_stats["elite_correct"] = _or_stats.get("elite_correct", 0) + 1
+                elif _or_pct >= 75:
+                    _or_stats["premium_total"]   = _or_stats.get("premium_total", 0) + 1
+                    if _or_correct:
+                        _or_stats["premium_correct"] = _or_stats.get("premium_correct", 0) + 1
+
                 if _or_pct == 100:
                     _or_stats["full_match_total"]   = _or_stats.get("full_match_total", 0) + 1
                     if _or_correct:
@@ -9906,22 +10000,30 @@ async def _run_auto_post(bot, bot_data: dict):
                     # ══════════════════════════════════════════════════════════
                     # TWO HARD FILTERS — both must pass to show prediction
                     # Filter 1: Strong lost OR Weak won (last game)
-                    # Filter 2: Winner leads history ≥67% with min 5 meetings
-                    # Everything else is info-only scoring shown on card.
+                    # ══════════════════════════════════════════════════════════
+                    # SOLE GATE: Odds Repeat Detection
+                    # Only matches where current odds match historical records
+                    # are sent as predictions. Everything else is info on card.
                     # ══════════════════════════════════════════════════════════
 
                     _tip_g = p["tip"].split()[0]
 
-                    # Hard block: no draws ever
+                    # Never show draws
                     if _tip_g == "DRAW":
                         continue
 
-                    # ── HARD FILTER 1: Strategy — Strong lost OR Weak won ─────
+                    # ── ODDS REPEAT — HARD GATE ───────────────────────────────
+                    _fp_db_gate = league_model.get("fingerprint_db", {})
+                    _repeat_chk = _detect_odds_repeat(
+                        _fp_db_gate, m["home"], m["away"], ev_odds
+                    )
+                    if not _repeat_chk.get("matched"):
+                        continue  # ❌ No odds repeat — skip this match
+
+                    # ── INFO: Strategy (view only, never blocks) ──────────────
                     _strat_standings = bot_data.get(f"standings_{lid}", {})
                     _g1_score = 0
                     _g1_label = "⚠️ no standings yet"
-                    _g1_passed = False
-
                     if _strat_standings:
                         _strat_tiers = _get_all_tiers(_strat_standings)
                         _h_tier = _find_tier(m["home"], _strat_tiers)
@@ -9930,7 +10032,6 @@ async def _run_auto_post(bot, bot_data: dict):
                         _a_last = _strategy_get_last_game(m["away"], league_model)
                         _h_result = (_h_last or {}).get("result", "")
                         _a_result = (_a_last or {}).get("result", "")
-
                         _strong_lost = (
                             (_h_tier == "STRONG" and _h_result == "LOSS") or
                             (_a_tier == "STRONG" and _a_result == "LOSS")
@@ -9939,33 +10040,24 @@ async def _run_auto_post(bot, bot_data: dict):
                             (_h_tier == "WEAK" and _h_result == "WIN") or
                             (_a_tier == "WEAK" and _a_result == "WIN")
                         )
-
-                        if not (_strong_lost or _weak_won):
-                            continue  # ❌ FILTER 1 FAILED
-
-                        _g1_passed = True
-                        _g1_score  = 100
                         if _strong_lost:
                             _sl = m["home"] if (_h_tier=="STRONG" and _h_result=="LOSS") else m["away"]
+                            _g1_score = 100
                             _g1_label = f"✅ {_sl}(Strong) lost → recovery"
-                        else:
+                        elif _weak_won:
                             _ww = m["home"] if (_h_tier=="WEAK" and _h_result=="WIN") else m["away"]
+                            _g1_score = 100
                             _g1_label = f"✅ {_ww}(Weak) won → opp WIN"
-                    else:
-                        # No standings yet — hard block, cannot filter without standings
-                        continue  # ❌ FILTER 1 FAILED — no standings data yet
+                        else:
+                            _g1_score = 40
+                            _g1_label = f"🟡 no strategy pattern"
 
-                    # ── HARD FILTER 2: History — winner leads clearly ──────────
-                    # Virtual football: each fixture plays ~8-9 times total
-                    # 67% was too strict — almost nothing passes in virtual football
-                    # 60% is realistic: 3/5 or 4/7 wins confirms clear dominance
-                    # Min 3 meetings required (new season may only have 1-2 so far)
+                    # ── INFO: History (view only) ─────────────────────────────
                     _fc_g      = p.get("fixture_case", {}) or {}
                     _fc_n_g    = _fc_g.get("n_meetings", 0)
                     _h_hist    = _fc_g.get("home_win_pct", 0)
                     _a_hist    = _fc_g.get("away_win_pct", 0)
                     _draw_hist = _fc_g.get("draw_pct", 0)
-
                     if _tip_g == "HOME":
                         _winner_hist = _h_hist; _loser_hist = _a_hist
                     else:
@@ -9975,17 +10067,17 @@ async def _run_auto_post(bot, bot_data: dict):
                         if _winner_hist >= 60:
                             _g2_score = round(_winner_hist)
                             _g2_label = f"✅ {_g2_score}% in {_fc_n_g} meetings"
+                        elif _winner_hist >= _loser_hist:
+                            _g2_score = round(_winner_hist)
+                            _g2_label = f"🟡 {_g2_score}% in {_fc_n_g} meetings"
                         else:
-                            # History exists but winner not clearly dominant — block
-                            continue  # ❌ FILTER 2 FAILED — history not strong enough
+                            _g2_score = round(_winner_hist)
+                            _g2_label = f"🔴 {_g2_score}% history (loser leads)"
                     else:
-                        # Fewer than 3 meetings — not enough data yet
-                        continue  # ❌ FILTER 2 FAILED — need 3+ meetings
+                        _g2_score = 50
+                        _g2_label = f"🔵 {_fc_n_g} meetings (building)"
 
-                    # ── INFO SCORES (shown on card, never block) ───────────────
-                    # Band accuracy — INFO ONLY, never a hard filter
-                    # Bot's 1X2 accuracy is 34-39% across all bands — not reliable
-                    # enough to use as a gate. Only used for display context.
+                    # ── INFO: Band accuracy (view only) ───────────────────────
                     _ma      = league_model.get("margin_acc", {})
                     _bba     = league_model.get("btts_band_acc", {"yes":{}, "no":{}})
                     _oba     = league_model.get("o25_band_acc",  {"yes":{}, "no":{}})
@@ -10003,9 +10095,8 @@ async def _run_auto_post(bot, bot_data: dict):
                     _s1x2 = _band_acc(_ma,  _1x2_b)
                     _sbt  = _band_acc(_bba,  _bt_b,  _bt_side)
                     _so25 = _band_acc(_oba,  _o25_b, _o25_side)
-                    _trusted      = [s for s in [_s1x2, _sbt, _so25] if s is not None and s >= 0.60]
-                    _no_band_data = all(s is None for s in [_s1x2, _sbt, _so25])
-
+                    _trusted      = [s for s in [_s1x2,_sbt,_so25] if s is not None and s >= 0.60]
+                    _no_band_data = all(s is None for s in [_s1x2,_sbt,_so25])
                     if _trusted:
                         _g3_score = round(max(_trusted) * 100)
                         _g3_label = f"✅ {_g3_score}% bot accuracy"
@@ -10013,12 +10104,11 @@ async def _run_auto_post(bot, bot_data: dict):
                         _g3_score = round(p["conf"])
                         _g3_label = f"🔵 {_g3_score}% conf (building)"
                     else:
-                        # Band exists but below threshold — show as info, never block
                         _best = max((s for s in [_s1x2,_sbt,_so25] if s is not None), default=0)
                         _g3_score = round(_best * 100)
                         _g3_label = f"🟡 {_g3_score}% bot accuracy"
 
-                    # Momentum
+                    # ── INFO: Momentum (view only) ────────────────────────────
                     _hm_g  = p.get("home_momentum") or {}
                     _am_g  = p.get("away_momentum") or {}
                     _has_mom = (_hm_g.get("games_used", 0) >= 3 and
@@ -10027,14 +10117,12 @@ async def _run_auto_post(bot, bot_data: dict):
                     _aw_g  = _am_g.get("win_pct", 0)
                     _ht_g  = _hm_g.get("trend", "STABLE")
                     _at_g  = _am_g.get("trend", "STABLE")
-
                     if _tip_g == "HOME":
                         _winner_mom = _hw_g; _loser_mom = _aw_g
                         _winner_trend = _ht_g; _loser_trend = _at_g
                     else:
                         _winner_mom = _aw_g; _loser_mom = _hw_g
                         _winner_trend = _at_g; _loser_trend = _ht_g
-
                     if _has_mom:
                         _mom_gap = _winner_mom - _loser_mom
                         if _winner_mom >= 50 and _mom_gap >= 25:
@@ -10053,24 +10141,17 @@ async def _run_auto_post(bot, bot_data: dict):
                         _g4_score = 50
                         _g4_label = "🔵 building"
 
-                    # ── COMBINED OVERALL ───────────────────────────────────────
+                    # ── OVERALL: based on info scores + repeat tier ────────────
                     _overall = round(
-                        _g1_score * 0.25 +
-                        _g2_score * 0.35 +
+                        _g1_score * 0.20 +
+                        _g2_score * 0.30 +
                         _g3_score * 0.20 +
-                        _g4_score * 0.20
+                        _g4_score * 0.30
                     )
                     if   _overall >= 80: _overall_label = "🔥 STRONG PICK"
                     elif _overall >= 67: _overall_label = "✅ GOOD PICK"
                     elif _overall >= 50: _overall_label = "🟡 MODERATE"
                     else:                _overall_label = "🔴 WEAK SIGNAL"
-
-                    # ── FINAL QUALITY GATE — only the best pass through ────────
-                    # Both hard filters already passed (Strategy + History).
-                    # Now only show STRONG PICK (≥80) or GOOD PICK (≥67).
-                    # Moderate and weak signals are skipped silently.
-                    if _overall < 67:
-                        continue  # ❌ QUALITY GATE — overall score too low
 
                     hs, as_ = m["hs"], m["as_"]
                     total  += 1
@@ -10234,19 +10315,31 @@ async def _run_auto_post(bot, bot_data: dict):
                         round_preds[-1]["strategy_pct"]    = _strategy_result.get("strategy_pct")
                         round_preds[-1]["history_pct"]     = _strategy_result.get("history_pct")
 
-                    # ── Odds repeat detection ─────────────────────────────────
+                    # ── Odds repeat — already detected at gate, reuse result ──
                     _repeat_line = ""
-                    _fp_db_now   = league_model.get("fingerprint_db", {})
-                    _repeat      = _detect_odds_repeat(
-                        _fp_db_now, m["home"], m["away"], ev_odds
-                    )
+                    _repeat      = _repeat_chk  # already computed above as the gate
                     if _repeat.get("matched"):
                         _repeat_line = f"┆ {_repeat['star_label']}\n"
-                        # Store repeat info for learning/tracking
-                        round_preds[-1]["odds_repeat"]         = True
-                        round_preds[-1]["odds_repeat_pct"]     = _repeat.get("match_pct", 0)
-                        round_preds[-1]["odds_repeat_outcome"] = _repeat.get("outcome", "")
-                        round_preds[-1]["odds_repeat_count"]   = _repeat.get("repeat_count", 0)
+                        round_preds[-1]["odds_repeat"]             = True
+                        round_preds[-1]["odds_repeat_pct"]         = _repeat.get("match_pct", 0)
+                        round_preds[-1]["odds_repeat_outcome"]     = _repeat.get("outcome", "")
+                        round_preds[-1]["odds_repeat_count"]       = _repeat.get("repeat_count", 0)
+                        round_preds[-1]["odds_repeat_consistency"] = _repeat.get("consistency_pct", 0)
+                        round_preds[-1]["odds_repeat_tier"]        = _repeat.get("tier", "")
+
+                        # Boost overall score based on repeat tier
+                        _consistency = _repeat.get("consistency_pct", 0)
+                        _rep_pct     = _repeat.get("match_pct", 0)
+                        if _rep_pct == 100 and _consistency == 100:
+                            _overall = min(_overall + 15, 99)
+                        elif _rep_pct == 100 and _consistency >= 67:
+                            _overall = min(_overall + 10, 99)
+                        elif _rep_pct >= 75 and _consistency >= 67:
+                            _overall = min(_overall + 6, 99)
+                        if   _overall >= 80: _overall_label = "🔥 STRONG PICK"
+                        elif _overall >= 67: _overall_label = "✅ GOOD PICK"
+                        elif _overall >= 50: _overall_label = "🟡 MODERATE"
+                        else:                _overall_label = "🔴 WEAK SIGNAL"
 
                     # ── Gate scores summary line ───────────────────────────────
                     _gate_line = (
@@ -11539,25 +11632,29 @@ async def _do_brainstat(message, c):
     _strat_summary = _strategy_brain_summary(_bd)
 
     # Odds repeat performance summary
-    _or_stats = _bd.get("odds_repeat_stats", {})
+    _or_stats  = _bd.get("odds_repeat_stats", {})
     _or_total  = _or_stats.get("total", 0)
     _or_correct= _or_stats.get("correct", 0)
-    _or_full_t = _or_stats.get("full_match_total", 0)
-    _or_full_c = _or_stats.get("full_match_correct", 0)
-    _or_part_t = _or_stats.get("partial_match_total", 0)
-    _or_part_c = _or_stats.get("partial_match_correct", 0)
+    _or_el_t   = _or_stats.get("elite_lock_total", 0)
+    _or_el_c   = _or_stats.get("elite_lock_correct", 0)
+    _or_e_t    = _or_stats.get("elite_total", 0)
+    _or_e_c    = _or_stats.get("elite_correct", 0)
+    _or_p_t    = _or_stats.get("premium_total", 0)
+    _or_p_c    = _or_stats.get("premium_correct", 0)
     if _or_total > 0:
-        _or_acc      = round(_or_correct/_or_total*100)
-        _or_full_acc = round(_or_full_c/_or_full_t*100) if _or_full_t else 0
-        _or_part_acc = round(_or_part_c/_or_part_t*100) if _or_part_t else 0
-        _or_summary  = (
-            f"⭐ *Odds Repeat Stats*\n"
+        _or_acc  = round(_or_correct/_or_total*100)
+        _el_acc  = round(_or_el_c/_or_el_t*100) if _or_el_t else 0
+        _e_acc   = round(_or_e_c/_or_e_t*100)   if _or_e_t  else 0
+        _p_acc   = round(_or_p_c/_or_p_t*100)   if _or_p_t  else 0
+        _or_summary = (
+            f"⭐ *Premium Signal Performance*\n"
             f"   Overall: {_or_correct}/{_or_total} = {_or_acc}%\n"
-            f"   Full match (100%): {_or_full_c}/{_or_full_t} = {_or_full_acc}%\n"
-            f"   Partial match: {_or_part_c}/{_or_part_t} = {_or_part_acc}%\n"
+            f"   💎 Elite Lock (100% mkts+100% consistent): {_or_el_c}/{_or_el_t} = {_el_acc}%\n"
+            f"   🏆 Elite (100% mkts): {_or_e_c}/{_or_e_t} = {_e_acc}%\n"
+            f"   ⭐ Premium (75%+ mkts): {_or_p_c}/{_or_p_t} = {_p_acc}%\n"
         )
     else:
-        _or_summary = "⭐ *Odds Repeat Stats*: No data yet\n"
+        _or_summary = "⭐ *Premium Signal Performance*: No data yet\n"
 
     header = (
         f"🧠 *Brain Training Report*\n"
