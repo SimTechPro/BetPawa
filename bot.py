@@ -9705,11 +9705,10 @@ async def _run_auto_post(bot, bot_data: dict):
                     })
 
                     # ══════════════════════════════════════════════════════════
-                    # GATE SCORING SYSTEM
-                    # Step 1 (HARD FILTER): Your strategy = Strong lost OR Weak won
-                    #   This IS the S-W filter — no separate S-W gate needed.
-                    # Steps 2-4: Band, History, Momentum score the match.
-                    # Overall = weighted combination shown on card.
+                    # TWO HARD FILTERS — both must pass to show prediction
+                    # Filter 1: Strong lost OR Weak won (last game)
+                    # Filter 2: Winner leads history ≥67% with min 5 meetings
+                    # Everything else is info-only scoring shown on card.
                     # ══════════════════════════════════════════════════════════
 
                     _tip_g = p["tip"].split()[0]
@@ -9718,28 +9717,21 @@ async def _run_auto_post(bot, bot_data: dict):
                     if _tip_g == "DRAW":
                         continue
 
-                    # ── GATE 1: Strategy filter — HARD FILTER ────────────────
-                    # Strong team (pos 1-5) lost last game → expect recovery
-                    # Weak team (pos 16+) won last game → expect opponent to win
-                    # This IS the S-W logic. No separate tier check needed.
+                    # ── HARD FILTER 1: Strategy — Strong lost OR Weak won ─────
                     _strat_standings = bot_data.get(f"standings_{lid}", {})
                     _g1_score = 0
                     _g1_label = "⚠️ no standings yet"
+                    _g1_passed = False
 
                     if _strat_standings:
                         _strat_tiers = _get_all_tiers(_strat_standings)
                         _h_tier = _find_tier(m["home"], _strat_tiers)
                         _a_tier = _find_tier(m["away"], _strat_tiers)
-
-                        # Get last game result for each team
                         _h_last = _strategy_get_last_game(m["home"], league_model)
                         _a_last = _strategy_get_last_game(m["away"], league_model)
                         _h_result = (_h_last or {}).get("result", "")
                         _a_result = (_a_last or {}).get("result", "")
 
-                        # Strategy qualifies when:
-                        # Strong team LOST their last game (recovery pattern)
-                        # OR Weak team WON their last game (momentum pattern)
                         _strong_lost = (
                             (_h_tier == "STRONG" and _h_result == "LOSS") or
                             (_a_tier == "STRONG" and _a_result == "LOSS")
@@ -9750,61 +9742,23 @@ async def _run_auto_post(bot, bot_data: dict):
                         )
 
                         if not (_strong_lost or _weak_won):
-                            continue  # hard block — doesn't match strategy pattern
+                            continue  # ❌ FILTER 1 FAILED
 
-                        _g1_score = 100
+                        _g1_passed = True
+                        _g1_score  = 100
                         if _strong_lost:
                             _sl = m["home"] if (_h_tier=="STRONG" and _h_result=="LOSS") else m["away"]
                             _g1_label = f"✅ {_sl}(Strong) lost → recovery"
                         else:
                             _ww = m["home"] if (_h_tier=="WEAK" and _h_result=="WIN") else m["away"]
-                            _g1_label = f"✅ {_ww}(Weak) won → opponent WIN"
+                            _g1_label = f"✅ {_ww}(Weak) won → opp WIN"
                     else:
-                        # No standings yet — fall back to S-W tier check only
-                        _g1_score = 60
-                        _g1_label = "🔵 standings building"
+                        # No standings — allow through, learning still building
+                        _g1_passed = True
+                        _g1_score  = 60
+                        _g1_label  = "🔵 standings building"
 
-                    # ── GATE 2: Band accuracy score ────────────────────────────
-                    _ma   = league_model.get("margin_acc", {})
-                    _bba  = league_model.get("btts_band_acc", {"yes":{}, "no":{}})
-                    _oba  = league_model.get("o25_band_acc",  {"yes":{}, "no":{}})
-                    _1x2_b  = str(int(p["conf"]          // 5) * 5)
-                    _bt_b   = str(int(p.get("btts",  50) // 5) * 5)
-                    _o25_b  = str(int(p.get("over25",50) // 5) * 5)
-                    _bt_side  = "yes" if p.get("btts",  50) >= 50 else "no"
-                    _o25_side = "yes" if p.get("over25",50) >= 50 else "no"
-
-                    def _band_acc(src, bkt, side=None):
-                        d = src[side] if side else src
-                        rec = d.get(bkt, [0, 0])
-                        return rec[0] / rec[1] if rec[1] >= 10 else None
-
-                    _s1x2 = _band_acc(_ma,   _1x2_b)
-                    _sbt  = _band_acc(_bba,   _bt_b,  _bt_side)
-                    _so25 = _band_acc(_oba,   _o25_b, _o25_side)
-                    _trusted = [s for s in [_s1x2, _sbt, _so25] if s is not None and s >= 0.60]
-                    _no_band_data = all(s is None for s in [_s1x2, _sbt, _so25])
-
-                    if _trusted:
-                        _g2_score = round(max(_trusted) * 100)
-                        _g2_label = f"✅ {_g2_score}% calibrated"
-                    elif _no_band_data:
-                        _g2_score = round(p["conf"])
-                        _g2_label = f"🔵 {_g2_score}% conf (building)"
-                    else:
-                        _g2_score = round((max(s for s in [_s1x2,_sbt,_so25] if s is not None) * 100) if any(s for s in [_s1x2,_sbt,_so25] if s) else p["conf"])
-                        _g2_label = f"🟡 {_g2_score}% band"
-
-                    # ── GATE 3: History score ──────────────────────────────────
-                    _hm_g    = p.get("home_momentum") or {}
-                    _am_g    = p.get("away_momentum") or {}
-                    _has_mom = (_hm_g.get("games_used", 0) >= 3 and
-                                _am_g.get("games_used", 0) >= 3)
-                    _hw_g    = _hm_g.get("win_pct", 0)
-                    _aw_g    = _am_g.get("win_pct", 0)
-                    _ht_g    = _hm_g.get("trend", "STABLE")
-                    _at_g    = _am_g.get("trend", "STABLE")
-
+                    # ── HARD FILTER 2: History ≥67% with min 5 meetings ────────
                     _fc_g      = p.get("fixture_case", {}) or {}
                     _fc_n_g    = _fc_g.get("n_meetings", 0)
                     _h_hist    = _fc_g.get("home_win_pct", 0)
@@ -9813,70 +9767,102 @@ async def _run_auto_post(bot, bot_data: dict):
 
                     if _tip_g == "HOME":
                         _winner_hist = _h_hist; _loser_hist = _a_hist
-                        _winner_mom  = _hw_g;   _loser_mom  = _aw_g
-                        _winner_trend= _ht_g;   _loser_trend= _at_g
                     else:
                         _winner_hist = _a_hist; _loser_hist = _h_hist
-                        _winner_mom  = _aw_g;   _loser_mom  = _hw_g
-                        _winner_trend= _at_g;   _loser_trend= _ht_g
 
-                    if _fc_n_g >= 3:
-                        if _winner_hist > _loser_hist:
-                            _g3_score = round(_winner_hist)
-                            _g3_label = f"✅ {_g3_score}% in {_fc_n_g} meetings"
-                        elif _winner_hist == _loser_hist:
-                            _g3_score = 50
-                            _g3_label = f"🟡 50/50 in {_fc_n_g} meetings"
+                    _g2_passed = False
+                    if _fc_n_g >= 5:
+                        if _winner_hist >= 67:
+                            _g2_passed = True
+                            _g2_score  = round(_winner_hist)
+                            _g2_label  = f"✅ {_g2_score}% in {_fc_n_g} meetings"
                         else:
-                            _g3_score = round(_winner_hist)
-                            _g3_label = f"🔴 {_g3_score}% history (loser leads)"
+                            # History exists but not strong enough — hard block
+                            continue  # ❌ FILTER 2 FAILED
                     else:
-                        _g3_score = 50
-                        _g3_label = f"🔵 {_fc_n_g} meetings (building)"
+                        # Not enough meetings yet — allow through (early season)
+                        _g2_passed = True
+                        _g2_score  = 50
+                        _g2_label  = f"🔵 {_fc_n_g} meetings (need 5+)"
 
-                    # ── GATE 4: Momentum score ─────────────────────────────────
+                    # ── INFO SCORES (shown on card, never block) ───────────────
+                    # Band accuracy
+                    _ma      = league_model.get("margin_acc", {})
+                    _bba     = league_model.get("btts_band_acc", {"yes":{}, "no":{}})
+                    _oba     = league_model.get("o25_band_acc",  {"yes":{}, "no":{}})
+                    _1x2_b   = str(int(p["conf"]          // 5) * 5)
+                    _bt_b    = str(int(p.get("btts",  50) // 5) * 5)
+                    _o25_b   = str(int(p.get("over25",50) // 5) * 5)
+                    _bt_side = "yes" if p.get("btts",  50) >= 50 else "no"
+                    _o25_side= "yes" if p.get("over25",50) >= 50 else "no"
+
+                    def _band_acc(src, bkt, side=None):
+                        d = src[side] if side else src
+                        rec = d.get(bkt, [0, 0])
+                        return rec[0] / rec[1] if rec[1] >= 10 else None
+
+                    _s1x2 = _band_acc(_ma,  _1x2_b)
+                    _sbt  = _band_acc(_bba,  _bt_b,  _bt_side)
+                    _so25 = _band_acc(_oba,  _o25_b, _o25_side)
+                    _trusted     = [s for s in [_s1x2, _sbt, _so25] if s is not None and s >= 0.60]
+                    _no_band_data = all(s is None for s in [_s1x2, _sbt, _so25])
+
+                    if _trusted:
+                        _g3_score = round(max(_trusted) * 100)
+                        _g3_label = f"✅ {_g3_score}% bot accuracy"
+                    elif _no_band_data:
+                        _g3_score = round(p["conf"])
+                        _g3_label = f"🔵 {_g3_score}% conf (building)"
+                    else:
+                        _g3_score = round(max(s for s in [_s1x2,_sbt,_so25] if s is not None)*100)
+                        _g3_label = f"🟡 {_g3_score}% bot accuracy"
+
+                    # Momentum
+                    _hm_g  = p.get("home_momentum") or {}
+                    _am_g  = p.get("away_momentum") or {}
+                    _has_mom = (_hm_g.get("games_used", 0) >= 3 and
+                                _am_g.get("games_used", 0) >= 3)
+                    _hw_g  = _hm_g.get("win_pct", 0)
+                    _aw_g  = _am_g.get("win_pct", 0)
+                    _ht_g  = _hm_g.get("trend", "STABLE")
+                    _at_g  = _am_g.get("trend", "STABLE")
+
+                    if _tip_g == "HOME":
+                        _winner_mom = _hw_g; _loser_mom = _aw_g
+                        _winner_trend = _ht_g; _loser_trend = _at_g
+                    else:
+                        _winner_mom = _aw_g; _loser_mom = _hw_g
+                        _winner_trend = _at_g; _loser_trend = _ht_g
+
                     if _has_mom:
                         _mom_gap = _winner_mom - _loser_mom
-                        if (_winner_trend == "RISING" and _winner_mom >= 50 and
-                                _loser_trend in ("STABLE","FALLING") and _loser_mom <= 33):
-                            _g4_score = round(min(70 + _mom_gap * 0.3, 95))
-                            _g4_label = f"✅ Rising {_winner_mom:.0f}% vs {_loser_trend.lower()} {_loser_mom:.0f}%"
-                        elif (_winner_trend == "STABLE" and _winner_mom >= 50 and
-                                _loser_trend == "FALLING" and _loser_mom <= 33):
-                            _g4_score = round(min(65 + _mom_gap * 0.3, 90))
-                            _g4_label = f"✅ Stable {_winner_mom:.0f}% vs falling {_loser_mom:.0f}%"
-                        elif _winner_mom >= 50 and _mom_gap >= 25:
-                            _g4_score = round(min(60 + _mom_gap * 0.3, 88))
+                        if _winner_mom >= 50 and _mom_gap >= 25:
+                            _g4_score = round(min(65 + _mom_gap * 0.3, 92))
                             _g4_label = f"✅ {_winner_mom:.0f}% vs {_loser_mom:.0f}% (+{_mom_gap:.0f}%)"
-                        elif _winner_mom >= 50 and _mom_gap >= 15:
+                        elif _winner_mom >= 50 and _mom_gap >= 10:
                             _g4_score = round(min(55 + _mom_gap * 0.3, 80))
-                            _g4_label = f"🟡 {_winner_mom:.0f}% vs {_loser_mom:.0f}% (+{_mom_gap:.0f}%)"
+                            _g4_label = f"🟡 {_winner_mom:.0f}% vs {_loser_mom:.0f}%"
                         elif _winner_mom >= _loser_mom:
-                            _g4_score = round(min(45 + _mom_gap * 0.3, 70))
+                            _g4_score = round(min(45 + _mom_gap * 0.3, 65))
                             _g4_label = f"🟡 {_winner_mom:.0f}% vs {_loser_mom:.0f}%"
                         else:
-                            _g4_score = round(max(20, 40 + _mom_gap * 0.3))
-                            _g4_label = f"🔴 {_winner_mom:.0f}% vs {_loser_mom:.0f}% (loser ahead)"
+                            _g4_score = round(max(20, 35 + _mom_gap * 0.3))
+                            _g4_label = f"🔴 {_winner_mom:.0f}% vs {_loser_mom:.0f}%"
                     else:
                         _g4_score = 50
-                        _g4_label = "🔵 building form data"
+                        _g4_label = "🔵 building"
 
-                    # ── COMBINED OVERALL SCORE ─────────────────────────────────
-                    # Weights: S-W(20%) + Band(25%) + History(25%) + Momentum(30%)
+                    # ── COMBINED OVERALL (info only) ───────────────────────────
                     _overall = round(
-                        _g1_score * 0.20 +
-                        _g2_score * 0.25 +
-                        _g3_score * 0.25 +
-                        _g4_score * 0.30
+                        _g1_score * 0.25 +
+                        _g2_score * 0.35 +
+                        _g3_score * 0.20 +
+                        _g4_score * 0.20
                     )
                     if   _overall >= 80: _overall_label = "🔥 STRONG PICK"
-                    elif _overall >= 65: _overall_label = "✅ GOOD PICK"
+                    elif _overall >= 67: _overall_label = "✅ GOOD PICK"
                     elif _overall >= 50: _overall_label = "🟡 MODERATE"
                     else:                _overall_label = "🔴 WEAK SIGNAL"
-
-                    # Block only if overall is very low AND band data exists and fails
-                    if _overall < 45 and not _no_band_data and not _trusted:
-                        continue
 
                     hs, as_ = m["hs"], m["as_"]
                     total  += 1
@@ -10048,6 +10034,7 @@ async def _run_auto_post(bot, bot_data: dict):
                     match_cards.append(card)
 
                 if not body:
+                    _had_events = True  # events evaluated but none passed filters
                     continue
 
                 if has_scores and total:
