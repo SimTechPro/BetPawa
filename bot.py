@@ -9755,7 +9755,11 @@ async def _run_auto_post(bot, bot_data: dict):
                         # No standings yet — hard block, cannot filter without standings
                         continue  # ❌ FILTER 1 FAILED — no standings data yet
 
-                    # ── HARD FILTER 2: History ≥67% with min 5 meetings ────────
+                    # ── HARD FILTER 2: History — winner leads clearly ──────────
+                    # Virtual football: each fixture plays ~8-9 times total
+                    # 67% was too strict — almost nothing passes in virtual football
+                    # 60% is realistic: 3/5 or 4/7 wins confirms clear dominance
+                    # Min 3 meetings required (new season may only have 1-2 so far)
                     _fc_g      = p.get("fixture_case", {}) or {}
                     _fc_n_g    = _fc_g.get("n_meetings", 0)
                     _h_hist    = _fc_g.get("home_win_pct", 0)
@@ -9767,21 +9771,21 @@ async def _run_auto_post(bot, bot_data: dict):
                     else:
                         _winner_hist = _a_hist; _loser_hist = _h_hist
 
-                    _g2_passed = False
-                    if _fc_n_g >= 5:
-                        if _winner_hist >= 67:
-                            _g2_passed = True
-                            _g2_score  = round(_winner_hist)
-                            _g2_label  = f"✅ {_g2_score}% in {_fc_n_g} meetings"
+                    if _fc_n_g >= 3:
+                        if _winner_hist >= 60:
+                            _g2_score = round(_winner_hist)
+                            _g2_label = f"✅ {_g2_score}% in {_fc_n_g} meetings"
                         else:
-                            # History exists but winner below 67% — hard block
+                            # History exists but winner not clearly dominant — block
                             continue  # ❌ FILTER 2 FAILED — history not strong enough
                     else:
-                        # Fewer than 5 meetings — hard block, not enough data
-                        continue  # ❌ FILTER 2 FAILED — need 5+ meetings
+                        # Fewer than 3 meetings — not enough data yet
+                        continue  # ❌ FILTER 2 FAILED — need 3+ meetings
 
                     # ── INFO SCORES (shown on card, never block) ───────────────
-                    # Band accuracy
+                    # Band accuracy — INFO ONLY, never a hard filter
+                    # Bot's 1X2 accuracy is 34-39% across all bands — not reliable
+                    # enough to use as a gate. Only used for display context.
                     _ma      = league_model.get("margin_acc", {})
                     _bba     = league_model.get("btts_band_acc", {"yes":{}, "no":{}})
                     _oba     = league_model.get("o25_band_acc",  {"yes":{}, "no":{}})
@@ -9799,19 +9803,20 @@ async def _run_auto_post(bot, bot_data: dict):
                     _s1x2 = _band_acc(_ma,  _1x2_b)
                     _sbt  = _band_acc(_bba,  _bt_b,  _bt_side)
                     _so25 = _band_acc(_oba,  _o25_b, _o25_side)
-                    _trusted     = [s for s in [_s1x2, _sbt, _so25] if s is not None and s >= 0.60]
+                    _trusted      = [s for s in [_s1x2, _sbt, _so25] if s is not None and s >= 0.60]
                     _no_band_data = all(s is None for s in [_s1x2, _sbt, _so25])
 
                     if _trusted:
                         _g3_score = round(max(_trusted) * 100)
                         _g3_label = f"✅ {_g3_score}% bot accuracy"
                     elif _no_band_data:
-                        # No band data yet — allow through, early season
                         _g3_score = round(p["conf"])
                         _g3_label = f"🔵 {_g3_score}% conf (building)"
                     else:
-                        # Band data exists but below 60% — hard block
-                        continue  # ❌ BAND FILTER FAILED
+                        # Band exists but below threshold — show as info, never block
+                        _best = max((s for s in [_s1x2,_sbt,_so25] if s is not None), default=0)
+                        _g3_score = round(_best * 100)
+                        _g3_label = f"🟡 {_g3_score}% bot accuracy"
 
                     # Momentum
                     _hm_g  = p.get("home_momentum") or {}
@@ -9848,7 +9853,7 @@ async def _run_auto_post(bot, bot_data: dict):
                         _g4_score = 50
                         _g4_label = "🔵 building"
 
-                    # ── COMBINED OVERALL (info only) ───────────────────────────
+                    # ── COMBINED OVERALL ───────────────────────────────────────
                     _overall = round(
                         _g1_score * 0.25 +
                         _g2_score * 0.35 +
@@ -9859,6 +9864,13 @@ async def _run_auto_post(bot, bot_data: dict):
                     elif _overall >= 67: _overall_label = "✅ GOOD PICK"
                     elif _overall >= 50: _overall_label = "🟡 MODERATE"
                     else:                _overall_label = "🔴 WEAK SIGNAL"
+
+                    # ── FINAL QUALITY GATE — only the best pass through ────────
+                    # Both hard filters already passed (Strategy + History).
+                    # Now only show STRONG PICK (≥80) or GOOD PICK (≥67).
+                    # Moderate and weak signals are skipped silently.
+                    if _overall < 67:
+                        continue  # ❌ QUALITY GATE — overall score too low
 
                     hs, as_ = m["hs"], m["as_"]
                     total  += 1
