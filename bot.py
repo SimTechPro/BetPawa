@@ -9638,8 +9638,20 @@ async def _run_auto_post(bot, bot_data: dict):
                     log.info(f"auto_post: stats not cached yet for {lid}, skipping")
                     continue
 
-                # Fetch next round for this league
-                round_name, round_id, _cur_season_id, events, has_scores = await fetch_next_round(client, lid)
+                # Fetch next round — wait for previous round to finish first
+                # fetch_completed_round returns upcoming odds BUT only proceeds
+                # when the just-finished round has confirmed scores.
+                # This ensures last-game results are final before we filter.
+                round_name, round_id, _cur_season_id, events, _prev_confirmed = \
+                    await fetch_completed_round(client, lid)
+                if not events or not round_id:
+                    continue
+
+                # Only predict once previous round is confirmed complete
+                # This ensures standings + last game results are final
+                if not _prev_confirmed:
+                    log.debug(f"auto_post [{lid}]: previous round not yet confirmed — waiting")
+                    continue
                 if not events or not round_id:
                     continue
 
@@ -10066,6 +10078,8 @@ async def _run_auto_post(bot, bot_data: dict):
 
                 _had_events = True  # league had events AND predictions passed
 
+                # Upcoming round never has scores yet — always awaiting results
+                has_scores = False
                 if has_scores and total:
                     acc      = round(agreed / total * 100)
                     acc_line = f"📊 *{agreed}/{total} correct ({acc}%)*\n"
