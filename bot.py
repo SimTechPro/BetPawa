@@ -126,10 +126,10 @@ LEAGUES: dict[int, dict] = {
     7794:  {"name": "England",     "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
     7795:  {"name": "Spain",       "flag": "🇪🇸"},
     7796:  {"name": "Italy",       "flag": "🇮🇹"},
-    9184:  {"name": "Germany",     "flag": "🇩🇪"},
     9183:  {"name": "France",      "flag": "🇫🇷"},
-    13774: {"name": "Netherlands", "flag": "🇳🇱"},
-    13773: {"name": "Portugal",    "flag": "🇵🇹"},
+    9184:  {"name": "Netherlands", "flag": "🇳🇱"},
+    13773: {"name": "Germany",     "flag": "🇩🇪"},
+    13774: {"name": "Portugal",    "flag": "🇵🇹"},
 }
 
 def ld(league_id: int) -> str:
@@ -156,19 +156,19 @@ LEAGUE_TEAMS: dict[int, set[str]] = {
         "ATA","BOL","CAG","COM","CRE","FIO","GEN","INT","JUV","LAZ",
         "LEC","MIL","NAP","PAR","PIS","ROM","SAS","TOR","UDI","VER",
     },
-    9184: {  # Germany (seed) — 18 teams
-        "AUG","COL","DOR","EIN","FCB","FRE","HEI","HOF",
-        "HSV","LEV","MAI","MON","RBL","STP","STU","UNI","WER","WOL",
-    },
     9183: {  # France (seed)
         "ASM","AUX","BRE","HAV","LEN","LIL","LOR","LYO",
         "MAR","MET","NAN","NIC","PSG","REN","STR","TOU","ANG","PAR",
     },
-    13774: {  # Netherlands (seed)
+    9184: {  # Netherlands (seed) — 18 teams
         "AJA","AZA","EXC","FEY","FOR","GAE","HEE","HER",
         "NAC","NEC","PEC","PSV","SPA","TEL","TWE","UTR","VOL","GRO",
     },
-    13773: {  # Portugal (seed) — 18 teams
+    13773: {  # Germany (seed) — 18 teams
+        "AUG","COL","DOR","EIN","FCB","FRE","HEI","HOF",
+        "HSV","LEV","MAI","MON","RBL","STP","STU","UNI","WER","WOL",
+    },
+    13774: {  # Portugal (seed) — 18 teams
         "ALV","ARO","AVS","BEN","BRA","CAS","EST","ETA","FAM",
         "GIL","GUI","MOR","NAC","POR","RIO","SAN","SPO","TON",
     },
@@ -8058,10 +8058,10 @@ async def _learning_job(context):
             7794: {"AST","ARS","BOU","BRE","BUR","CHE","CRY","EVE","FUL","LIV","MCI","MUN","NEW","NOT","TOT","WHU","WOL","BHA","SUN","LEE"},
             7795: {"ALA","ATH","ATM","BAR","BET","CEL","ELC","ESP","GET","GIR","LEV","MAL","OSA","OVI","RAY","RMA","RSO","SEV","VAL","VIL"},
             7796: {"ATA","BOL","CAG","COM","CRE","FIO","GEN","INT","JUV","LAZ","LEC","MIL","NAP","PAR","PIS","ROM","SAS","TOR","UDI","VER"},
-            9184: {"AUG","COL","DOR","EIN","FCB","FRE","HEI","HOF","HSV","LEV","MAI","MON","RBL","STP","STU","UNI","WER","WOL"},
             9183: {"ANG","ASM","AUX","BRE","HAV","LEN","LIL","LOR","LYO","MAR","MET","NAN","NIC","PAR","PSG","REN","STR","TOU"},
-            13774: {"AJA","AZA","EXC","FEY","FOR","GAE","HEE","HER","NAC","NEC","PEC","PSV","SPA","TEL","TWE","UTR","VOL","GRO"},
-            13773: {"ALV","ARO","AVS","BEN","BRA","CAS","EST","ETA","FAM","GIL","GUI","MOR","NAC","POR","RIO","SAN","SPO","TON"},
+            9184: {"AJA","AZA","EXC","FEY","FOR","GAE","HEE","HER","NAC","NEC","PEC","PSV","SPA","TEL","TWE","UTR","VOL","GRO"},
+            13773: {"AUG","COL","DOR","EIN","FCB","FRE","HEI","HOF","HSV","LEV","MAI","MON","RBL","STP","STU","UNI","WER","WOL"},
+            13774: {"ALV","ARO","AVS","BEN","BRA","CAS","EST","ETA","FAM","GIL","GUI","MOR","NAC","POR","RIO","SAN","SPO","TON"},
         }
         for _lid, _seed in _SEED.items():
             _before = len(LEAGUE_TEAMS.get(_lid, set()))
