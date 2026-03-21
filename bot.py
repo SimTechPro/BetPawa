@@ -1193,6 +1193,8 @@ async def fetch_completed_round(client, league_id: int):
 
     # Check if the just-ended round has confirmed scores
     has_confirmed_scores = False
+    prev_round_id        = ""
+    prev_scores          = {}  # fixture_key → (score_h, score_a)
 
     # First try: just_ended from actual rounds list (normal case)
     # Fallback: most recent past round (fresh start / bot was offline)
@@ -1200,10 +1202,9 @@ async def fetch_completed_round(client, league_id: int):
     if just_ended:
         _check_round = just_ended
     else:
-        # Bot just started or previous round already moved to past list
         past_rounds = await fetch_round_list(client, league_id, past=True)
         if past_rounds:
-            _check_round = past_rounds[0]  # most recent past round
+            _check_round = past_rounds[0]
 
     if _check_round:
         _check_id    = str(_check_round.get("id") or _check_round.get("gameRoundId") or "")
@@ -1214,23 +1215,24 @@ async def fetch_completed_round(client, league_id: int):
                 _extract_score(e)[0] is not None for e in score_events
             )
             if has_confirmed_scores:
-                # Merge scores into upcoming events by position
-                for i, ev in enumerate(events):
-                    if i < len(score_events):
-                        sc = score_events[i]
-                        sh, sa = _extract_score(sc)
-                        if sh is not None and sa is not None:
-                            if "results" not in ev or not ev["results"]:
-                                ev = dict(ev)
-                                ev["_injected_score_h"] = sh
-                                ev["_injected_score_a"] = sa
-                                events[i] = ev
+                prev_round_id = _check_id
+                # Build score map for previous round — used to update old cards
+                # Do NOT inject into upcoming events (those are not yet played)
+                for sc in score_events:
+                    nm = _norm_event(sc)
+                    sh, sa = _extract_score(sc)
+                    if sh is not None and sa is not None and nm["home"] and nm["away"]:
+                        fk = _fixture_key(nm["home"], nm["away"])
+                        prev_scores[fk]                          = (sh, sa)
+                        prev_scores[f"{nm['home']}|{nm['away']}"] = (sh, sa)
+                        prev_scores[f"{nm['away']}|{nm['home']}"] = (sa, sh)
 
     log.info(f"✅ [{league_id}] fetch_completed_round {upcoming_id}: "
              f"{len(events)} events, with_odds={with_odds}/{len(events)}, "
-             f"scores_confirmed={has_confirmed_scores}")
+             f"confirmed={has_confirmed_scores}, prev_rid={prev_round_id}, "
+             f"prev_scores={len(prev_scores)}")
 
-    return upcoming_name, upcoming_id, season_id, events, has_confirmed_scores
+    return upcoming_name, upcoming_id, season_id, events, has_confirmed_scores, prev_round_id, prev_scores
 
 
 async def fetch_live_round(client, league_id: int):
@@ -9803,8 +9805,26 @@ async def _run_auto_post(bot, bot_data: dict):
                 # Fetch next round — wait for previous round to finish first
                 # fetch_completed_round only confirms when previous round scores are final
                 # This ensures standings + last game results are updated before filtering
-                round_name, round_id, _cur_season_id, events, _prev_confirmed = \
+                round_name, round_id, _cur_season_id, events, _prev_confirmed, \
+                    _prev_rid, _prev_scores = \
                     await fetch_completed_round(client, lid)
+
+                # ── Update previously sent cards with results ──────────────
+                # When previous round just finished, edit those sent cards
+                # to show ✅/❌ results instead of ⏳ pending
+                if _prev_rid and _prev_scores:
+                    _prev_sent_key = f"results_updated_{lid}_{_prev_rid}"
+                    if not bot_data.get(_prev_sent_key):
+                        bot_data[_prev_sent_key] = True
+                        # Store prev scores so send loop can update old messages
+                        bot_data.setdefault("pending_result_updates", {})
+                        bot_data["pending_result_updates"][f"{lid}:{_prev_rid}"] = {
+                            "lid":        lid,
+                            "round_id":   _prev_rid,
+                            "scores":     _prev_scores,
+                        }
+                        log.info(f"📊 Queued result update for lid={lid} prev_rid={_prev_rid} "
+                                 f"({len(_prev_scores)} scores)")
                 if not events or not round_id:
                     continue
 
@@ -10303,15 +10323,33 @@ async def _run_auto_post(bot, bot_data: dict):
         if not _had_events:
             # Nothing evaluated at all this tick — completely silent
             return
-        # Had events but zero predictions passed filters
-        # Use matchday number as skip key — one message per matchday total
-        _skip_md = Counter(matchday_nums).most_common(1)[0][0] if matchday_nums else "?"
-        # Build key from round_ids if available, else fall back to matchday
-        _skip_key_base = tuple(sorted(round_ids)) if round_ids else f"md_{_skip_md}"
-        _skip_key = f"auto_skip_notified_{_skip_key_base}"
+
+        # Before sending skip — check if ANY league already sent predictions
+        # for this same round_id. All leagues share the same round_id.
+        # If some leagues sent predictions, other leagues with no picks
+        # should stay silent — not fire a skip message.
+        _sent_map_now = bot_data.get("auto_sent_per_league", {})
+        _shared_rid   = round_ids[0].split(":")[-1] if round_ids else ""
+        if not _shared_rid and round_ids:
+            _shared_rid = round_ids[0].split(":")[-1]
+
+        # Get the round_id from any processed league this tick
+        _any_league_sent = any(
+            v == _shared_rid
+            for v in _sent_map_now.values()
+        ) if _shared_rid else False
+
+        if _any_league_sent:
+            # Some leagues already sent predictions this round — stay silent
+            return
+
+        # Truly zero predictions sent anywhere — send one skip per round_id
+        _skip_md  = Counter(matchday_nums).most_common(1)[0][0] if matchday_nums else "?"
+        _skip_rid = _shared_rid or _skip_md
+        _skip_key = f"auto_skip_notified_rid_{_skip_rid}"
         if not bot_data.get(_skip_key):
             bot_data[_skip_key] = True
-            _skip_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
+            _skip_ts  = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
             _skip_msg = (f"🤖 *MD{_skip_md}*  |  _{_skip_ts}_\n"
                          f"⏭️ No picks this round — no matches passed all filters")
             acc_s = _access(bot_data)
@@ -10325,7 +10363,7 @@ async def _run_auto_post(bot, bot_data: dict):
                                            parse_mode="Markdown")
                 except Exception:
                     pass
-            log.info(f"auto_post: skip notice sent for MD{_skip_md}")
+            log.info(f"auto_post: skip notice sent for MD{_skip_md} rid={_skip_rid}")
         return
 
     # One string per league for change detection
@@ -10416,6 +10454,38 @@ async def _run_auto_post(bot, bot_data: dict):
                     chat_msgs[f"{sec['lid']}_cards"] = _mid_list
                     _sent_map[_lid_str] = _rid_str  # mark as sent
 
+                    # Store card info + message IDs for result update later
+                    # When previous round finishes, we edit these messages with ✅/❌
+                    _card_infos = []
+                    for idx, card in enumerate(_mid_list):
+                        # Extract home/away/tip from round_preds if available
+                        # We stored round_preds in pending_predictions
+                        _card_infos.append({
+                            "msg_id":    card,
+                            "card_idx":  idx,
+                        })
+                    # Store round_preds per section for result lookup
+                    _sec_preds = sec.get("round_preds_ref", [])
+                    bot_data[f"sent_cards_{_lid_str}_{_rid_str}"] = [
+                        {
+                            "home":      pred.get("home", ""),
+                            "away":      pred.get("away", ""),
+                            "tip":       pred.get("tip", ""),
+                            "card_text": _hdr + _cards[i] if i < len(_cards) else "",
+                        }
+                        for i, pred in enumerate(
+                            (bot_data.get("pending_predictions", {})
+                             .get(_lid_str, {})
+                             .get(_rid_str, {})
+                             .get("preds", []))
+                        )
+                    ]
+                    # Store message IDs per chat for editing
+                    for chat2 in send_targets:
+                        _c2msgs = msg_ids.setdefault(str(chat2), {})
+                        _c2msgs[f"{_lid_str}_prev_cards_{_rid_str}"] = \
+                            msg_ids.get(str(chat), {}).get(f"{_lid_str}_cards", [])
+
                 any_sent = True
                 log.info(f"📨 New picks posted → {chat} ({sum(len(s.get('match_cards',[])) for s in sections)} matches, round_key={round_key})")
             except Exception as exc:
@@ -10460,7 +10530,70 @@ async def _run_auto_post(bot, bot_data: dict):
                             log.warning(f"fresh send failed → {chat}: {exc}")
             log.info(f"✏️  Match cards updated with scores → {chat}")
         bot_data["auto_last_body"] = body_text
-        bot_data["auto_last_body"] = body_text
+
+    # ── Update previously sent cards with results ──────────────────────────────
+    # After previous round finishes, edit those cards to show ✅/❌ + score
+    _pending_updates = bot_data.get("pending_result_updates", {})
+    if _pending_updates:
+        _processed_keys = []
+        for _upd_key, _upd in list(_pending_updates.items()):
+            _upd_lid     = _upd.get("lid")
+            _upd_rid     = _upd.get("round_id")
+            _upd_scores  = _upd.get("scores", {})
+            if not _upd_scores:
+                _processed_keys.append(_upd_key)
+                continue
+
+            # Find stored cards for this league+round
+            _stored_cards = bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", [])
+            if not _stored_cards:
+                _processed_keys.append(_upd_key)
+                continue
+
+            for chat in send_targets:
+                chat_msgs = msg_ids.get(str(chat), {})
+                _mid_list = chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}", [])
+                for idx, card_info in enumerate(_stored_cards):
+                    if idx >= len(_mid_list):
+                        break
+                    _h = card_info.get("home", "")
+                    _a = card_info.get("away", "")
+                    _tip = card_info.get("tip", "")
+                    # Look up score
+                    fk = _fixture_key(_h, _a)
+                    score = (_upd_scores.get(fk) or
+                             _upd_scores.get(f"{_h}|{_a}") or
+                             _upd_scores.get(f"{_a}|{_h}"))
+                    if not score:
+                        continue
+                    sh, sa = score
+                    ft_out = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
+                    tip_out = _tip.split()[0] if _tip else ""
+                    ok = (tip_out == ft_out)
+                    result_str = f"{'✅' if ok else '❌'} {sh}–{sa}"
+                    # Rebuild card with result replacing ⏳ pending
+                    new_card = card_info.get("card_text", "").replace(
+                        "⏳ pending", result_str
+                    )
+                    if new_card and new_card != card_info.get("card_text", ""):
+                        try:
+                            await bot.edit_message_text(
+                                chat_id=chat,
+                                message_id=_mid_list[idx],
+                                text=new_card,
+                                parse_mode="Markdown"
+                            )
+                            await asyncio.sleep(0.2)
+                        except Exception as exc:
+                            if "Message is not modified" not in str(exc):
+                                log.warning(f"result edit failed → {chat} lid={_upd_lid}: {exc}")
+
+            _processed_keys.append(_upd_key)
+            log.info(f"✅ Results updated for lid={_upd_lid} rid={_upd_rid}")
+
+        # Clean up processed updates
+        for k in _processed_keys:
+            _pending_updates.pop(k, None)
 
 
 async def _standings_job(context):
