@@ -1193,23 +1193,33 @@ async def fetch_completed_round(client, league_id: int):
 
     # Check if the just-ended round has confirmed scores
     has_confirmed_scores = False
+
+    # First try: just_ended from actual rounds list (normal case)
+    # Fallback: most recent past round (fresh start / bot was offline)
+    _check_round = None
     if just_ended:
-        just_ended_id = str(just_ended.get("id") or just_ended.get("gameRoundId") or "")
-        score_events  = await fetch_round_events(client, just_ended_id, PAGE_MATCHUPS)
-        score_events  = _filter_league(score_events, league_id)
+        _check_round = just_ended
+    else:
+        # Bot just started or previous round already moved to past list
+        past_rounds = await fetch_round_list(client, league_id, past=True)
+        if past_rounds:
+            _check_round = past_rounds[0]  # most recent past round
+
+    if _check_round:
+        _check_id    = str(_check_round.get("id") or _check_round.get("gameRoundId") or "")
+        score_events = await fetch_round_events(client, _check_id, PAGE_MATCHUPS)
+        score_events = _filter_league(score_events, league_id)
         if score_events:
             has_confirmed_scores = all(
                 _extract_score(e)[0] is not None for e in score_events
             )
             if has_confirmed_scores:
                 # Merge scores into upcoming events by position
-                # (same fixture order guaranteed within a season)
                 for i, ev in enumerate(events):
                     if i < len(score_events):
                         sc = score_events[i]
                         sh, sa = _extract_score(sc)
                         if sh is not None and sa is not None:
-                            # Inject score into upcoming event
                             if "results" not in ev or not ev["results"]:
                                 ev = dict(ev)
                                 ev["_injected_score_h"] = sh
@@ -9800,13 +9810,19 @@ async def _run_auto_post(bot, bot_data: dict):
 
                 # Only predict once previous round is confirmed complete
                 if not _prev_confirmed:
-                    log.debug(f"auto_post [{lid}]: previous round not yet confirmed — waiting")
-                    continue
+                    # Cold start grace: if match_log is empty (fresh deploy with
+                    # no brain data), allow through — data_collector will backfill
+                    # past rounds and standings will build up within minutes.
+                    _ml_size = len(_get_model(bot_data, lid).get("match_log", []))
+                    if _ml_size < 18:
+                        log.info(f"auto_post [{lid}]: cold start — match_log has {_ml_size} entries, allowing through")
+                    else:
+                        log.debug(f"auto_post [{lid}]: previous round not yet confirmed — waiting")
+                        continue
 
-                # If this league+round was already sent — mark done and move on silently
+                # If this league+round was already sent — silent, move on
                 _sent_map_check = bot_data.get("auto_sent_per_league", {})
                 if _sent_map_check.get(str(lid)) == str(round_id):
-                    _had_events = True  # already handled this round
                     continue
 
                 round_ids.append(f"{lid}:{round_id}")
@@ -9818,6 +9834,11 @@ async def _run_auto_post(bot, bot_data: dict):
 
                 # Get learned model for this league
                 league_model = _get_model(bot_data, lid)
+
+                # Always save current season ID so standings job uses correct season
+                if _cur_season_id:
+                    league_model["_current_season_id"] = str(_cur_season_id)
+
                 # Cache standings + tier_map into model so predict_match
                 # can access them for momentum and fixture investigation
                 _st_now = bot_data.get(f"standings_{lid}", {})
@@ -10280,15 +10301,17 @@ async def _run_auto_post(bot, bot_data: dict):
 
     if not sections:
         if not _had_events:
-            # No events at all this tick — completely silent
+            # Nothing evaluated at all this tick — completely silent
             return
-        # Events were evaluated across all leagues but ZERO predictions passed
-        # Send one skip notice per round combination only
-        _skip_key = f"auto_skip_notified_{tuple(sorted(round_ids))}"
+        # Had events but zero predictions passed filters
+        # Use matchday number as skip key — one message per matchday total
+        _skip_md = Counter(matchday_nums).most_common(1)[0][0] if matchday_nums else "?"
+        # Build key from round_ids if available, else fall back to matchday
+        _skip_key_base = tuple(sorted(round_ids)) if round_ids else f"md_{_skip_md}"
+        _skip_key = f"auto_skip_notified_{_skip_key_base}"
         if not bot_data.get(_skip_key):
             bot_data[_skip_key] = True
             _skip_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
-            _skip_md = Counter(matchday_nums).most_common(1)[0][0] if matchday_nums else "?"
             _skip_msg = (f"🤖 *MD{_skip_md}*  |  _{_skip_ts}_\n"
                          f"⏭️ No picks this round — no matches passed all filters")
             acc_s = _access(bot_data)
@@ -10302,7 +10325,7 @@ async def _run_auto_post(bot, bot_data: dict):
                                            parse_mode="Markdown")
                 except Exception:
                     pass
-        log.info("auto_post: no qualifying picks — skip notice sent")
+            log.info(f"auto_post: skip notice sent for MD{_skip_md}")
         return
 
     # One string per league for change detection
