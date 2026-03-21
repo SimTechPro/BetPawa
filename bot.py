@@ -3194,7 +3194,136 @@ def _fp_similarity(fp_key: tuple, query_key: tuple) -> float:
     return (score_w / total_w) if total_w > 0 else 0.0
 
 
-def _h2h_home_analysis(fp_db: dict, home: str, away: str) -> dict:
+def _detect_odds_repeat(fp_db: dict, home: str, away: str,
+                         current_odds: dict) -> dict:
+    """
+    Detect if current match odds match any historical record for this fixture.
+
+    Checks each market independently:
+      - 1X2 (home/draw/away odds)
+      - DC  (1X / X2 / 12 odds)
+      - BTTS (yes/no odds)
+      - O/U 1.5, 2.5, 3.5
+      - HT/FT (main outcomes)
+
+    Returns:
+      matched:       bool — at least 2 markets matched
+      match_pct:     float 0-100 — % of available markets that matched
+      markets_matched: list of matched market names
+      markets_total:   int — total markets available in current odds
+      repeat_count:  int — how many historical records matched
+      best_record:   dict — the closest matching historical record
+      confidence:    float 0-100 — how confident this is a true repeat
+      outcome:       str — what result happened last time (from best_record)
+      star_label:    str — formatted label for card display
+    """
+    canon = sorted([home, away])
+    fk    = "|".join(canon)
+    recs  = fp_db.get(fk, [])
+
+    if not recs or not current_odds:
+        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+
+    cur_fp = list(_odds_fp_key(current_odds))
+    if not any(cur_fp):
+        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+
+    # Market groups and which fp_key indices they use
+    market_groups = {
+        "1X2":   [0, 1, 2],
+        "DC":    [7, 8, 9],
+        "BTTS":  [6],
+        "O/U1.5":[3],
+        "O/U2.5":[4],
+        "O/U3.5":[5],
+        "HT/FT": [10, 11, 12, 13],
+    }
+
+    # Which markets have data in current odds
+    available_markets = []
+    for mkt, indices in market_groups.items():
+        if any(cur_fp[i] > 0 for i in indices if i < len(cur_fp)):
+            available_markets.append(mkt)
+
+    n_available = len(available_markets)
+    if n_available == 0:
+        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+
+    best_sim    = 0.0
+    best_record = None
+    matched_records = []
+
+    for rec in recs:
+        rec_fp = tuple(rec.get("fp_key", []))
+        if not rec_fp:
+            continue
+        sim = _fp_similarity(rec_fp, tuple(cur_fp))
+        if sim >= 0.85:  # high similarity threshold
+            matched_records.append((sim, rec))
+            if sim > best_sim:
+                best_sim    = sim
+                best_record = rec
+
+    if not best_record:
+        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+
+    # Count which individual markets matched in the best record
+    best_fp = tuple(best_record.get("fp_key", []))
+    matched_markets = []
+    for mkt, indices in market_groups.items():
+        if mkt not in available_markets:
+            continue
+        # Check if this market's odds are close enough in the best record
+        mkt_match = True
+        mkt_has_data = False
+        for i in indices:
+            if i >= len(cur_fp) or i >= len(best_fp):
+                continue
+            if cur_fp[i] == 0.0 or best_fp[i] == 0.0:
+                continue
+            mkt_has_data = True
+            # Tolerance: within 10% of odds value
+            tol = 0.10
+            if abs(cur_fp[i] - best_fp[i]) > tol:
+                mkt_match = False
+                break
+        if mkt_has_data and mkt_match:
+            matched_markets.append(mkt)
+
+    n_matched = len(matched_markets)
+    if n_matched < 2:  # require at least 2 markets to match
+        return {"matched": False, "match_pct": 0, "repeat_count": 0}
+
+    match_pct   = round(n_matched / n_available * 100)
+    repeat_count = len(matched_records)
+    outcome      = best_record.get("outcome", "?")
+    confidence   = round(best_sim * 100)
+
+    # Build star label
+    mkts_str = " + ".join(matched_markets)
+    if match_pct == 100:
+        star_label = (f"⭐ *ODDS REPEAT* — all {n_matched} markets match!\n"
+                      f"┆    Happened {repeat_count}x before → result: *{outcome}*\n"
+                      f"┆    Markets: {mkts_str}  ({confidence}% match)")
+    else:
+        star_label = (f"⭐ *ODDS REPEAT* — {n_matched}/{n_available} markets ({match_pct}%)\n"
+                      f"┆    Happened {repeat_count}x → result: *{outcome}*\n"
+                      f"┆    Matched: {mkts_str}  ({confidence}% sim)")
+
+    return {
+        "matched":          True,
+        "match_pct":        match_pct,
+        "markets_matched":  matched_markets,
+        "markets_total":    n_available,
+        "repeat_count":     repeat_count,
+        "best_record":      best_record,
+        "confidence":       confidence,
+        "outcome":          outcome,
+        "star_label":       star_label,
+        "best_sim":         best_sim,
+    }
+
+
     """
     Full H2H analysis between two teams — used when odds don't match well.
 
@@ -7701,12 +7830,32 @@ def _learn_from_round(bot_data: dict, league_id: int,
             _strat_tip = pred.get("strategy_tip")
             _strat_mkt = pred.get("strategy_market")
             if _strat_tip and _strat_mkt:
-                # Determine actual outcome
-                _actual_out = ft_out  # "HOME" / "AWAY" / "DRAW"
-                # For BTTS: check if both teams scored
+                _actual_out = ft_out
                 _btts_actual = "BTTS_YES" if (ah > 0 and aa > 0) else "BTTS_NO"
                 _learn_actual = _btts_actual if _strat_mkt == "BTTS" else _actual_out
                 _strategy_update_stats(bot_data, _strat_mkt, _strat_tip, _learn_actual)
+
+            # ── Odds repeat learning ──────────────────────────────────────────
+            if pred.get("odds_repeat"):
+                _or_stats = bot_data.setdefault("odds_repeat_stats", {
+                    "total": 0, "correct": 0,
+                    "full_match_total": 0, "full_match_correct": 0,
+                    "partial_match_total": 0, "partial_match_correct": 0,
+                })
+                _or_pct      = pred.get("odds_repeat_pct", 0)
+                _or_outcome  = pred.get("odds_repeat_outcome", "")
+                _or_correct  = (_or_outcome == ft_out)
+                _or_stats["total"]   = _or_stats.get("total", 0) + 1
+                if _or_correct:
+                    _or_stats["correct"] = _or_stats.get("correct", 0) + 1
+                if _or_pct == 100:
+                    _or_stats["full_match_total"]   = _or_stats.get("full_match_total", 0) + 1
+                    if _or_correct:
+                        _or_stats["full_match_correct"] = _or_stats.get("full_match_correct", 0) + 1
+                else:
+                    _or_stats["partial_match_total"]   = _or_stats.get("partial_match_total", 0) + 1
+                    if _or_correct:
+                        _or_stats["partial_match_correct"] = _or_stats.get("partial_match_correct", 0) + 1
             ota = model.setdefault("outcome_type_acc", {
                 "HOME": {"correct":0,"total":0},
                 "DRAW": {"correct":0,"total":0},
@@ -8274,6 +8423,9 @@ async def _learning_job(context):
                     _learn_from_round(bot_data, league_id, preds, results,
                                        round_id=int(round_id) if round_id else 0,
                                        season_id=_p_season)
+                    # Always keep current season ID up to date in model
+                    if _p_season:
+                        _get_model(bot_data, league_id)["_current_season_id"] = str(_p_season)
                     _learn_algo_signals(_get_model(bot_data, league_id), preds, results,
                                         round_id_int=int(round_id) if round_id else 0)
                     _ai_postmatch_analysis(
@@ -9639,27 +9791,22 @@ async def _run_auto_post(bot, bot_data: dict):
                     continue
 
                 # Fetch next round — wait for previous round to finish first
-                # fetch_completed_round returns upcoming odds BUT only proceeds
-                # when the just-finished round has confirmed scores.
-                # This ensures last-game results are final before we filter.
+                # fetch_completed_round only confirms when previous round scores are final
+                # This ensures standings + last game results are updated before filtering
                 round_name, round_id, _cur_season_id, events, _prev_confirmed = \
                     await fetch_completed_round(client, lid)
                 if not events or not round_id:
                     continue
 
                 # Only predict once previous round is confirmed complete
-                # This ensures standings + last game results are final
                 if not _prev_confirmed:
                     log.debug(f"auto_post [{lid}]: previous round not yet confirmed — waiting")
                     continue
-                if not events or not round_id:
-                    continue
 
-                # Skip if this league+round was already sent
+                # If this league+round was already sent — mark done and move on silently
                 _sent_map_check = bot_data.get("auto_sent_per_league", {})
                 if _sent_map_check.get(str(lid)) == str(round_id):
-                    round_ids.append(f"{lid}:{round_id}")
-                    matchday_nums.append(str(round_name))
+                    _had_events = True  # already handled this round
                     continue
 
                 round_ids.append(f"{lid}:{round_id}")
@@ -10046,6 +10193,20 @@ async def _run_auto_post(bot, bot_data: dict):
                         round_preds[-1]["strategy_pct"]    = _strategy_result.get("strategy_pct")
                         round_preds[-1]["history_pct"]     = _strategy_result.get("history_pct")
 
+                    # ── Odds repeat detection ─────────────────────────────────
+                    _repeat_line = ""
+                    _fp_db_now   = league_model.get("fingerprint_db", {})
+                    _repeat      = _detect_odds_repeat(
+                        _fp_db_now, m["home"], m["away"], ev_odds
+                    )
+                    if _repeat.get("matched"):
+                        _repeat_line = f"┆ {_repeat['star_label']}\n"
+                        # Store repeat info for learning/tracking
+                        round_preds[-1]["odds_repeat"]         = True
+                        round_preds[-1]["odds_repeat_pct"]     = _repeat.get("match_pct", 0)
+                        round_preds[-1]["odds_repeat_outcome"] = _repeat.get("outcome", "")
+                        round_preds[-1]["odds_repeat_count"]   = _repeat.get("repeat_count", 0)
+
                     # ── Gate scores summary line ───────────────────────────────
                     _gate_line = (
                         f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -10066,6 +10227,7 @@ async def _run_auto_post(bot, bot_data: dict):
                         + _fc_line
                         + _mom_line
                         + _strategy_line
+                        + _repeat_line
                         + _gate_line
                         + f"{result_str}\n"
                     )
@@ -10281,23 +10443,20 @@ async def _run_auto_post(bot, bot_data: dict):
 async def _standings_job(context):
     """
     Dedicated standings refresh job — runs every 5 minutes independently.
-    Computes standings from fp_db match_log (self-calculated, no API needed).
-    Falls back to API only if fp_db has no data yet.
+    Computes standings from match_log (self-calculated, no API needed).
+    Uses CURRENT SEASON ONLY so positions are always accurate.
+    Refreshes every round (not every 10) so goals update immediately.
     """
     bot_data = context.bot_data
 
     for lid in LEAGUES:
-        _model_rds = (bot_data.get(f"model_{lid}") or {}).get("rounds_learned", 0)
-        _std_rds   = bot_data.get(f"standings_rounds_{lid}", 0)
-        _needs = (not bot_data.get(f"standings_{lid}") or
-                  _model_rds - _std_rds >= 10)
-        if not _needs:
-            continue
-
         try:
             league_model = _get_model(bot_data, lid)
             fp_db        = league_model.get("fingerprint_db", {})
             _ml          = league_model.get("match_log", [])
+
+            # Get current season ID from model
+            _cur_season  = str(league_model.get("_current_season_id", "") or "")
 
             # Filter to this league's teams only
             league_codes = LEAGUE_TEAMS.get(lid, set())
@@ -10307,11 +10466,22 @@ async def _standings_job(context):
                     if all(p in league_codes for p in fk.split("|"))
                 }
 
-            # Compute standings from stored match data
-            computed = _compute_standings_from_fp_db(fp_db, match_log=_ml)
+            # Compute standings from current season only
+            # This ensures MD1 starts fresh with 0 goals for all teams
+            computed = _compute_standings_from_fp_db(
+                fp_db,
+                season_id=_cur_season,
+                match_log=_ml
+            )
             rows = list(computed.values()) if computed else []
 
-            # Fallback: use stats if fp_db empty
+            # Fallback: if no current season data yet (very start of season)
+            # use all-time standings until first round is learned
+            if not rows and _ml:
+                computed = _compute_standings_from_fp_db(fp_db, match_log=_ml)
+                rows = list(computed.values()) if computed else []
+
+            # Final fallback: stats cache
             if not rows:
                 stats = bot_data.get(f"stats_{lid}", {})
                 if stats:
@@ -10334,9 +10504,10 @@ async def _standings_job(context):
 
             if rows:
                 bot_data[f"standings_{lid}"]        = {r["name"]: r for r in rows}
-                bot_data[f"standings_rounds_{lid}"] = _model_rds
-                log.info(f"📊 Standings computed [{lid}]: {len(rows)} teams "
-                         f"(from {'fp_db' if computed else 'stats'})")
+                bot_data[f"standings_rounds_{lid}"] = league_model.get("rounds_learned", 0)
+                log.info(f"📊 Standings updated [{lid}]: {len(rows)} teams "
+                         f"season={_cur_season or 'all'} "
+                         f"(source={'match_log' if computed else 'stats'})")
         except Exception as _e:
             log.debug(f"standings_job [{lid}]: {_e}")
 
@@ -11211,6 +11382,27 @@ async def _do_brainstat(message, c):
     # Strategy performance summary
     _strat_summary = _strategy_brain_summary(_bd)
 
+    # Odds repeat performance summary
+    _or_stats = _bd.get("odds_repeat_stats", {})
+    _or_total  = _or_stats.get("total", 0)
+    _or_correct= _or_stats.get("correct", 0)
+    _or_full_t = _or_stats.get("full_match_total", 0)
+    _or_full_c = _or_stats.get("full_match_correct", 0)
+    _or_part_t = _or_stats.get("partial_match_total", 0)
+    _or_part_c = _or_stats.get("partial_match_correct", 0)
+    if _or_total > 0:
+        _or_acc      = round(_or_correct/_or_total*100)
+        _or_full_acc = round(_or_full_c/_or_full_t*100) if _or_full_t else 0
+        _or_part_acc = round(_or_part_c/_or_part_t*100) if _or_part_t else 0
+        _or_summary  = (
+            f"⭐ *Odds Repeat Stats*\n"
+            f"   Overall: {_or_correct}/{_or_total} = {_or_acc}%\n"
+            f"   Full match (100%): {_or_full_c}/{_or_full_t} = {_or_full_acc}%\n"
+            f"   Partial match: {_or_part_c}/{_or_part_t} = {_or_part_acc}%\n"
+        )
+    else:
+        _or_summary = "⭐ *Odds Repeat Stats*: No data yet\n"
+
     header = (
         f"🧠 *Brain Training Report*\n"
         f"{'━'*26}\n"
@@ -11218,6 +11410,8 @@ async def _do_brainstat(message, c):
         f"📚 {active}/{len(LEAGUES)} leagues active\n"
         f"{'━'*26}\n\n"
         f"{_strat_summary}"
+        f"{'━'*26}\n\n"
+        f"{_or_summary}"
         f"{'━'*26}\n\n"
     )
 
@@ -11366,6 +11560,7 @@ async def _do_backup_inner(message, c):
         "allowed_channels":    channels,
         "pending_predictions": bd.get("pending_predictions", {}),
         "strategy_stats":      bd.get("strategy_stats", {}),
+        "odds_repeat_stats":   bd.get("odds_repeat_stats", {}),
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -11641,6 +11836,10 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     if "strategy_stats" in data and data["strategy_stats"]:
         bot_data["strategy_stats"] = data["strategy_stats"]
         log.info(f"✅ Restored strategy_stats from backup")
+
+    if "odds_repeat_stats" in data and data["odds_repeat_stats"]:
+        bot_data["odds_repeat_stats"] = data["odds_repeat_stats"]
+        log.info(f"✅ Restored odds_repeat_stats from backup")
 
     models = data.get("models", {})
     users  = data.get("users", {})
@@ -12357,10 +12556,10 @@ def main():
     app.job_queue.run_repeating(_data_collector_job, interval=240, first=300)  # 5min delay — gives time to restore brain before backfill runs
 
     # ── Standings refresh job — runs every 5 minutes independently ──────────────
-    app.job_queue.run_repeating(_standings_job, interval=300, first=60)
+    app.job_queue.run_repeating(_standings_job, interval=60, first=10)
 
     # ── Self-learning job — checks for new results every 6 min ─────────────────
-    app.job_queue.run_repeating(_learning_job, interval=360, first=90)
+    app.job_queue.run_repeating(_learning_job,      interval=120, first=90)
 
     # ── Auto-post every 30 seconds (uses cached stats only) ────────────────────
     app.job_queue.run_repeating(_auto_send_job, interval=30, first=70)
