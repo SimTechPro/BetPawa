@@ -9752,10 +9752,8 @@ async def _run_auto_post(bot, bot_data: dict):
                             _ww = m["home"] if (_h_tier=="WEAK" and _h_result=="WIN") else m["away"]
                             _g1_label = f"✅ {_ww}(Weak) won → opp WIN"
                     else:
-                        # No standings — allow through, learning still building
-                        _g1_passed = True
-                        _g1_score  = 60
-                        _g1_label  = "🔵 standings building"
+                        # No standings yet — hard block, cannot filter without standings
+                        continue  # ❌ FILTER 1 FAILED — no standings data yet
 
                     # ── HARD FILTER 2: History ≥67% with min 5 meetings ────────
                     _fc_g      = p.get("fixture_case", {}) or {}
@@ -9776,13 +9774,11 @@ async def _run_auto_post(bot, bot_data: dict):
                             _g2_score  = round(_winner_hist)
                             _g2_label  = f"✅ {_g2_score}% in {_fc_n_g} meetings"
                         else:
-                            # History exists but not strong enough — hard block
-                            continue  # ❌ FILTER 2 FAILED
+                            # History exists but winner below 67% — hard block
+                            continue  # ❌ FILTER 2 FAILED — history not strong enough
                     else:
-                        # Not enough meetings yet — allow through (early season)
-                        _g2_passed = True
-                        _g2_score  = 50
-                        _g2_label  = f"🔵 {_fc_n_g} meetings (need 5+)"
+                        # Fewer than 5 meetings — hard block, not enough data
+                        continue  # ❌ FILTER 2 FAILED — need 5+ meetings
 
                     # ── INFO SCORES (shown on card, never block) ───────────────
                     # Band accuracy
