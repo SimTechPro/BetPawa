@@ -9656,7 +9656,6 @@ async def _run_auto_post(bot, bot_data: dict):
                 body           = ""
                 match_cards    = []
                 round_preds    = []
-                _had_events    = True  # this league had events to evaluate
 
                 # Get learned model for this league
                 league_model = _get_model(bot_data, lid)
@@ -9811,11 +9810,12 @@ async def _run_auto_post(bot, bot_data: dict):
                         _g3_score = round(max(_trusted) * 100)
                         _g3_label = f"✅ {_g3_score}% bot accuracy"
                     elif _no_band_data:
+                        # No band data yet — allow through, early season
                         _g3_score = round(p["conf"])
                         _g3_label = f"🔵 {_g3_score}% conf (building)"
                     else:
-                        _g3_score = round(max(s for s in [_s1x2,_sbt,_so25] if s is not None)*100)
-                        _g3_label = f"🟡 {_g3_score}% bot accuracy"
+                        # Band data exists but below 60% — hard block
+                        continue  # ❌ BAND FILTER FAILED
 
                     # Momentum
                     _hm_g  = p.get("home_momentum") or {}
@@ -10034,8 +10034,10 @@ async def _run_auto_post(bot, bot_data: dict):
                     match_cards.append(card)
 
                 if not body:
-                    _had_events = True  # events evaluated but none passed filters
+                    _had_events = True  # league had events but none passed filters
                     continue
+
+                _had_events = True  # league had events AND predictions passed
 
                 if has_scores and total:
                     acc      = round(agreed / total * 100)
@@ -10075,10 +10077,10 @@ async def _run_auto_post(bot, bot_data: dict):
 
     if not sections:
         if not _had_events:
-            # All leagues were already sent this round — silent, nothing to do
+            # No events at all this tick — completely silent
             return
-        # Events existed but none passed the filters — send one skip notice
-        # only if this round hasn't been skip-notified already
+        # Events were evaluated across all leagues but ZERO predictions passed
+        # Send one skip notice per round combination only
         _skip_key = f"auto_skip_notified_{tuple(sorted(round_ids))}"
         if not bot_data.get(_skip_key):
             bot_data[_skip_key] = True
