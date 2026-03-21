@@ -9985,10 +9985,29 @@ async def _run_auto_post(bot, bot_data: dict):
                     _amom = p.get("away_momentum") or {}
                     _mom_line = ""
                     if _hmom.get("games_used",0) >= 3 and _amom.get("games_used",0) >= 3:
-                        _hti = "📈 rising" if _hmom.get("trend")=="RISING" else ("📉 falling" if _hmom.get("trend")=="FALLING" else "➡️ stable")
-                        _ati = "📈 rising" if _amom.get("trend")=="RISING" else ("📉 falling" if _amom.get("trend")=="FALLING" else "➡️ stable")
                         _hwp = _hmom.get("win_pct", 0)
                         _awp = _amom.get("win_pct", 0)
+                        _htr = _hmom.get("trend", "STABLE")
+                        _atr = _amom.get("trend", "STABLE")
+
+                        # Fix trend label to match win% reality
+                        # RISING only makes sense with ≥50% wins
+                        # FALLING only makes sense with ≤50% wins
+                        # Otherwise use STABLE
+                        if _htr == "RISING" and _hwp >= 50:
+                            _hti = "📈 rising"
+                        elif _htr == "FALLING" and _hwp <= 50:
+                            _hti = "📉 falling"
+                        else:
+                            _hti = "➡️ stable"
+
+                        if _atr == "RISING" and _awp >= 50:
+                            _ati = "📈 rising"
+                        elif _atr == "FALLING" and _awp <= 50:
+                            _ati = "📉 falling"
+                        else:
+                            _ati = "➡️ stable"
+
                         _mom_line = (
                             f"┆ {m['home']} → {_hti} {_hwp:.0f}% wins\n"
                             f"┆ {m['away']} → {_ati} {_awp:.0f}% wins\n"
