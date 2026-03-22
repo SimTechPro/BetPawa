@@ -3501,16 +3501,35 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     # Detect cycle rotation pattern from the full sequence
     # ── FULL SCORE CYCLE DETECTION ──────────────────────────────────────────
     # ── FULL SCORE CYCLE DETECTION (England only — 7794) ──────────────────
-    # Score cycle tracking runs only for England to test the concept.
-    # Other leagues get direction-only cycle prediction.
+    # For England: use score_history_7794 keyed by fixture+odds fingerprint
+    # This gives the complete cross-round history for the EXACT same odds.
+    # Other leagues: direction-only from verified records.
     _full_seq = []
-    for q in _all_with_outcome:
-        rec = q["record"]
-        out = rec.get("outcome", "")
-        sh  = rec.get("score_h")
-        sa  = rec.get("score_a")
-        if out and sh is not None and sa is not None:
-            _full_seq.append((out, sh, sa))
+
+    if league_id == 7794 and bot_data:
+        # Build odds fingerprint from current odds (1x2)
+        _cur_1x2_fp = current_odds.get("1x2", {})
+        _ofp = f"{_cur_1x2_fp.get('1',0)}-{_cur_1x2_fp.get('X',0)}-{_cur_1x2_fp.get('2',0)}"
+        _sh_key = f"{fk}|{_ofp}"  # fk = canonical fixture key (already computed above)
+        _sh_store = bot_data.get("score_history_7794", {})
+        _fh = _sh_store.get(_sh_key, [])
+        # Build full_seq from score_history — complete picture of this odds pattern
+        for _r in _fh:
+            _out = _r.get("outcome", "")
+            _sh  = _r.get("score_h")
+            _sa  = _r.get("score_a")
+            if _out and _sh is not None and _sa is not None:
+                _full_seq.append((_out, _sh, _sa))
+
+    # Fallback: build from verified records (all leagues, or England if no history yet)
+    if not _full_seq:
+        for q in _all_with_outcome:
+            rec = q["record"]
+            out = rec.get("outcome", "")
+            sh  = rec.get("score_h")
+            sa  = rec.get("score_a")
+            if out and sh is not None and sa is not None:
+                _full_seq.append((out, sh, sa))
 
     _cycle_next       = None
     _cycle_next_score = None
@@ -3597,7 +3616,9 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     avg_diff   = sum(diffs)/len(diffs) if diffs else 0
     confidence = round(max(0, 100 - avg_diff * 1000))
 
-    out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(dominant_out, dominant_out)
+    # Use cycle_next as the authoritative direction when cycle is detected
+    _effective_out = _cycle_next if _cycle_next else dominant_out
+    out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(_effective_out, _effective_out)
 
     if consistency_pct == 100 and repeat_count >= 2:
         tier     = "💎 ELITE LOCK"
@@ -3607,10 +3628,18 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         tier_msg = f"all 5 markets confirmed — {consistency_pct}% same result"
 
     scores_str = "  ·  ".join(score_lines[:3])
-    # Show ALL scores chronologically (oldest→newest) with direction icons
-    scores_str = "  ·  ".join(score_lines)  # full cycle sequence
-
-    # Cycle next prediction
+    # Show current in-progress cycle run only
+    # cycle_pos_now = how many steps into the current (incomplete) loop
+    # If pos=0 (loop just completed): show the last full period so pattern is visible
+    if _cycle_period:
+        _cycle_pos_now = len(_full_seq) % _cycle_period
+        if _cycle_pos_now == 0:
+            _cur_run = score_lines[-_cycle_period:]  # last completed loop
+        else:
+            _cur_run = score_lines[-_cycle_pos_now:]  # current partial loop
+        scores_str = "  ·  ".join(_cur_run)
+    else:
+        scores_str = "  ·  ".join(score_lines[-3:])  # last 3 if no cycle yet
     # Cycle next — show predicted direction AND score if full cycle detected
     _cycle_icon = "🏠" if _cycle_next == "HOME" else ("✈️" if _cycle_next == "AWAY" else "")
     if _cycle_period and _cycle_next_score:
@@ -3634,9 +3663,15 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         elif _mk == "HT/FT":        _core5["HT/FT"]= True
     _verified_count = sum(_core5.values())
 
+    # Count occurrences of the effective direction (cycle_next or dominant)
+    _effective_count = outcome_counts.get(_effective_out, 0)
+    # If cycle overrides dominant, note it clearly
+    _cycle_override  = (_cycle_next and _cycle_next != dominant_out)
+    _override_note   = f" *(cycle override — dominant was {dominant_out})*" if _cycle_override else ""
+
     star_label = (
         f"{tier} — {tier_msg}{_period_info}\n"
-        f"┆    📌 Result: *{out_label}*  ({consistency_count}/{repeat_count}x confirmed)\n"
+        f"┆    📌 Result: *{out_label}*  ({_effective_count}/{repeat_count}x){_override_note}\n"
         + (f"┆    🔄 Cycle: {scores_str}\n" if scores_str else "")
         + (f"┆    ➡️  {_cycle_str}\n" if _cycle_str else "")
         + f"┆    🔑 Markets verified: {_verified_count}/5\n"
@@ -3651,7 +3686,7 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         "repeat_count":      repeat_count,
         "best_record":       best_record,
         "confidence":        confidence,
-        "outcome":           dominant_out,
+        "outcome":           _effective_out,
         "consistency_pct":   consistency_pct,
         "consistency_count": consistency_count,
         "tier":              tier,
@@ -7889,21 +7924,28 @@ def _learn_from_round(bot_data: dict, league_id: int,
                     entry["ht_h"] = res.get("ht_h")
                     entry["ht_a"] = res.get("ht_a")
                 # England only: build cross-round score history per fixture
-                # Every unique score recorded chronologically, never overwritten
+                # England only: score history keyed by fixture+odds fingerprint
+                # Same odds = same cycle track. Different odds = new track.
+                # Records both new scores AND repeats (cycle confirmations).
                 if league_id == 7794:
                     _sh_store = bot_data.setdefault("score_history_7794", {})
-                    _fh = _sh_store.setdefault(_canon, [])
-                    _new_rec = {
-                        "outcome":  ft,
-                        "score_h":  ah,
-                        "score_a":  aa,
-                        "round_id": int(_rid_str) if _rid_str.isdigit() else 0,
-                    }
-                    # Only append if this round not already recorded
-                    if not any(r["round_id"] == _new_rec["round_id"] for r in _fh):
-                        _fh.append(_new_rec)
-                        _fh.sort(key=lambda x: x["round_id"])  # keep chronological
-
+                    _snap = entry.get("odds_snapshot", {})
+                    _o1x2 = _snap.get("1x2", {})
+                    _ofp  = f"{_o1x2.get('1',0)}-{_o1x2.get('X',0)}-{_o1x2.get('2',0)}"
+                    _sh_key = f"{_canon}|{_ofp}"  # fixture+odds fingerprint
+                    _fh = _sh_store.setdefault(_sh_key, [])
+                    # Skip if this exact round already recorded
+                    if not any(r["round_id"] == (int(_rid_str) if _rid_str.isdigit() else 0) for r in _fh):
+                        _existing_scores = {(r["score_h"], r["score_a"]) for r in _fh}
+                        _fh.append({
+                            "outcome":      ft,
+                            "score_h":      ah,
+                            "score_a":      aa,
+                            "round_id":     int(_rid_str) if _rid_str.isdigit() else 0,
+                            "is_new_score": (ah, aa) not in _existing_scores,
+                            "is_repeat":    (ah, aa) in _existing_scores,
+                        })
+                        _fh.sort(key=lambda x: x["round_id"])
     # Step 2+3+4: Scan ALL rounds — delete only bad/stale, keep valuable forever
     sorted_rids = sorted(
         _lid_os.keys(),
@@ -12311,6 +12353,7 @@ async def _do_backup_inner(message, c):
         "strategy_stats":      bd.get("strategy_stats", {}),
         "odds_repeat_stats":   bd.get("odds_repeat_stats", {}),
         "odds_store":          bd.get("odds_store", {}),
+        "score_history_7794":  bd.get("score_history_7794", {}),
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -12594,6 +12637,11 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     if "odds_store" in data and data["odds_store"]:
         bot_data["odds_store"] = data["odds_store"]
         log.info(f"✅ Restored odds_store from backup")
+
+    if "score_history_7794" in data and data["score_history_7794"]:
+        bot_data["score_history_7794"] = data["score_history_7794"]
+        total_sh = sum(len(v) for v in data["score_history_7794"].values())
+        log.info(f"✅ Restored score_history_7794: {len(data["score_history_7794"])} fixtures, {total_sh} records")
 
     models = data.get("models", {})
     users  = data.get("users", {})
