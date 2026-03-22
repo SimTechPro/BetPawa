@@ -10355,13 +10355,14 @@ async def _run_auto_post(bot, bot_data: dict):
                         _winner_trend = _at_g; _loser_trend = _ht_g
                     if _has_mom:
                         _mom_gap = _winner_mom - _loser_mom
-                        if _winner_mom >= 50 and _mom_gap >= 25:
+                        # RISING=60+  FALLING=30-  STABLE=31-59
+                        if _winner_mom >= 60 and _mom_gap >= 25:
                             _g4_score = round(min(65 + _mom_gap * 0.3, 92))
                             _g4_label = f"✅ {_winner_mom:.0f}% vs {_loser_mom:.0f}% (+{_mom_gap:.0f}%)"
-                        elif _winner_mom >= 50 and _mom_gap >= 10:
+                        elif _winner_mom >= 60 and _mom_gap >= 10:
                             _g4_score = round(min(55 + _mom_gap * 0.3, 80))
                             _g4_label = f"🟡 {_winner_mom:.0f}% vs {_loser_mom:.0f}%"
-                        elif _winner_mom >= _loser_mom:
+                        elif _winner_mom > _loser_mom:
                             _g4_score = round(min(45 + _mom_gap * 0.3, 65))
                             _g4_label = f"🟡 {_winner_mom:.0f}% vs {_loser_mom:.0f}%"
                         else:
@@ -10501,20 +10502,18 @@ async def _run_auto_post(bot, bot_data: dict):
                         _htr = _hmom.get("trend", "STABLE")
                         _atr = _amom.get("trend", "STABLE")
 
-                        # Fix trend label to match win% reality
-                        # RISING only makes sense with ≥50% wins
-                        # FALLING only makes sense with ≤50% wins
-                        # Otherwise use STABLE
-                        if _htr == "RISING" and _hwp >= 50:
+                        # Strict trend thresholds:
+                        # RISING  = 60%+  FALLING = 30%-  STABLE = 31-59%
+                        if _hwp >= 60:
                             _hti = "📈 rising"
-                        elif _htr == "FALLING" and _hwp <= 50:
+                        elif _hwp <= 30:
                             _hti = "📉 falling"
                         else:
                             _hti = "➡️ stable"
 
-                        if _atr == "RISING" and _awp >= 50:
+                        if _awp >= 60:
                             _ati = "📈 rising"
-                        elif _atr == "FALLING" and _awp <= 50:
+                        elif _awp <= 30:
                             _ati = "📉 falling"
                         else:
                             _ati = "➡️ stable"
@@ -10572,18 +10571,30 @@ async def _run_auto_post(bot, bot_data: dict):
                         else:                _overall_label = "🔴 WEAK SIGNAL"
 
                     # ── TRIPLE-CONFIRM FILTER (direction-agnostic) ───────────
-                    # Only post picks where ALL three confirm the tip direction:
-                    #   1. Top-line has 🔥  (fp pool strong vote rate)
-                    #   2. Overall confirms same direction — repeat dominant outcome
-                    #      matches tip (HOME or AWAY); overall % label irrelevant
-                    #   3. HT/FT was verified in repeat AND repeat outcome == tip
+                    # Only post picks where ALL confirm the tip direction:
+                    #   1. Top-line has 🔥
+                    #   2. Repeat dominant outcome matches tip (HOME or AWAY)
+                    #   3. HT/FT verified in repeat AND outcome matches tip
+                    #   4. Momentum: predicted winner win% >= 60 (stable/rising)
+                    #               predicted loser  win% <= 30 (stable/falling)
                     _repeat_outcome   = _repeat.get("outcome", "")   # "HOME" / "AWAY"
                     _htft_in_repeat   = "HT/FT" in _repeat.get("markets_matched", [])
-                    _top_fire         = bool(_fire)   # " 🔥" present on top line
+                    _top_fire         = bool(_fire)
                     _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
                     _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
+                    # Momentum gate — based on each team's own win%, not tip direction
+                    if _has_mom:
+                        if _tip_g == "HOME":
+                            _winner_wp = _hm_g.get("win_pct", 0)
+                            _loser_wp  = _am_g.get("win_pct", 0)
+                        else:
+                            _winner_wp = _am_g.get("win_pct", 0)
+                            _loser_wp  = _hm_g.get("win_pct", 0)
+                        _mom_ok = (_winner_wp >= 60) and (_loser_wp <= 30)
+                    else:
+                        _mom_ok = True  # no momentum data yet — allow through
 
-                    if not (_top_fire and _overall_confirms and _htft_agrees):
+                    if not (_top_fire and _overall_confirms and _htft_agrees and _mom_ok):
                         continue  # ❌ Direction-confirm filter — skip this match
 
                     # ── Gate scores summary line ───────────────────────────────
