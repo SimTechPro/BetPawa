@@ -3490,8 +3490,24 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         return {"matched": False, "repeat_count": repeat_count,
                 "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
 
-    # ── All checks passed (4+ markets confirmed, ≥67% consistent) ────────────
-    match_pct = round(n_matched / n_available * 100)
+    # ── RECENCY CHECK: detect if pattern has cycled ──────────────────────────
+    # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
+    # A fixture goes under maintenance the moment its most recent result
+    # contradicts the dominant outcome. It only returns to predictions when
+    # the 2 most recent results BOTH match the dominant outcome — confirming
+    # the direction is genuinely restored, not just a one-off recovery.
+    _sorted_verified = sorted(
+        [q for q in verified if q["record"].get("outcome")],
+        key=lambda q: int(q["record"].get("round_id", 0) or 0),
+        reverse=True
+    )
+    if len(_sorted_verified) >= 2:
+        _r1 = _sorted_verified[0]["record"].get("outcome")
+        _r2 = _sorted_verified[1]["record"].get("outcome")
+        if not (_r1 == dominant_out and _r2 == dominant_out):
+            return {"matched": False, "repeat_count": repeat_count,
+                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {dominant_out} to restore"}
+
     # Compute confidence from raw odds closeness across all matched markets
     diffs = []
     snap_b = best_record.get("odds_snapshot") or {}
