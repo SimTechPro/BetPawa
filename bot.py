@@ -3319,6 +3319,12 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
                 return price
         return None
 
+    def _get_ou_u(snap, line):
+        for side, ln, price in snap.get("ou", []):
+            if str(ln) == str(line) and side == "U":
+                return price
+        return None
+
     def _get_htft_main(snap):
         htft = snap.get("htft") or {}
         vals = {}
@@ -3330,10 +3336,13 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     cur_1x2   = _get_1x2(current_odds)
     cur_dc    = _get_dc(current_odds)
     cur_btts  = _get_btts(current_odds)
-    cur_ou15  = _get_ou(current_odds, "1.5")
-    cur_ou25  = _get_ou(current_odds, "2.5")
-    cur_ou35  = _get_ou(current_odds, "3.5")
     cur_htft  = _get_htft_main(current_odds)
+
+    # Build O/U avail dynamically from ALL lines present in current odds
+    # Covers both Over and Under for every line (6, 10, 14 or 1.5, 2.5, 3.5)
+    cur_ou_map = {}  # key="O/U{line}_{side}" value=price
+    for _side, _line, _price in current_odds.get("ou", []):
+        cur_ou_map[f"O/U{_line}_{_side}"] = _price
 
     # Available markets in current odds
     avail = {}
@@ -3343,12 +3352,9 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         avail["DC"]  = cur_dc
     if cur_btts is not None:
         avail["BTTS"] = (cur_btts,)
-    if cur_ou15 is not None:
-        avail["O/U1.5"] = (cur_ou15,)
-    if cur_ou25 is not None:
-        avail["O/U2.5"] = (cur_ou25,)
-    if cur_ou35 is not None:
-        avail["O/U3.5"] = (cur_ou35,)
+    # Add every O/U line+side present in current odds
+    for _k, _pv in cur_ou_map.items():
+        avail[_k] = (_pv,)
     if len(cur_htft) >= 2:
         avail["HT/FT"] = cur_htft
 
@@ -3381,22 +3387,23 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         rec_1x2  = _get_1x2(snap)
         rec_dc   = _get_dc(snap)
         rec_btts = _get_btts(snap)
-        rec_ou15 = _get_ou(snap, "1.5")
-        rec_ou25 = _get_ou(snap, "2.5")
-        rec_ou35 = _get_ou(snap, "3.5")
         rec_htft = _get_htft_main(snap)
 
-        if "1X2"    in avail and _vals_match(cur_1x2,  rec_1x2):   matched.append("1X2")
-        if "DC"     in avail and _vals_match(cur_dc,   rec_dc):     matched.append("DC")
-        if "BTTS"   in avail and rec_btts is not None and abs(float(cur_btts)-float(rec_btts)) <= TOL:
+        # Build rec O/U map dynamically from ALL lines in stored snap
+        rec_ou_map = {}
+        for _side, _line, _price in snap.get("ou", []):
+            rec_ou_map[f"O/U{_line}_{_side}"] = _price
+
+        if "1X2" in avail and _vals_match(cur_1x2, rec_1x2):   matched.append("1X2")
+        if "DC"  in avail and _vals_match(cur_dc,  rec_dc):     matched.append("DC")
+        if "BTTS" in avail and rec_btts is not None and abs(float(cur_btts)-float(rec_btts)) <= TOL:
             matched.append("BTTS")
-        if "O/U1.5" in avail and rec_ou15 is not None and abs(float(cur_ou15)-float(rec_ou15)) <= TOL:
-            matched.append("O/U1.5")
-        if "O/U2.5" in avail and rec_ou25 is not None and abs(float(cur_ou25)-float(rec_ou25)) <= TOL:
-            matched.append("O/U2.5")
-        if "O/U3.5" in avail and rec_ou35 is not None and abs(float(cur_ou35)-float(rec_ou35)) <= TOL:
-            matched.append("O/U3.5")
-        if "HT/FT"  in avail and rec_htft:
+        # Match every O/U line+side that exists in both current and stored
+        for _k, _cur_pv in cur_ou_map.items():
+            _rec_pv = rec_ou_map.get(_k)
+            if _rec_pv is not None and abs(float(_cur_pv) - float(_rec_pv)) <= TOL:
+                matched.append(_k)
+        if "HT/FT" in avail and rec_htft:
             htft_match = sum(
                 1 for k, cv in cur_htft.items()
                 if k in rec_htft and abs(float(cv)-float(rec_htft[k])) <= TOL
@@ -3498,6 +3505,15 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         elif mk == "BTTS":
             if cur_btts and _get_btts(snap_b):
                 diffs.append(abs(float(cur_btts) - float(_get_btts(snap_b))))
+        elif mk.startswith("O/U"):
+            # Dynamic O/U key e.g. "O/U6_O", "O/U10_U"
+            _cur_pv = cur_ou_map.get(mk)
+            _rec_pv = {f"O/U{s}{l}_{sd}": p for sd,l,p in snap_b.get("ou",[]) for s in [""]}.get(mk)
+            # simpler: rebuild rec_ou_map for snap_b
+            _snap_b_ou = {f"O/U{_sl}_{_ss}": _sp for _ss,_sl,_sp in snap_b.get("ou",[])}
+            _rec_pv = _snap_b_ou.get(mk)
+            if _cur_pv and _rec_pv:
+                diffs.append(abs(float(_cur_pv) - float(_rec_pv)))
     avg_diff   = sum(diffs)/len(diffs) if diffs else 0
     confidence = round(max(0, 100 - avg_diff * 1000))
 
