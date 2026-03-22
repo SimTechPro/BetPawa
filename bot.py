@@ -3481,7 +3481,8 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         return {"matched": False, "repeat_count": repeat_count,
                 "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
 
-    # ── All checks passed ──────────────────────────────────────────────────────
+    # ── All checks passed (4+ markets confirmed, ≥67% consistent) ────────────
+    match_pct = round(n_matched / n_available * 100)
     # Compute confidence from raw odds closeness across all matched markets
     diffs = []
     snap_b = best_record.get("odds_snapshot") or {}
