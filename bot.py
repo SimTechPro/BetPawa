@@ -3265,6 +3265,8 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
                 "league_id":     league_id,
                 "source":        "odds_store",
                 "round_id":      rid_key,
+                "home":          entry.get("home", ""),
+                "away":          entry.get("away", ""),
             })
 
     # SOURCE 2: fp_db — fallback for older rounds
@@ -3479,13 +3481,7 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         return {"matched": False, "repeat_count": repeat_count,
                 "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
 
-    # ── Final check: ALL markets must match — no partial allowed ──────────────
-    match_pct = round(n_matched / n_available * 100)
-    if n_matched < n_available:
-        return {"matched": False, "repeat_count": repeat_count,
-                "fail_reason": f"only {n_matched}/{n_available} markets matched — need ALL {n_available}"}
-
-    # ── All checks passed — all markets confirmed ──────────────────────────────
+    # ── All checks passed ──────────────────────────────────────────────────────
     # Compute confidence from raw odds closeness across all matched markets
     diffs = []
     snap_b = best_record.get("odds_snapshot") or {}
