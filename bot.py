@@ -10571,20 +10571,20 @@ async def _run_auto_post(bot, bot_data: dict):
                         elif _overall >= 50: _overall_label = "🟡 MODERATE"
                         else:                _overall_label = "🔴 WEAK SIGNAL"
 
-                    # ── TRIPLE-CONFIRM FILTER ─────────────────────────────────
-                    # Only post if ALL three conditions hold:
-                    #   1. Top-line confidence has 🔥  (fp pool ≥3 samples, ≥65% vote)
-                    #   2. Overall score is 🔥 STRONG PICK  (≥80%)
-                    #   3. HT/FT market was verified in repeat check AND its dominant
-                    #      outcome direction matches the tip (HOME→home win, AWAY→away win)
+                    # ── TRIPLE-CONFIRM FILTER (direction-agnostic) ───────────
+                    # Only post picks where ALL three confirm the tip direction:
+                    #   1. Top-line has 🔥  (fp pool strong vote rate)
+                    #   2. Overall confirms same direction — repeat dominant outcome
+                    #      matches tip (HOME or AWAY); overall % label irrelevant
+                    #   3. HT/FT was verified in repeat AND repeat outcome == tip
+                    _repeat_outcome   = _repeat.get("outcome", "")   # "HOME" / "AWAY"
                     _htft_in_repeat   = "HT/FT" in _repeat.get("markets_matched", [])
-                    _repeat_outcome   = _repeat.get("outcome", "")   # "HOME" / "AWAY" / "DRAW"
+                    _top_fire         = bool(_fire)   # " 🔥" present on top line
+                    _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
                     _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
-                    _top_fire         = bool(_fire)          # "" = no fire, " 🔥" = fire
-                    _overall_fire     = (_overall >= 80)     # 🔥 STRONG PICK threshold
 
-                    if not (_top_fire and _overall_fire and _htft_agrees):
-                        continue  # ❌ Triple-confirm filter — skip this match
+                    if not (_top_fire and _overall_confirms and _htft_agrees):
+                        continue  # ❌ Direction-confirm filter — skip this match
 
                     # ── Gate scores summary line ───────────────────────────────
                     _gate_line = (
