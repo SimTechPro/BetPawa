@@ -3446,6 +3446,8 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     n_matched       = len(matched_markets)
 
     # ── CROSS-CHECK 3: result consistency across ALL verified records ──────────
+    # Strict: outcome slot (HOME/AWAY) must match exactly as stored.
+    # A record where the team was away is an AWAY result — no translation.
     outcome_counts = {}
     score_lines    = []
 
