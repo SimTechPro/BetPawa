@@ -3521,21 +3521,30 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
 
     if consistency_pct == 100 and repeat_count >= 2:
         tier     = "💎 ELITE LOCK"
-        tier_msg = f"all {n_matched} markets identical — 100% same result every time"
+        tier_msg = f"all 5 markets identical — 100% same result every time"
     elif consistency_pct >= 67:
         tier     = "🏆 ELITE"
-        tier_msg = f"all {n_matched} markets confirmed — {consistency_pct}% same result"
+        tier_msg = f"all 5 markets confirmed — {consistency_pct}% same result"
 
     scores_str = "  ·  ".join(score_lines[:3])
     if len(score_lines) > 3:
         scores_str += f"  (+{len(score_lines)-3} more)"
 
-    mkts_str   = " · ".join(matched_markets)
+    # Map matched markets to 5 core slots for display
+    _core5 = {"1X2": False, "DC": False, "BTTS": False, "O/U": False, "HT/FT": False}
+    for _mk in matched_markets:
+        if _mk == "1X2":            _core5["1X2"]  = True
+        elif _mk == "DC":           _core5["DC"]   = True
+        elif _mk == "BTTS":         _core5["BTTS"] = True
+        elif _mk.startswith("O/U"): _core5["O/U"]  = True
+        elif _mk == "HT/FT":        _core5["HT/FT"]= True
+    _verified_count = sum(_core5.values())
+
     star_label = (
         f"{tier} — {tier_msg}\n"
         f"┆    📌 Result: *{out_label}*  ({consistency_count}/{repeat_count}x confirmed)\n"
         + (f"┆    📊 Scores (HT/FT): `{scores_str}`\n" if scores_str else "")
-        + f"┆    🔑 Markets verified: {mkts_str}\n"
+        + f"┆    🔑 Markets verified: {_verified_count}/5\n"
         f"┆    🎯 Odds precision: {confidence}%  ·  ±5% tolerance"
     )
 
