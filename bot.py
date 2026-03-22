@@ -3508,6 +3508,8 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
             return {"matched": False, "repeat_count": repeat_count,
                     "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {dominant_out} to restore"}
 
+    # ── All checks passed ─────────────────────────────────────────────────────
+    match_pct = round(n_matched / n_available * 100)
     # Compute confidence from raw odds closeness across all matched markets
     diffs = []
     snap_b = best_record.get("odds_snapshot") or {}
