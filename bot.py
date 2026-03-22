@@ -132,6 +132,13 @@ LEAGUES: dict[int, dict] = {
     13774: {"name": "Portugal",    "flag": "🇵🇹"},
 }
 
+
+# ── ACTIVE LEAGUES ───────────────────────────────────────────────────────────
+# Only leagues in this set are predicted, stored, and learned from.
+# All others are completely dormant — no predictions, no storing, no learning.
+# To re-enable a league, add its ID back to this set.
+ACTIVE_LEAGUES: set = {7794}  # England only
+
 def ld(league_id: int) -> str:
     l = LEAGUES[league_id]
     return f"{l['flag']} {l['name']}"
@@ -3453,27 +3460,34 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     n_matched       = len(matched_markets)
 
     # ── CROSS-CHECK 3: result consistency across ALL verified records ──────────
-    # Strict: outcome slot (HOME/AWAY) must match exactly as stored.
-    # A record where the team was away is an AWAY result — no translation.
-    outcome_counts = {}
-    score_lines    = []
+    # ── CROSS-CHECK 3: result consistency + cycle sequence ────────────────
+    # Sort ALL verified records chronologically (oldest→newest)
+    # to build the true sequence of outcomes for this fixture.
+    _all_with_outcome = sorted(
+        [q for q in verified if q["record"].get("outcome")],
+        key=lambda q: int(q["record"].get("round_id", 0) or 0)
+    )
 
-    for q in verified:
+    outcome_counts = {}
+    score_lines    = []   # chronological: oldest→newest with direction label
+
+    for q in _all_with_outcome:
         rec = q["record"]
         out = rec.get("outcome", "")
         if not out:
-            continue  # skip pending records (no result yet) from consistency count
+            continue
         outcome_counts[out] = outcome_counts.get(out, 0) + 1
         sh   = rec.get("score_h")
         sa   = rec.get("score_a")
         ht_h = rec.get("ht_h")
         ht_a = rec.get("ht_a")
         if sh is not None and sa is not None:
-            ht_str = f"{ht_h}-{ht_a}/" if ht_h is not None and ht_a is not None else ""
-            score_lines.append(f"{ht_str}{sh}-{sa}")
+            ht_str   = f"{ht_h}-{ht_a}/" if ht_h is not None and ht_a is not None else ""
+            dir_icon = "🏠" if out == "HOME" else ("✈️" if out == "AWAY" else "🤝")
+            score_lines.append(f"{dir_icon}{ht_str}{sh}-{sa}")
 
-    repeat_count = len(verified)
-    known_count  = len(outcome_counts)  # records with confirmed results
+    repeat_count = len(_all_with_outcome)
+    known_count  = len(outcome_counts)
 
     if not outcome_counts:
         return {"matched": False, "repeat_count": repeat_count,
@@ -3481,21 +3495,69 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
 
     dominant_out      = max(outcome_counts, key=outcome_counts.get)
     consistency_count = outcome_counts[dominant_out]
-    # Consistency based only on records with known results
     total_known       = sum(outcome_counts.values())
     consistency_pct   = round(consistency_count / total_known * 100)
 
-    # STRICT: ≥67% same result across known outcomes
+    # Detect cycle rotation pattern from the full sequence
+    # ── FULL SCORE CYCLE DETECTION ──────────────────────────────────────────
+    # ── FULL SCORE CYCLE DETECTION (England only — 7794) ──────────────────
+    # Score cycle tracking runs only for England to test the concept.
+    # Other leagues get direction-only cycle prediction.
+    _full_seq = []
+    for q in _all_with_outcome:
+        rec = q["record"]
+        out = rec.get("outcome", "")
+        sh  = rec.get("score_h")
+        sa  = rec.get("score_a")
+        if out and sh is not None and sa is not None:
+            _full_seq.append((out, sh, sa))
+
+    _cycle_next       = None
+    _cycle_next_score = None
+    _cycle_period     = None
+    _cycle_pos        = None
+
+    if len(_full_seq) >= 2:
+        if league_id == 7794:  # England only — full score cycle tracking
+            _n = len(_full_seq)
+            for _period in range(1, _n // 2 + 1):
+                _pattern = _full_seq[:_period]
+                _matches = all(_full_seq[_i] == _pattern[_i % _period] for _i in range(_n))
+                if _matches:
+                    _cycle_period     = _period
+                    _cycle_pos        = _n % _period
+                    _next_in_pat      = _pattern[_cycle_pos]
+                    _cycle_next       = _next_in_pat[0]
+                    _cycle_next_score = f"{_next_in_pat[1]}-{_next_in_pat[2]}"
+                    break
+
+        # Direction-only fallback (all leagues including England if no score cycle)
+        if not _cycle_period:
+            _dir_seq     = [s[0] for s in _full_seq]
+            _alternating = all(_dir_seq[i] != _dir_seq[i+1] for i in range(len(_dir_seq)-1))
+            _cycle_next  = ("HOME" if _dir_seq[-1] == "AWAY" else "AWAY") if _alternating else dominant_out
+
+    # Annotate score_lines with 🔁 at cycle restart points (England only)
+    _annotated_lines = []
+    for _i, (_sl, _q) in enumerate(zip(score_lines, _all_with_outcome)):
+        _entry = _sl
+        if _cycle_period and _i > 0 and _i % _cycle_period == 0:
+            _entry = "🔁 " + _entry
+        _annotated_lines.append(_entry)
+    score_lines = _annotated_lines
+
+    _seq = [s[0] for s in _full_seq]  # direction sequence for maintenance check
     if consistency_pct < 67:
         return {"matched": False, "repeat_count": repeat_count,
                 "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
-
     # ── RECENCY CHECK: detect if pattern has cycled ──────────────────────────
     # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
-    # A fixture goes under maintenance the moment its most recent result
-    # contradicts the dominant outcome. It only returns to predictions when
-    # the 2 most recent results BOTH match the dominant outcome — confirming
-    # the direction is genuinely restored, not just a one-off recovery.
+    # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
+    # Uses cycle_next as the expected direction:
+    # - If alternating cycle: expects opposite of last result
+    # - If consistent cycle: expects same as dominant
+    # The last 2 results must BOTH match the expected direction to fire.
+    _expected_dir = _cycle_next if _cycle_next else dominant_out
     _sorted_verified = sorted(
         [q for q in verified if q["record"].get("outcome")],
         key=lambda q: int(q["record"].get("round_id", 0) or 0),
@@ -3504,9 +3566,9 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     if len(_sorted_verified) >= 2:
         _r1 = _sorted_verified[0]["record"].get("outcome")
         _r2 = _sorted_verified[1]["record"].get("outcome")
-        if not (_r1 == dominant_out and _r2 == dominant_out):
+        if not (_r1 == _expected_dir and _r2 == _expected_dir):
             return {"matched": False, "repeat_count": repeat_count,
-                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {dominant_out} to restore"}
+                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {_expected_dir} to restore"}
 
     # ── All checks passed ─────────────────────────────────────────────────────
     match_pct = round(n_matched / n_available * 100)
@@ -3545,8 +3607,22 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         tier_msg = f"all 5 markets confirmed — {consistency_pct}% same result"
 
     scores_str = "  ·  ".join(score_lines[:3])
-    if len(score_lines) > 3:
-        scores_str += f"  (+{len(score_lines)-3} more)"
+    # Show ALL scores chronologically (oldest→newest) with direction icons
+    scores_str = "  ·  ".join(score_lines)  # full cycle sequence
+
+    # Cycle next prediction
+    # Cycle next — show predicted direction AND score if full cycle detected
+    _cycle_icon = "🏠" if _cycle_next == "HOME" else ("✈️" if _cycle_next == "AWAY" else "")
+    if _cycle_period and _cycle_next_score:
+        _period_label = f"period {_cycle_period}" if _cycle_period > 1 else ""
+        _cycle_str = (f"{_cycle_icon} *{_cycle_next}*  `{_cycle_next_score}` "
+                      f"— score cycle ({_period_label})")
+    elif _cycle_next:
+        _cycle_str = f"{_cycle_icon} *{_cycle_next}* next in cycle"
+    else:
+        _cycle_str = ""
+
+    _period_info = f" · {_cycle_period}-step cycle" if _cycle_period else ""
 
     # Map matched markets to 5 core slots for display
     _core5 = {"1X2": False, "DC": False, "BTTS": False, "O/U": False, "HT/FT": False}
@@ -3559,9 +3635,10 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     _verified_count = sum(_core5.values())
 
     star_label = (
-        f"{tier} — {tier_msg}\n"
+        f"{tier} — {tier_msg}{_period_info}\n"
         f"┆    📌 Result: *{out_label}*  ({consistency_count}/{repeat_count}x confirmed)\n"
-        + (f"┆    📊 Scores (HT/FT): `{scores_str}`\n" if scores_str else "")
+        + (f"┆    🔄 Cycle: {scores_str}\n" if scores_str else "")
+        + (f"┆    ➡️  {_cycle_str}\n" if _cycle_str else "")
         + f"┆    🔑 Markets verified: {_verified_count}/5\n"
         f"┆    🎯 Odds precision: {confidence}%  ·  ±5% tolerance"
     )
@@ -3578,6 +3655,7 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         "consistency_pct":   consistency_pct,
         "consistency_count": consistency_count,
         "tier":              tier,
+        "cycle_next":        _cycle_next,
         "score_history":     score_lines,
         "star_label":        star_label,
     }
@@ -7810,6 +7888,21 @@ def _learn_from_round(bot_data: dict, league_id: int,
                 if res.get("ht_h") is not None:
                     entry["ht_h"] = res.get("ht_h")
                     entry["ht_a"] = res.get("ht_a")
+                # England only: build cross-round score history per fixture
+                # Every unique score recorded chronologically, never overwritten
+                if league_id == 7794:
+                    _sh_store = bot_data.setdefault("score_history_7794", {})
+                    _fh = _sh_store.setdefault(_canon, [])
+                    _new_rec = {
+                        "outcome":  ft,
+                        "score_h":  ah,
+                        "score_a":  aa,
+                        "round_id": int(_rid_str) if _rid_str.isdigit() else 0,
+                    }
+                    # Only append if this round not already recorded
+                    if not any(r["round_id"] == _new_rec["round_id"] for r in _fh):
+                        _fh.append(_new_rec)
+                        _fh.sort(key=lambda x: x["round_id"])  # keep chronological
 
     # Step 2+3+4: Scan ALL rounds — delete only bad/stale, keep valuable forever
     sorted_rids = sorted(
@@ -8306,6 +8399,32 @@ def _learn_from_round(bot_data: dict, league_id: int,
     model["recent_10_total"]   = r10t
     model["recent_10_acc"]     = round(r10c/r10t, 4) if r10t > 0 else 0.0
 
+    # ── Rolling phase tracker — last 10 rounds outcome distribution ───────────
+    # Tracks HOME/DRAW/AWAY dominance so the bot knows which direction the
+    # league is currently in. Self-adjusts every round automatically.
+    _phase_q = model.setdefault("phase_q", [])
+    _phase_q.append({"home": home_wins, "draw": draws, "away": away_wins, "n": n_matches})
+    if len(_phase_q) > 10: _phase_q.pop(0)
+    _ph_home  = sum(r["home"] for r in _phase_q)
+    _ph_draw  = sum(r["draw"] for r in _phase_q)
+    _ph_away  = sum(r["away"] for r in _phase_q)
+    _ph_total = max(_ph_home + _ph_draw + _ph_away, 1)
+    model["phase_home_pct"] = round(_ph_home  / _ph_total * 100)
+    model["phase_draw_pct"] = round(_ph_draw  / _ph_total * 100)
+    model["phase_away_pct"] = round(_ph_away  / _ph_total * 100)
+    # Phase label: what direction is dominant RIGHT NOW in this league
+    # Phase thresholds calibrated for virtual football distributions:
+    # typical: HOME~45% DRAW~24% AWAY~31%
+    # HOME phase  = ≥50% home wins  (clearly above normal)
+    # AWAY phase  = ≥35% away wins  (clearly above normal for virtual)
+    # DRAW phase  = ≥30% draws      (above normal)
+    # NEUTRAL     = none dominant   → both HOME and AWAY allowed
+    if   model["phase_home_pct"] >= 50:  model["phase_label"] = "HOME"
+    elif model["phase_away_pct"] >= 35:  model["phase_label"] = "AWAY"
+    elif model["phase_draw_pct"] >= 30:  model["phase_label"] = "DRAW"
+    else:                                 model["phase_label"] = "NEUTRAL"
+
+
     fp_count = sum(len(v) for v in fp_db.values())
 
     # ── Update signal weights from accumulated signal_acc data ───────────────
@@ -8500,6 +8619,7 @@ async def _learning_job(context):
         log.info("⚙️  One-time migration: clearing poisoned band calibration data "
                  "(margin_acc / btts_band_acc / o25_band_acc) — will rebuild from live rounds")
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if isinstance(m, dict):
                 m.pop("margin_acc",     None)
@@ -8518,6 +8638,7 @@ async def _learning_job(context):
         log.info("⚙️  One-time migration: trimming fp_db to 15 records per fixture")
         total_removed = 0
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict): continue
             fp_db = m.get("fingerprint_db", {})
@@ -8541,6 +8662,7 @@ async def _learning_job(context):
     if not bot_data.get("_fpdb_decontaminated_v1"):
         log.info("⚙️  One-time migration: purging cross-contaminated fp_db records")
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -8614,6 +8736,7 @@ async def _learning_job(context):
         log.info("⚙️  Migration v4: wiping corrupted fp_db + match_log, forcing clean rebuild")
         wiped_leagues = 0
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -8666,6 +8789,7 @@ async def _learning_job(context):
     if not bot_data.get("_ml_season_fixed_v6"):
         restored_leagues = 0
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -8706,6 +8830,7 @@ async def _learning_job(context):
     if not bot_data.get("_ml_bootstrap_purge_v7"):
         purged_leagues = 0
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -9226,6 +9351,7 @@ async def cmd_resetdata(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     wiped = []
     for lid in LEAGUES:
+        if lid not in ACTIVE_LEAGUES: continue
         m = c.bot_data.get(f"model_{lid}")
         if not isinstance(m, dict):
             continue
@@ -10163,6 +10289,7 @@ async def _run_auto_post(bot, bot_data: dict):
         _had_events   = False  # tracks if any league had new events to evaluate
 
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             try:
                 # Only use already-cached stats — skip if not loaded yet
                 stats = bot_data.get(f"stats_{lid}")
@@ -10642,6 +10769,23 @@ async def _run_auto_post(bot, bot_data: dict):
                     if not (_top_fire and _overall_confirms and _htft_agrees and _mom_ok):
                         continue  # ❌ Direction-confirm filter — skip this match
 
+                    # ── LEAGUE PHASE GATE ─────────────────────────────────
+                    # ── LEAGUE PHASE GATE ─────────────────────────────────
+                    # The tip must align with the current league cycle phase.
+                    # Phase is built from actual last-10-round win distribution.
+                    # Only confirmed phase directions fire — NEUTRAL allows both.
+                    _phase_label = league_model.get("phase_label", "NEUTRAL")
+                    _phase_home  = league_model.get("phase_home_pct", 45)
+                    _phase_away  = league_model.get("phase_away_pct", 30)
+                    # Phase is confirmed HOME: only HOME tips fire
+                    if _phase_label == "HOME" and _tip_g != "HOME":
+                        continue  # ❌ League in HOME phase — tip must be HOME
+                    # Phase is confirmed AWAY: only AWAY tips fire
+                    if _phase_label == "AWAY" and _tip_g != "AWAY":
+                        continue  # ❌ League in AWAY phase — tip must be AWAY
+                    # Phase is DRAW or NEUTRAL: both HOME and AWAY allowed
+                    # (DRAW phase = no strong direction, let fixture decide)
+
                     # ── Gate scores summary line ───────────────────────────────
                     _gate_line = (
                         f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -11000,6 +11144,7 @@ async def _standings_job(context):
     bot_data = context.bot_data
 
     for lid in LEAGUES:
+        if lid not in ACTIVE_LEAGUES: continue
         try:
             league_model = _get_model(bot_data, lid)
             fp_db        = league_model.get("fingerprint_db", {})
@@ -11124,45 +11269,61 @@ async def _data_collector_job(context):
 
                 if events and round_id:
                     ck = f"{lid}:{round_id}"
+
+                    # ── ALWAYS save odds first — even if round already collected ──
+                    # On fresh start the odds_store is empty. We must save all 5
+                    # markets for every upcoming round immediately so they are ready
+                    # when that round plays and outcomes come in.
+                    # Odds are only saved if not already present for this round+fixture.
+                    _os     = bot_data.setdefault("odds_store", {})
+                    _lid_os = _os.setdefault(str(lid), {})
+                    _rid_os = _lid_os.setdefault(str(round_id), {})
+                    _odds_saved = 0
+
+                    for raw in events:
+                        try:
+                            m       = _norm_event(raw)
+                            ev_odds = _extract_odds(raw)
+                            if not m["home"] or not m["away"]:
+                                continue
+                            if not ev_odds or not ev_odds.get("1x2"):
+                                continue
+                            _canon = "|".join(sorted([
+                                m["home"].strip().upper(),
+                                m["away"].strip().upper()
+                            ]))
+                            # Only save if not already stored for this round
+                            # (never overwrite outcome/score that was already written)
+                            if _canon not in _rid_os:
+                                _rid_os[_canon] = {
+                                    "odds_snapshot": ev_odds,
+                                    "home":          m["home"],
+                                    "away":          m["away"],
+                                    "round_id":      str(round_id),
+                                    "league_id":     lid,
+                                    "season_id":     _cur_season_id or "",
+                                    "saved_ts":      time.time(),
+                                    "outcome":       None,
+                                    "score_h":       None,
+                                    "score_a":       None,
+                                    "correct":       None,
+                                }
+                                _odds_saved += 1
+                        except Exception as _oe:
+                            log.warning(f"COLLECTOR [{name}] odds save error: {_oe}")
+
+                    if _odds_saved:
+                        log.info(f"💾 COLLECTOR [{name}] rnd={round_id}: saved {_odds_saved} odds entries")
+
+                    # ── Queue predictions for learning — only once per round ──
                     if ck not in collected:
                         match_preds = []
-
-                        # ── Save live server odds to dedicated odds_store ──────
-                        # This is authoritative — fetched fresh from betPawa server.
-                        # Used by _detect_odds_repeat as the historical comparison source.
-                        # Key: odds_store[lid][round_id][canonical_fixture_key]
-                        _os = bot_data.setdefault("odds_store", {})
-                        _lid_os = _os.setdefault(str(lid), {})
-                        _rid_os = _lid_os.setdefault(str(round_id), {})
-
                         for raw in events:
                             try:
                                 m       = _norm_event(raw)
                                 ev_odds = _extract_odds(raw)
                                 if not m["home"] or not m["away"]:
                                     continue
-
-                                # Save odds if they have real 1x2 data from server
-                                if ev_odds and ev_odds.get("1x2"):
-                                    _canon = sorted([
-                                        m["home"].strip().upper(),
-                                        m["away"].strip().upper()
-                                    ])
-                                    _fk = "|".join(_canon)
-                                    _rid_os[_fk] = {
-                                        "odds_snapshot": ev_odds,
-                                        "home":          m["home"],
-                                        "away":          m["away"],
-                                        "round_id":      str(round_id),
-                                        "league_id":     lid,
-                                        "season_id":     _cur_season_id or "",
-                                        "saved_ts":      time.time(),
-                                        "outcome":       None,   # filled in after round ends
-                                        "score_h":       None,
-                                        "score_a":       None,
-                                        "correct":       None,   # filled after learning
-                                    }
-
                                 p = predict_match(
                                     m["home"], m["away"], stats,
                                     ev_odds, league_model
@@ -11205,6 +11366,7 @@ async def _data_collector_job(context):
                             )
                     else:
                         log.info(f"📡 COLLECTOR [{name}] rnd={round_id} already queued, skipping")
+
 
                 # ── B) Backfill past rounds — fill every gap in match_log ─────
                 # The old approach skipped backfill once fp_db had >= 10 rounds,
@@ -11360,6 +11522,7 @@ async def _stats_loader_job(context):
     ctx = _FakeCtx(context.bot_data)
     async with httpx.AsyncClient() as client:
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             try:
                 await _ensure_stats(ctx, lid, client)
                 log.info(f"📦 Stats refreshed for league {lid}")
@@ -12100,6 +12263,7 @@ async def _do_backup_inner(message, c):
     brain_data = {}
 
     for lid in LEAGUES:
+        if lid not in ACTIVE_LEAGUES: continue
         m = bd.get(f"model_{lid}")
         if not isinstance(m, dict):
             continue
@@ -13078,6 +13242,7 @@ def main():
         log.info(f"   Users    : {len(users)} ({list(users.keys())})")
         log.info(f"   Channels : {len(channels)} ({list(channels)})")
         for lid in LEAGUES:
+            if lid not in ACTIVE_LEAGUES: continue
             m = bd.get(f"model_{lid}")
             if isinstance(m, dict) and m.get("rounds_learned", 0) > 0:
                 log.info(f"   League {lid}: {m['rounds_learned']} rounds learned, "
@@ -13087,7 +13252,7 @@ def main():
                 log.info(f"   League {lid}: no prior learning — will bootstrap")
         log.info("-" * 60)
         async with httpx.AsyncClient() as client:
-            for test_lid, test_name in [(7794, "England"), (7795, "Spain")]:
+            for test_lid, test_name in [(lid, LEAGUES[lid]["name"]) for lid in ACTIVE_LEAGUES if lid in LEAGUES]:
                 log.info(f"--- League {test_lid} {test_name} ---")
                 past   = await fetch_round_list(client, test_lid, past=True)
                 actual = await fetch_round_list(client, test_lid, past=False)
