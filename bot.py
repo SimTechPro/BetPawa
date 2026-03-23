@@ -3500,14 +3500,34 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
 
     # ── SCORE CYCLE DETECTION ────────────────────────────────────────────────
     # Build full sequence from score_history (England) or verified records
-    _full_seq = []
+    # ── TRANSITION-MAP CYCLE DETECTION ──────────────────────────────────────
+    # Read from score_history_7794 transition map for England.
+    # The map stores: for each score, what score came NEXT and how many times.
+    # This tracks every path ever taken, including branches.
+    _full_seq    = []      # chronological sequence for fallback logic
+    _transitions = {}      # score → {next_score: count}
+    _last_sc     = None    # last score played (canonical)
+    _last_out    = None    # last outcome
+    _track       = None
+
     if league_id == 7794 and bot_data:
         _c1x2   = current_odds.get("1x2", {})
         _ofp    = f"{_c1x2.get('1',0)}-{_c1x2.get('X',0)}-{_c1x2.get('2',0)}"
         _sh_key = f"{fk}|{_ofp}"
-        for _r in bot_data.get("score_history_7794", {}).get(_sh_key, []):
-            if _r.get("outcome") and _r.get("score_h") is not None:
-                _full_seq.append((_r["outcome"], _r["score_h"], _r["score_a"]))
+        _track  = bot_data.get("score_history_7794", {}).get(_sh_key)
+        if _track and isinstance(_track, dict):
+            # New transition-map format
+            _full_seq    = [(r[0], r[1], r[2]) for r in _track.get("sequence", [])]
+            _transitions = _track.get("transitions", {})
+            _last_sc     = _track.get("last_score")
+            _last_out    = _track.get("last_outcome")
+        elif _track and isinstance(_track, list):
+            # Legacy flat-list format — migrate on the fly
+            for _r in _track:
+                if isinstance(_r, dict) and _r.get("outcome") and _r.get("score_h") is not None:
+                    _full_seq.append((_r["outcome"], _r["score_h"], _r["score_a"]))
+
+    # Fallback: use verified records when no score_history data yet
     if not _full_seq:
         for q in _all_with_outcome:
             rec = q["record"]
@@ -3516,13 +3536,37 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
                 _full_seq.append((out, sh, sa))
 
     _seq              = [s[0] for s in _full_seq]
-    _cycle_next       = None   # next expected direction
-    _cycle_next_score = None   # next expected score (only when score repeats exactly)
+    _cycle_next       = None
+    _cycle_next_score = None
     _cycle_period     = None
-    _cycle_tip_market = "1X2" # default market for prediction
+    _cycle_tip_market = "1X2"
+    scores_str        = ""
 
-    # Detect repeating period (needs 2x period records minimum)
-    if len(_full_seq) >= 2:
+    # ── PREDICT NEXT FROM TRANSITION MAP ──────────────────────────────────────
+    # If we have a last_score and transitions, use the map directly.
+    # Most common "next" is the primary prediction.
+    # All known "nexts" are shown on the card.
+    _next_candidates = {}   # {score_str: count} of all known next scores
+    if _last_sc and _transitions.get(_last_sc):
+        _next_candidates = _transitions[_last_sc]
+        # Best next = most frequent
+        _best_next_sc  = max(_next_candidates, key=_next_candidates.get)
+        _best_count    = _next_candidates[_best_next_sc]
+        _total_nexts   = sum(_next_candidates.values())
+        # Determine direction of best next
+        _bnh, _bna     = (int(x) for x in _best_next_sc.split("-"))
+        _cycle_next        = "HOME" if _bnh > _bna else ("AWAY" if _bna > _bnh else "DRAW")
+        _cycle_next_score  = _best_next_sc
+        # Check if ALL next candidates share same direction
+        _all_dirs = set()
+        for _nsc in _next_candidates:
+            _nh, _na = (int(x) for x in _nsc.split("-"))
+            _all_dirs.add("HOME" if _nh > _na else ("AWAY" if _na > _nh else "DRAW"))
+        if len(_all_dirs) > 1:
+            # Multiple directions in next candidates — no clear 1X2
+            _cycle_next = "DRAW"  # signals: use BTTS/O/U
+    elif len(_full_seq) >= 2:
+        # No transition map data yet — fall back to period detection
         if league_id == 7794:
             _n = len(_full_seq)
             for _period in range(1, _n // 2 + 1):
@@ -3533,8 +3577,7 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
                     _cycle_next       = _nxt[0]
                     _cycle_next_score = f"{_nxt[1]}-{_nxt[2]}"
                     break
-        # Direction-only fallback when no score cycle confirmed
-        if not _cycle_period:
+        if not _cycle_next:
             _alt        = all(_seq[i] != _seq[i+1] for i in range(len(_seq)-1)) if len(_seq) >= 2 else False
             _cycle_next = ("HOME" if _seq[-1] == "AWAY" else "AWAY") if _alt else dominant_out
 
@@ -3550,53 +3593,46 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     #   cycle_next = DRAW or None → BTTS/O/U, show "1-5 👉 1-2, 4-1" (all possible next)
     #
     _last_played = _full_seq[-1] if _full_seq else None
-    _cur_str     = f"{_last_played[1]}-{_last_played[2]}" if _last_played else ""
-    dir_icons    = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}
+    # ── DISPLAY: current → all known next scores ────────────────────────────
+    _cur_str  = _last_sc if _last_sc else (
+        f"{_full_seq[-1][1]}-{_full_seq[-1][2]}" if _full_seq else ""
+    )
+    dir_icons = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}
 
     if _cycle_next in ("HOME", "AWAY"):
-        # CASE 1 or 2 — directional → always 1X2
         _cycle_tip_market = "1X2"
-
-        if _cycle_period and _cycle_next_score:
-            # Check if score repeats exactly (all records have same score)
-            _unique_scores = {(s[1], s[2]) for s in _full_seq}
-            if len(_unique_scores) == 1:
-                # CASE 1: same score always — "2-4 👉 2-4"
-                scores_str = f"`{_cur_str}` 👉 `{_cycle_next_score}`"
-            else:
-                # CASE 2: direction same, score varies — show current → next from cycle
-                scores_str = f"`{_cur_str}` 👉 `{_cycle_next_score}`"
-            # Both cases show current → next, difference is in the note on the card
-            _score_exact = len(_unique_scores) == 1
-        else:
-            # No confirmed cycle yet — direction only
-            _score_exact = False
-            _nxt_icon    = dir_icons.get(_cycle_next, "")
-            scores_str   = f"`{_cur_str}` 👉 {_nxt_icon} {_cycle_next}" if _cur_str else ""
+        _score_exact = False
+        if _next_candidates:
+            # Show current → all known next scores, sorted by frequency
+            _sorted_nexts = sorted(_next_candidates.items(), key=lambda x: -x[1])
+            _nxt_parts = []
+            for _nsc, _cnt in _sorted_nexts:
+                _tot = sum(_next_candidates.values())
+                _pct = round(_cnt/_tot*100)
+                _nxt_parts.append(f"`{_nsc}`({_pct}%)")
+            _score_exact = len(_sorted_nexts) == 1
+            _cycle_next_score = _sorted_nexts[0][0]  # most frequent
+            scores_str = f"`{_cur_str}` 👉 {chr(32).join(_nxt_parts)}" if _cur_str else ""
+        elif _cycle_next_score:
+            scores_str = f"`{_cur_str}` 👉 `{_cycle_next_score}`"
+            _score_exact = True
+        elif _cur_str:
+            _nxt_icon  = dir_icons.get(_cycle_next, "")
+            scores_str = f"`{_cur_str}` 👉 {_nxt_icon} {_cycle_next}"
 
     else:
-        # CASE 3 — DRAW or no direction → BTTS or O/U
+        # No clear direction — BTTS or O/U
         _score_exact = False
-        _totals      = [s[1] + s[2] for s in _full_seq]
-        _all_over    = all(t > 2 for t in _totals) if _totals else False
-        _all_under   = all(t <= 2 for t in _totals) if _totals else False
+        _totals   = [s[1]+s[2] for s in _full_seq]
+        _all_over = all(t > 2 for t in _totals) if _totals else False
+        _all_under= all(t <= 2 for t in _totals) if _totals else False
         _cycle_tip_market = "O/U" if (_all_over or _all_under) else "BTTS"
-
-        # Show all possible next scores from this cycle position
-        if _cycle_period and len(_full_seq) >= _cycle_period:
-            _n        = len(_full_seq)
-            _next_pos = _n % _cycle_period
-            # Collect all scores that appeared at this position across cycles
-            _pos_scores = list(dict.fromkeys(
-                f"{_full_seq[_i][1]}-{_full_seq[_i][2]}"
-                for _i in range(_next_pos, _n, _cycle_period)
-            ))
-            _nxt_part  = ", ".join(f"`{s}`" for s in _pos_scores)
-            scores_str = f"`{_cur_str}` 👉 {_nxt_part}" if _cur_str else _nxt_part
-        else:
-            # No full cycle — show all unique scores seen as possibilities
-            _possible  = ", ".join(f"`{s[1]}-{s[2]}`" for s in dict.fromkeys(_full_seq))
-            scores_str = f"`{_cur_str}` 👉 {_possible}" if _cur_str else _possible
+        if _next_candidates:
+            _sorted_nexts = sorted(_next_candidates.items(), key=lambda x: -x[1])
+            _nxt_parts = [f"`{s}`({round(c/sum(_next_candidates.values())*100)}%)" for s,c in _sorted_nexts]
+            scores_str = f"`{_cur_str}` 👉 {chr(32).join(_nxt_parts)}" if _cur_str else ""
+        elif _cur_str:
+            scores_str = f"`{_cur_str}` 👉 ?"
 
     # ── MAINTENANCE CHECK ─────────────────────────────────────────────────────
     _expected_dir = _cycle_next if _cycle_next else dominant_out
@@ -7905,43 +7941,70 @@ def _save_score_history(bot_data: dict, league_id: int,
                         outcome: str, score_h: int, score_a: int,
                         round_id: int):
     """
-    Save a match result to score_history_7794 (England only).
-    Scores normalised to canonical (sorted) team order so score_h always
-    belongs to the alphabetically-first team, regardless of who was home.
-    Outcome re-derived from normalised score — never trust the passed-in outcome.
+    Save a match to score_history_7794 using a TRANSITION MAP.
+
+    Structure per fixture+odds key:
+      {
+        "sequence": [(outcome, sh, sa, round_id), ...],   # full chronological record
+        "transitions": {                                   # what came AFTER each score
+            "2-4": {"3-1": 2, "4-0": 1},                 #   after 2-4: 3-1 happened 2x, 4-0 once
+            "3-1": {"2-4": 2},                            #   after 3-1: always 2-4
+        },
+        "last_score": "4-0",                              # most recently played score
+        "last_outcome": "HOME",
+        "last_round": 1006,
+      }
+
+    This tracks every path ever taken so the bot can follow the full cycle
+    including all branches, and predict what comes next after the last result.
+    No data is ever deleted — new branches are added as they occur.
     """
     if league_id != 7794:
         return
     o1x2 = odds_snapshot.get("1x2", {})
     if not o1x2:
         return
-    ofp        = f"{o1x2.get('1',0)}-{o1x2.get('X',0)}-{o1x2.get('2',0)}"
-    team_a     = home.strip().upper()
-    team_b     = away.strip().upper()
-    canon      = "|".join(sorted([team_a, team_b]))
-    sh_key     = f"{canon}|{ofp}"
-    # Normalise score to canonical order
-    # canon.split("|")[0] is alphabetically first team
+    ofp    = f"{o1x2.get('1',0)}-{o1x2.get('X',0)}-{o1x2.get('2',0)}"
+    team_a = home.strip().upper()
+    team_b = away.strip().upper()
+    canon  = "|".join(sorted([team_a, team_b]))
+    sh_key = f"{canon}|{ofp}"
+
+    # Normalise score to canonical team order
     if team_a == canon.split("|")[0]:
-        c_sh, c_sa = score_h, score_a   # home=canon-first, no swap
+        c_sh, c_sa = score_h, score_a
     else:
-        c_sh, c_sa = score_a, score_h   # away=canon-first, swap
-    # Re-derive outcome from normalised score
+        c_sh, c_sa = score_a, score_h
     c_outcome = "HOME" if c_sh > c_sa else ("AWAY" if c_sa > c_sh else "DRAW")
+
     store = bot_data.setdefault("score_history_7794", {})
-    hist  = store.setdefault(sh_key, [])
-    if any(r["round_id"] == round_id for r in hist):
-        return
-    seen = {(r["score_h"], r["score_a"]) for r in hist}
-    hist.append({
-        "outcome":      c_outcome,
-        "score_h":      c_sh,
-        "score_a":      c_sa,
-        "round_id":     round_id,
-        "is_new_score": (c_sh, c_sa) not in seen,
-        "is_repeat":    (c_sh, c_sa) in seen,
+    track = store.setdefault(sh_key, {
+        "sequence":    [],
+        "transitions": {},
+        "last_score":  None,
+        "last_outcome": None,
+        "last_round":  None,
     })
-    hist.sort(key=lambda x: x["round_id"])
+
+    # Skip duplicate round
+    if any(r[3] == round_id for r in track["sequence"]):
+        return
+
+    # Record this result
+    track["sequence"].append((c_outcome, c_sh, c_sa, round_id))
+    track["sequence"].sort(key=lambda x: x[3])  # keep chronological
+
+    # Update transition: what came after the PREVIOUS score
+    if track["last_score"] is not None:
+        prev_sc = track["last_score"]
+        curr_sc = f"{c_sh}-{c_sa}"
+        nexts   = track["transitions"].setdefault(prev_sc, {})
+        nexts[curr_sc] = nexts.get(curr_sc, 0) + 1
+
+    # Update last
+    track["last_score"]   = f"{c_sh}-{c_sa}"
+    track["last_outcome"] = c_outcome
+    track["last_round"]   = round_id
 
 
 def _learn_from_round(bot_data: dict, league_id: int,
@@ -11564,9 +11627,9 @@ async def _data_collector_job(context):
 
                         # ── Save odds + scores to odds_store + score_history ──
                         # NOTE: odds not available for past rounds (betPawa strips them).
-                        # odds_store and score_history are built from LIVE rounds only.
-                        # The live collector saves odds every tick for upcoming rounds.
+                        # odds_store and score_history built from LIVE rounds only.
 
+                        if preds and results:
                             _past_season_id = str(r.get("_seasonId") or r.get("seasonId") or "")
                             _learn_from_round(bot_data, lid, preds, results,
                                               round_id=int(rid) if rid.isdigit() else 0,
@@ -11579,7 +11642,6 @@ async def _data_collector_job(context):
                             collected[bk] = 1
                             backfilled += 1
                             log.info(f"📚 COLLECTOR BACKFILL [{name}] rnd={rid} learned {len(results)} matches (gap-fill)")
-
                 except Exception as e:
                     log.warning(
                         f"COLLECTOR backfill [{name}]: {e}\n{traceback.format_exc()}"
