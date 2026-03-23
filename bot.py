@@ -132,13 +132,6 @@ LEAGUES: dict[int, dict] = {
     13774: {"name": "Portugal",    "flag": "🇵🇹"},
 }
 
-
-# ── ACTIVE LEAGUES ───────────────────────────────────────────────────────────
-# Only leagues in this set are predicted, stored, and learned from.
-# All others are completely dormant — no predictions, no storing, no learning.
-# To re-enable a league, add its ID back to this set.
-ACTIVE_LEAGUES: set = {7794}  # England only
-
 def ld(league_id: int) -> str:
     l = LEAGUES[league_id]
     return f"{l['flag']} {l['name']}"
@@ -647,6 +640,284 @@ def _extract_odds(event: dict) -> dict:
                             result["htft"][clean] = p
 
     return result
+
+# ─── MULTI-MARKET ENGINE ──────────────────────────────────────────────────────
+
+def _ml_weights(bot_data: dict) -> dict:
+    """
+    Return the self-learning market weight dict from bot_data.
+    Initialises with Laplace-smoothed defaults (correct=1, total=2 → 50%)
+    so the engine produces sensible output before any results are known.
+    Stored globally in bot_data (not per-league) so all leagues share the
+    same weight table and learn faster.
+    """
+    if "ml_weights" not in bot_data:
+        bot_data["ml_weights"] = {
+            "1x2":  {"correct": 1, "total": 2},
+            "ou":   {"correct": 1, "total": 2},
+            "btts": {"correct": 1, "total": 2},
+            "htft": {"correct": 1, "total": 2},
+            "dc":   {"correct": 1, "total": 2},
+        }
+    # Forward-compat: patch any missing keys
+    w = bot_data["ml_weights"]
+    for k in ("1x2", "ou", "btts", "htft", "dc"):
+        w.setdefault(k, {"correct": 1, "total": 2})
+        w[k].setdefault("correct", 1)
+        w[k].setdefault("total",   2)
+    return w
+
+
+def _risk_control(bot_data: dict) -> dict:
+    """
+    Return the loss-streak risk control dict from bot_data.
+    loss_streak is reset to 0 on each correct prediction and incremented
+    on each wrong one.  When streak >= 3 confidence is trimmed; >= 5 the
+    tip is forced to DRAW (safest) until the streak breaks.
+    """
+    if "risk" not in bot_data:
+        bot_data["risk"] = {"loss_streak": 0}
+    bot_data["risk"].setdefault("loss_streak", 0)
+    return bot_data["risk"]
+
+
+def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
+    """
+    Unified multi-market prediction engine.
+    Uses: 1X2, O/U (2.5 line), BTTS, HT/FT, Double Chance.
+
+    Market weights are self-learning: each market's score contribution is
+    proportional to how often that market's implied signal was correct in
+    past results (tracked by update_market_learning).
+
+    Returns:
+        {
+          "pick":       "HOME" | "DRAW" | "AWAY",
+          "confidence": float (0-100),
+          "scores":     {"HOME": float, "DRAW": float, "AWAY": float},
+          "used":       list[str],          # which markets contributed
+        }
+    """
+    if bot_data is None:
+        bot_data = {}
+
+    weights = _ml_weights(bot_data)
+
+    def w(key: str) -> float:
+        """Dynamic weight for a market key, scaled to 0.5 – 3.0."""
+        rec = weights.get(key, {"correct": 1, "total": 2})
+        t   = max(rec.get("total", 2), 2)
+        c   = rec.get("correct", 1)
+        return (c / t) * 3.0   # range: ~0 to 3.0; at 50% accuracy = 1.5
+
+    score: dict[str, float] = {"HOME": 0.0, "DRAW": 0.0, "AWAY": 0.0}
+    used: list[str] = []
+
+    # ── 1. 1X2 (base probability) ─────────────────────────────────────────────
+    o1x2 = odds.get("1x2", {})
+    if o1x2:
+        try:
+            h = 1.0 / float(o1x2.get("1", 99))
+            d = 1.0 / float(o1x2.get("X", 99))
+            a = 1.0 / float(o1x2.get("2", 99))
+            total = h + d + a
+            if total > 0:
+                wt = w("1x2")
+                score["HOME"] += (h / total) * wt
+                score["DRAW"] += (d / total) * wt
+                score["AWAY"] += (a / total) * wt
+                used.append("1x2")
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    # ── 2. Over/Under 2.5 (game type signal) ─────────────────────────────────
+    ou = odds.get("ou", [])
+    ou25 = [x for x in ou if str(x[1]) == "2.5"]
+    if ou25:
+        try:
+            over  = next((p for s, l, p in ou25 if s == "O"), None)
+            under = next((p for s, l, p in ou25 if s == "U"), None)
+            if over and under:
+                wt = w("ou")
+                if under < over:           # low scoring → draw favoured
+                    score["DRAW"] += wt
+                else:                      # high scoring → decisive result
+                    score["HOME"] += wt / 2
+                    score["AWAY"] += wt / 2
+                used.append("ou")
+        except (TypeError, ValueError):
+            pass
+
+    # ── 3. BTTS (goal symmetry) ───────────────────────────────────────────────
+    btts = odds.get("btts", {})
+    if btts:
+        try:
+            yes = btts.get("Yes")
+            no  = btts.get("No")
+            if yes and no:
+                wt = w("btts")
+                if yes < no:               # both teams likely to score → narrow
+                    score["DRAW"] += wt
+                else:                      # one-sided → boost whichever team is leading
+                    if score["HOME"] >= score["AWAY"]:
+                        score["HOME"] += wt
+                    else:
+                        score["AWAY"] += wt
+                used.append("btts")
+        except (TypeError, ValueError):
+            pass
+
+    # ── 4. HT/FT (game-flow signal) ──────────────────────────────────────────
+    htft = odds.get("htft", {})
+    if htft:
+        try:
+            best = min(htft.items(), key=lambda x: x[1])[0]
+            wt   = w("htft")
+            mapping = {
+                "1/1": ("HOME", wt),       "2/2": ("AWAY", wt),
+                "X/X": ("DRAW", wt),       "1/X": ("DRAW", wt * 0.67),
+                "X/1": ("HOME", wt * 0.67),"2/X": ("DRAW", wt * 0.67),
+                "X/2": ("AWAY", wt * 0.67),"1/2": ("AWAY", wt * 0.50),
+                "2/1": ("HOME", wt * 0.50),
+            }
+            out, pts = mapping.get(best, (None, 0))
+            if out:
+                score[out] += pts
+                used.append("htft")
+        except (TypeError, ValueError, StopIteration):
+            pass
+
+    # ── 5. Double Chance (market safety signal) ───────────────────────────────
+    dc = odds.get("dc", {})
+    if dc:
+        try:
+            best_dc = min(dc.items(), key=lambda x: x[1])[0]
+            wt = w("dc")
+            if best_dc == "1X":
+                score["HOME"] += wt / 2
+            elif best_dc == "X2":
+                score["AWAY"] += wt / 2
+            elif best_dc == "12":
+                score["DRAW"] -= wt / 2   # draw is the risky side
+            used.append("dc")
+        except (TypeError, ValueError, StopIteration):
+            pass
+
+    # ── Final decision ────────────────────────────────────────────────────────
+    sorted_scores = sorted(score.items(), key=lambda x: x[1], reverse=True)
+    top, second   = sorted_scores[0], sorted_scores[1]
+
+    # Anti-random filter: if top two are too close, default to DRAW
+    if abs(top[1] - second[1]) < 1.5:
+        pick = "DRAW"
+    else:
+        pick = top[0]
+
+    total_score = sum(score.values())
+    if total_score > 0:
+        confidence = round((top[1] / total_score) * 100, 1)
+    else:
+        confidence = 33.0
+
+    return {
+        "pick":       pick,
+        "confidence": confidence,
+        "scores":     score,
+        "used":       used,
+    }
+
+
+def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: dict) -> None:
+    """
+    Called after each match result is known.
+    Updates the self-learning weight table for each market that had a view
+    on this match, incrementing 'correct' when the market's implied signal
+    matched the actual outcome.
+
+    Args:
+        bot_data:  the application's persistent bot_data dict
+        predicted: "HOME" | "DRAW" | "AWAY"  — our predicted outcome
+        actual:    "HOME" | "DRAW" | "AWAY"  — the real FT outcome
+        odds:      the odds dict returned by _extract_odds for the match
+    """
+    weights = _ml_weights(bot_data)
+
+    def _update(key: str, correct: bool) -> None:
+        weights[key]["total"] += 1
+        if correct:
+            weights[key]["correct"] += 1
+
+    # 1X2 — implied favourite matches actual?
+    o1x2 = odds.get("1x2", {})
+    if o1x2:
+        try:
+            fav  = min(o1x2, key=lambda k: o1x2[k])
+            mapped = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(fav)
+            if mapped:
+                _update("1x2", mapped == actual)
+        except (TypeError, ValueError):
+            pass
+
+    # O/U 2.5 — under favoured → DRAW implied; over → decisive
+    ou = odds.get("ou", [])
+    ou25 = [x for x in ou if str(x[1]) == "2.5"]
+    if ou25:
+        try:
+            over  = next((p for s, l, p in ou25 if s == "O"), None)
+            under = next((p for s, l, p in ou25 if s == "U"), None)
+            if over and under:
+                implied_draw = (under < over)
+                actual_draw  = (actual == "DRAW")
+                _update("ou", implied_draw == actual_draw)
+        except (TypeError, ValueError):
+            pass
+
+    # BTTS — yes < no → both score → narrower result (draw-leaning)
+    btts = odds.get("btts", {})
+    if btts:
+        try:
+            yes = btts.get("Yes")
+            no  = btts.get("No")
+            if yes and no:
+                implied_btts = (yes < no)
+                actual_btts  = (actual != "DRAW")   # rough: decisive → one team scored more
+                _update("btts", implied_btts == actual_btts)
+        except (TypeError, ValueError):
+            pass
+
+    # HT/FT — lowest-priced outcome maps to a result; was it correct?
+    htft = odds.get("htft", {})
+    if htft:
+        try:
+            best = min(htft.items(), key=lambda x: x[1])[0]
+            # first character: 1=Home, X=Draw, 2=Away at FT
+            ft_char = best.split("/")[-1] if "/" in best else ""
+            mapped  = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(ft_char)
+            if mapped:
+                _update("htft", mapped == actual)
+        except (TypeError, ValueError, StopIteration):
+            pass
+
+    # DC — cheapest DC option; does the actual outcome fall within it?
+    dc = odds.get("dc", {})
+    if dc:
+        try:
+            best = min(dc.items(), key=lambda x: x[1])[0]
+            if best == "1X":
+                _update("dc", actual in ("HOME", "DRAW"))
+            elif best == "X2":
+                _update("dc", actual in ("AWAY", "DRAW"))
+            elif best == "12":
+                _update("dc", actual in ("HOME", "AWAY"))
+        except (TypeError, ValueError, StopIteration):
+            pass
+
+    log.debug(
+        f"📊 market_learning updated — predicted={predicted} actual={actual} | "
+        + " ".join(f"{k}={v['correct']}/{v['total']}" for k, v in weights.items())
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _fmt_odds_full(odds: dict) -> str:
     sections = []
@@ -2884,6 +3155,48 @@ def predict_match(home: str, away: str, stats: dict,
     elif calib < -3:
         conf = round(min(97.0, conf - calib * 0.15), 1)
 
+    # ── Multi-market engine blend ─────────────────────────────────────────────
+    # Run the dedicated multi-market predictor and let it nudge the ensemble.
+    # Weight: 15% blend so it adds signal without overriding odds-dominant model.
+    # bot_data is carried inside model["_bot_data"] when available; otherwise
+    # the engine runs with default (equal) weights.
+    _bd_ref = model.get("_bot_data") if model else None
+    mm_result = multi_market_predict(odds if odds else {}, bot_data=_bd_ref)
+    mm_pick = mm_result.get("pick", "")
+    MM_BLEND = 0.15   # 15 % influence
+    if mm_pick == "HOME":
+        hw = hw * (1 - MM_BLEND) + MM_BLEND
+        dw = dw * (1 - MM_BLEND)
+        aw = aw * (1 - MM_BLEND)
+    elif mm_pick == "DRAW":
+        dw = dw * (1 - MM_BLEND) + MM_BLEND
+        hw = hw * (1 - MM_BLEND)
+        aw = aw * (1 - MM_BLEND)
+    elif mm_pick == "AWAY":
+        aw = aw * (1 - MM_BLEND) + MM_BLEND
+        hw = hw * (1 - MM_BLEND)
+        dw = dw * (1 - MM_BLEND)
+    # Re-normalise after blend
+    _mm_t = hw + dw + aw or 1.0
+    hw /= _mm_t; dw /= _mm_t; aw /= _mm_t
+    # Tiny confidence nudge when multi-market agrees with our tip
+    if mm_pick and mm_pick == tip_outcome:
+        conf = round(min(97.0, conf + 1.5), 1)
+
+    # ── Loss-streak risk protection ───────────────────────────────────────────
+    # Applied here so every prediction path respects the streak state.
+    if _bd_ref is not None:
+        _risk = _risk_control(_bd_ref)
+        _streak = _risk.get("loss_streak", 0)
+        if _streak >= 3:
+            conf = round(max(40.0, conf - 20.0), 1)
+        if _streak >= 5:
+            # Force to DRAW (safest bet) when deeply in a losing streak
+            if tip_outcome != "DRAW":
+                tip        = "DRAW / CLOSE"
+                icon       = "🤝"
+                tip_outcome = "DRAW"
+
     # ── 9. Side markets — use odds if available, else blend stats + learned rates ─
     p  = hst["p"] or 1
     pa = ast["p"] or 1
@@ -3460,34 +3773,27 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     n_matched       = len(matched_markets)
 
     # ── CROSS-CHECK 3: result consistency across ALL verified records ──────────
-    # ── CROSS-CHECK 3: result consistency + cycle sequence ────────────────
-    # Sort ALL verified records chronologically (oldest→newest)
-    # to build the true sequence of outcomes for this fixture.
-    _all_with_outcome = sorted(
-        [q for q in verified if q["record"].get("outcome")],
-        key=lambda q: int(q["record"].get("round_id", 0) or 0)
-    )
-
+    # Strict: outcome slot (HOME/AWAY) must match exactly as stored.
+    # A record where the team was away is an AWAY result — no translation.
     outcome_counts = {}
-    score_lines    = []   # chronological: oldest→newest with direction label
+    score_lines    = []
 
-    for q in _all_with_outcome:
+    for q in verified:
         rec = q["record"]
         out = rec.get("outcome", "")
         if not out:
-            continue
+            continue  # skip pending records (no result yet) from consistency count
         outcome_counts[out] = outcome_counts.get(out, 0) + 1
         sh   = rec.get("score_h")
         sa   = rec.get("score_a")
         ht_h = rec.get("ht_h")
         ht_a = rec.get("ht_a")
         if sh is not None and sa is not None:
-            ht_str   = f"{ht_h}-{ht_a}/" if ht_h is not None and ht_a is not None else ""
-            dir_icon = "🏠" if out == "HOME" else ("✈️" if out == "AWAY" else "🤝")
-            score_lines.append(f"{dir_icon}{ht_str}{sh}-{sa}")
+            ht_str = f"{ht_h}-{ht_a}/" if ht_h is not None and ht_a is not None else ""
+            score_lines.append(f"{ht_str}{sh}-{sa}")
 
-    repeat_count = len(_all_with_outcome)
-    known_count  = len(outcome_counts)
+    repeat_count = len(verified)
+    known_count  = len(outcome_counts)  # records with confirmed results
 
     if not outcome_counts:
         return {"matched": False, "repeat_count": repeat_count,
@@ -3495,177 +3801,36 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
 
     dominant_out      = max(outcome_counts, key=outcome_counts.get)
     consistency_count = outcome_counts[dominant_out]
+    # Consistency based only on records with known results
     total_known       = sum(outcome_counts.values())
     consistency_pct   = round(consistency_count / total_known * 100)
 
-    # ── SCORE CYCLE DETECTION ────────────────────────────────────────────────
-    # Build full sequence from score_history (England) or verified records
-    # ── TRANSITION-MAP CYCLE DETECTION ──────────────────────────────────────
-    # Read from score_history_7794 transition map for England.
-    # The map stores: for each score, what score came NEXT and how many times.
-    # This tracks every path ever taken, including branches.
-    _full_seq    = []      # chronological sequence for fallback logic
-    _transitions = {}      # score → {next_score: count}
-    _last_sc     = None    # last score played (canonical)
-    _last_out    = None    # last outcome
-    _track       = None
+    # STRICT: ≥67% same result across known outcomes
+    if consistency_pct < 67:
+        return {"matched": False, "repeat_count": repeat_count,
+                "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
 
-    if league_id == 7794 and bot_data:
-        _c1x2   = current_odds.get("1x2", {})
-        _ofp    = f"{_c1x2.get('1',0)}-{_c1x2.get('X',0)}-{_c1x2.get('2',0)}"
-        _sh_key = f"{fk}|{_ofp}"
-        _track  = bot_data.get("score_history_7794", {}).get(_sh_key)
-        if _track and isinstance(_track, dict):
-            # New transition-map format
-            _full_seq    = [(r[0], r[1], r[2]) for r in _track.get("sequence", [])]
-            _transitions = _track.get("transitions", {})
-            _last_sc     = _track.get("last_score")
-            _last_out    = _track.get("last_outcome")
-        elif _track and isinstance(_track, list):
-            # Legacy flat-list format — migrate on the fly
-            for _r in _track:
-                if isinstance(_r, dict) and _r.get("outcome") and _r.get("score_h") is not None:
-                    _full_seq.append((_r["outcome"], _r["score_h"], _r["score_a"]))
-
-    # Fallback: use verified records when no score_history data yet
-    if not _full_seq:
-        for q in _all_with_outcome:
-            rec = q["record"]
-            out = rec.get("outcome",""); sh = rec.get("score_h"); sa = rec.get("score_a")
-            if out and sh is not None and sa is not None:
-                _full_seq.append((out, sh, sa))
-
-    _seq              = [s[0] for s in _full_seq]
-    _cycle_next       = None
-    _cycle_next_score = None
-    _cycle_period     = None
-    _cycle_tip_market = "1X2"
-    scores_str        = ""
-
-    # ── PREDICT NEXT FROM TRANSITION MAP ──────────────────────────────────────
-    # If we have a last_score and transitions, use the map directly.
-    # Most common "next" is the primary prediction.
-    # All known "nexts" are shown on the card.
-    _next_candidates = {}   # {score_str: count} of all known next scores
-    if _last_sc and _transitions.get(_last_sc):
-        _next_candidates = _transitions[_last_sc]
-        # Best next = most frequent
-        _best_next_sc  = max(_next_candidates, key=_next_candidates.get)
-        _best_count    = _next_candidates[_best_next_sc]
-        _total_nexts   = sum(_next_candidates.values())
-        # Determine direction of best next
-        _bnh, _bna     = (int(x) for x in _best_next_sc.split("-"))
-        _cycle_next        = "HOME" if _bnh > _bna else ("AWAY" if _bna > _bnh else "DRAW")
-        _cycle_next_score  = _best_next_sc
-        # Check if ALL next candidates share same direction
-        _all_dirs = set()
-        for _nsc in _next_candidates:
-            _nh, _na = (int(x) for x in _nsc.split("-"))
-            _all_dirs.add("HOME" if _nh > _na else ("AWAY" if _na > _nh else "DRAW"))
-        if len(_all_dirs) > 1:
-            # Multiple directions in next candidates — no clear 1X2
-            _cycle_next = "DRAW"  # signals: use BTTS/O/U
-    elif _last_out and not _next_candidates:
-        # Only 1 record — no transitions yet. Use the known outcome as direction.
-        # BTTS/O/U only fires when we actually have conflicting directions from 2+ records.
-        _cycle_next       = _last_out
-        _cycle_next_score = None  # score unknown until next round plays
-    if not _cycle_next and len(_full_seq) >= 2:
-        # No transition map data yet — fall back to period detection
-        if league_id == 7794:
-            _n = len(_full_seq)
-            for _period in range(1, _n // 2 + 1):
-                _pat = _full_seq[:_period]
-                if all(_full_seq[_i] == _pat[_i % _period] for _i in range(_n)):
-                    _cycle_period     = _period
-                    _nxt              = _pat[_n % _period]
-                    _cycle_next       = _nxt[0]
-                    _cycle_next_score = f"{_nxt[1]}-{_nxt[2]}"
-                    break
-        if not _cycle_next:
-            _alt        = all(_seq[i] != _seq[i+1] for i in range(len(_seq)-1)) if len(_seq) >= 2 else False
-            _cycle_next = ("HOME" if _seq[-1] == "AWAY" else "AWAY") if _alt else dominant_out
-
-    # ── THREE CASES ───────────────────────────────────────────────────────────
-    #
-    # CASE 1 — Same direction, same score every time:
-    #   cycle_next = HOME/AWAY, cycle_next_score set → 1X2, show "2-4 👉 2-4"
-    #
-    # CASE 2 — Same direction, score varies:
-    #   cycle_next = HOME/AWAY, no exact score → 1X2, show "1-5 👉 2-4" (next from pattern)
-    #
-    # CASE 3 — No clear direction (DRAW or ambiguous):
-    #   cycle_next = DRAW or None → BTTS/O/U, show "1-5 👉 1-2, 4-1" (all possible next)
-    #
-    _last_played = _full_seq[-1] if _full_seq else None
-    # ── DISPLAY: current → all known next scores ────────────────────────────
-    # Show score in current round perspective (home team first on card)
-    # _last_sc is canonical (sorted alphabetically), but card shows home v away
-    # so we may need to flip the score for display
-    _canon_first = fk.split("|")[0] if "|" in fk else home.strip().upper()
-    _home_upper  = home.strip().upper()
-    if _last_sc and "-" in _last_sc:
-        _lh, _la = _last_sc.split("-", 1)
-        if _home_upper == _canon_first:
-            _cur_str = _last_sc          # home = canonical-first, no flip
-        else:
-            _cur_str = f"{_la}-{_lh}"   # flip: show from current home perspective
-    else:
-        _cur_str = _last_sc if _last_sc else (
-            f"{_full_seq[-1][1]}-{_full_seq[-1][2]}" if _full_seq else ""
-        )
-    dir_icons = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}
-
-    if _cycle_next in ("HOME", "AWAY"):
-        _cycle_tip_market = "1X2"
-        _score_exact = False
-        if _next_candidates:
-            # Show current → all known next scores, sorted by frequency
-            _sorted_nexts = sorted(_next_candidates.items(), key=lambda x: -x[1])
-            _nxt_parts = []
-            for _nsc, _cnt in _sorted_nexts:
-                _tot = sum(_next_candidates.values())
-                _pct = round(_cnt/_tot*100)
-                _nxt_parts.append(f"`{_nsc}`({_pct}%)")
-            _score_exact = len(_sorted_nexts) == 1
-            _cycle_next_score = _sorted_nexts[0][0]  # most frequent
-            scores_str = f"`{_cur_str}` 👉 {chr(32).join(_nxt_parts)}" if _cur_str else ""
-        elif _cycle_next_score:
-            scores_str = f"`{_cur_str}` 👉 `{_cycle_next_score}`"
-            _score_exact = True
-        elif _cur_str:
-            _nxt_icon  = dir_icons.get(_cycle_next, "")
-            scores_str = f"`{_cur_str}` 👉 {_nxt_icon} {_cycle_next}"
-
-    else:
-        # No clear direction — BTTS or O/U
-        _score_exact = False
-        _totals   = [s[1]+s[2] for s in _full_seq]
-        _all_over = all(t > 2 for t in _totals) if _totals else False
-        _all_under= all(t <= 2 for t in _totals) if _totals else False
-        _cycle_tip_market = "O/U" if (_all_over or _all_under) else "BTTS"
-        if _next_candidates:
-            _sorted_nexts = sorted(_next_candidates.items(), key=lambda x: -x[1])
-            _nxt_parts = [f"`{s}`({round(c/sum(_next_candidates.values())*100)}%)" for s,c in _sorted_nexts]
-            scores_str = f"`{_cur_str}` 👉 {chr(32).join(_nxt_parts)}" if _cur_str else ""
-        elif _cur_str:
-            scores_str = f"`{_cur_str}` 👉 ?"
-
-    # ── MAINTENANCE CHECK ─────────────────────────────────────────────────────
-    _expected_dir = _cycle_next if _cycle_next else dominant_out
-    _sorted_v = sorted(
+    # ── RECENCY CHECK: detect if pattern has cycled ──────────────────────────
+    # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
+    # A fixture goes under maintenance the moment its most recent result
+    # contradicts the dominant outcome. It only returns to predictions when
+    # the 2 most recent results BOTH match the dominant outcome — confirming
+    # the direction is genuinely restored, not just a one-off recovery.
+    _sorted_verified = sorted(
         [q for q in verified if q["record"].get("outcome")],
-        key=lambda q: int(q["record"].get("round_id", 0) or 0), reverse=True
+        key=lambda q: int(q["record"].get("round_id", 0) or 0),
+        reverse=True
     )
-    if len(_sorted_v) >= 2:
-        _r1 = _sorted_v[0]["record"].get("outcome")
-        _r2 = _sorted_v[1]["record"].get("outcome")
-        if not (_r1 == _expected_dir and _r2 == _expected_dir):
+    if len(_sorted_verified) >= 2:
+        _r1 = _sorted_verified[0]["record"].get("outcome")
+        _r2 = _sorted_verified[1]["record"].get("outcome")
+        if not (_r1 == dominant_out and _r2 == dominant_out):
             return {"matched": False, "repeat_count": repeat_count,
-                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {_expected_dir}"}
+                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {dominant_out} to restore"}
 
-    # ── CONFIDENCE ────────────────────────────────────────────────────────────
+    # ── All checks passed ─────────────────────────────────────────────────────
     match_pct = round(n_matched / n_available * 100)
+    # Compute confidence from raw odds closeness across all matched markets
     diffs = []
     snap_b = best_record.get("odds_snapshot") or {}
     for mk in matched_markets:
@@ -3679,54 +3844,31 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
             if cur_btts and _get_btts(snap_b):
                 diffs.append(abs(float(cur_btts) - float(_get_btts(snap_b))))
         elif mk.startswith("O/U"):
-            _snap_b_ou = {f"O/U{_sl}_{_ss}": _sp for _ss,_sl,_sp in snap_b.get("ou",[])}
+            # Dynamic O/U key e.g. "O/U6_O", "O/U10_U"
             _cur_pv = cur_ou_map.get(mk)
+            _rec_pv = {f"O/U{s}{l}_{sd}": p for sd,l,p in snap_b.get("ou",[]) for s in [""]}.get(mk)
+            # simpler: rebuild rec_ou_map for snap_b
+            _snap_b_ou = {f"O/U{_sl}_{_ss}": _sp for _ss,_sl,_sp in snap_b.get("ou",[])}
             _rec_pv = _snap_b_ou.get(mk)
             if _cur_pv and _rec_pv:
                 diffs.append(abs(float(_cur_pv) - float(_rec_pv)))
     avg_diff   = sum(diffs)/len(diffs) if diffs else 0
     confidence = round(max(0, 100 - avg_diff * 1000))
 
-    # ── EFFECTIVE OUTCOME AND TIER ─────────────────────────────────────────────
-    _effective_out = _cycle_next if _cycle_next else dominant_out
-    out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(_effective_out, _effective_out)
+    out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(dominant_out, dominant_out)
 
     if consistency_pct == 100 and repeat_count >= 2:
         tier     = "💎 ELITE LOCK"
-        tier_msg = "all 5 markets identical — 100% same result every time"
+        tier_msg = f"all 5 markets identical — 100% same result every time"
     elif consistency_pct >= 67:
         tier     = "🏆 ELITE"
         tier_msg = f"all 5 markets confirmed — {consistency_pct}% same result"
-    else:
-        tier     = "⭐ PREMIUM"
-        tier_msg = f"{consistency_pct}% consistent"
 
-    _period_info = f" · {_cycle_period}-step cycle" if _cycle_period else ""
+    scores_str = "  ·  ".join(score_lines[:3])
+    if len(score_lines) > 3:
+        scores_str += f"  (+{len(score_lines)-3} more)"
 
-    # Cycle display line
-    _cycle_icon = dir_icons.get(_cycle_next, "")
-    if _cycle_tip_market == "1X2":
-        if _cycle_next_score:
-            _note = " *(exact repeat)*" if _score_exact else " *(score varies)*"
-            _cycle_str = f"{_cycle_icon} *{_cycle_next}* — `{_cycle_next_score}`{_note}"
-        elif _cycle_next:
-            _cycle_str = f"{_cycle_icon} *{_cycle_next}* next in cycle"
-        else:
-            _cycle_str = ""
-    else:
-        # BTTS or O/U — show which market and why
-        _totals    = [s[1] + s[2] for s in _full_seq]
-        _avg_tot   = round(sum(_totals) / len(_totals), 1) if _totals else 0
-        _btts_cnt  = sum(1 for s in _full_seq if s[1] > 0 and s[2] > 0)
-        _btts_pct  = round(_btts_cnt / len(_full_seq) * 100) if _full_seq else 0
-        if _cycle_tip_market == "O/U":
-            _ou_dir    = "Over" if _all_over else "Under"
-            _cycle_str = f"📊 *{_ou_dir} 2.5* — avg {_avg_tot} goals  (no clear 1X2 direction)"
-        else:
-            _btts_lbl  = "Yes" if _btts_pct >= 60 else "No"
-            _cycle_str = f"⚽ *BTTS {_btts_lbl}* — {_btts_pct}% both score  (no clear 1X2 direction)"
-
-    # Map markets to 5 core slots
+    # Map matched markets to 5 core slots for display
     _core5 = {"1X2": False, "DC": False, "BTTS": False, "O/U": False, "HT/FT": False}
     for _mk in matched_markets:
         if _mk == "1X2":            _core5["1X2"]  = True
@@ -3736,15 +3878,10 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         elif _mk == "HT/FT":        _core5["HT/FT"]= True
     _verified_count = sum(_core5.values())
 
-    _effective_count = outcome_counts.get(_effective_out, 0)
-    _cycle_override  = (_cycle_next and _cycle_next != dominant_out)
-    _override_note   = f" *(cycle override — dominant was {dominant_out})*" if _cycle_override else ""
-
     star_label = (
-        f"{tier} — {tier_msg}{_period_info}\n"
-        f"┆    📌 Result: *{out_label}*  ({_effective_count}/{repeat_count}x){_override_note}\n"
-        + (f"┆    🔄 {scores_str}\n" if scores_str else "")
-        + (f"┆    ➡️  {_cycle_str}\n" if _cycle_str else "")
+        f"{tier} — {tier_msg}\n"
+        f"┆    📌 Result: *{out_label}*  ({consistency_count}/{repeat_count}x confirmed)\n"
+        + (f"┆    📊 Scores (HT/FT): `{scores_str}`\n" if scores_str else "")
         + f"┆    🔑 Markets verified: {_verified_count}/5\n"
         f"┆    🎯 Odds precision: {confidence}%  ·  ±5% tolerance"
     )
@@ -3757,16 +3894,13 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         "repeat_count":      repeat_count,
         "best_record":       best_record,
         "confidence":        confidence,
-        "outcome":           _effective_out,
+        "outcome":           dominant_out,
         "consistency_pct":   consistency_pct,
         "consistency_count": consistency_count,
         "tier":              tier,
-        "cycle_next":        _cycle_next,
-        "cycle_tip_market":  _cycle_tip_market,
-        "score_history":     [f"{s[1]}-{s[2]}" for s in _full_seq],
+        "score_history":     score_lines,
         "star_label":        star_label,
     }
-
     """
     Full H2H analysis between two teams — used when odds don't match well.
 
@@ -6510,6 +6644,10 @@ def _get_model(bot_data: dict, league_id: int) -> dict:
             for stale in ("fixture_trust",):
                 old_ai.pop(stale, None)
 
+    # Always attach a live reference to bot_data so predict_match can access
+    # _ml_weights and _risk_control without needing bot_data passed explicitly.
+    # This is a transient reference — it is stripped before backup/JSON serialisation.
+    bot_data[key]["_bot_data"] = bot_data
     return bot_data[key]
 
 
@@ -7951,79 +8089,6 @@ def _form_snapshot_for_record(team: str, model: dict) -> dict:
     }
 
 
-
-def _save_score_history(bot_data: dict, league_id: int,
-                        home: str, away: str,
-                        odds_snapshot: dict,
-                        outcome: str, score_h: int, score_a: int,
-                        round_id: int):
-    """
-    Save a match to score_history_7794 using a TRANSITION MAP.
-
-    Structure per fixture+odds key:
-      {
-        "sequence": [(outcome, sh, sa, round_id), ...],   # full chronological record
-        "transitions": {                                   # what came AFTER each score
-            "2-4": {"3-1": 2, "4-0": 1},                 #   after 2-4: 3-1 happened 2x, 4-0 once
-            "3-1": {"2-4": 2},                            #   after 3-1: always 2-4
-        },
-        "last_score": "4-0",                              # most recently played score
-        "last_outcome": "HOME",
-        "last_round": 1006,
-      }
-
-    This tracks every path ever taken so the bot can follow the full cycle
-    including all branches, and predict what comes next after the last result.
-    No data is ever deleted — new branches are added as they occur.
-    """
-    if league_id != 7794:
-        return
-    o1x2 = odds_snapshot.get("1x2", {})
-    if not o1x2:
-        return
-    ofp    = f"{o1x2.get('1',0)}-{o1x2.get('X',0)}-{o1x2.get('2',0)}"
-    team_a = home.strip().upper()
-    team_b = away.strip().upper()
-    canon  = "|".join(sorted([team_a, team_b]))
-    sh_key = f"{canon}|{ofp}"
-
-    # Normalise score to canonical team order
-    if team_a == canon.split("|")[0]:
-        c_sh, c_sa = score_h, score_a
-    else:
-        c_sh, c_sa = score_a, score_h
-    c_outcome = "HOME" if c_sh > c_sa else ("AWAY" if c_sa > c_sh else "DRAW")
-
-    store = bot_data.setdefault("score_history_7794", {})
-    track = store.setdefault(sh_key, {
-        "sequence":    [],
-        "transitions": {},
-        "last_score":  None,
-        "last_outcome": None,
-        "last_round":  None,
-    })
-
-    # Skip duplicate round
-    if any(r[3] == round_id for r in track["sequence"]):
-        return
-
-    # Record this result
-    track["sequence"].append((c_outcome, c_sh, c_sa, round_id))
-    track["sequence"].sort(key=lambda x: x[3])  # keep chronological
-
-    # Update transition: what came after the PREVIOUS score
-    if track["last_score"] is not None:
-        prev_sc = track["last_score"]
-        curr_sc = f"{c_sh}-{c_sa}"
-        nexts   = track["transitions"].setdefault(prev_sc, {})
-        nexts[curr_sc] = nexts.get(curr_sc, 0) + 1
-
-    # Update last
-    track["last_score"]   = f"{c_sh}-{c_sa}"
-    track["last_outcome"] = c_outcome
-    track["last_round"]   = round_id
-
-
 def _learn_from_round(bot_data: dict, league_id: int,
                        predictions: list[dict], results: list[dict],
                        round_id: int = 0, season_id: str = "",
@@ -8069,15 +8134,7 @@ def _learn_from_round(bot_data: dict, league_id: int,
                 if res.get("ht_h") is not None:
                     entry["ht_h"] = res.get("ht_h")
                     entry["ht_a"] = res.get("ht_a")
-                # Save to score history via helper (England only)
-                _save_score_history(
-                    bot_data, league_id,
-                    res.get("home", entry.get("home", "")),
-                    res.get("away", entry.get("away", "")),
-                    entry.get("odds_snapshot", {}),
-                    ft, ah, aa,
-                    int(_rid_str) if _rid_str.isdigit() else 0
-                )
+
     # Step 2+3+4: Scan ALL rounds — delete only bad/stale, keep valuable forever
     sorted_rids = sorted(
         _lid_os.keys(),
@@ -8535,6 +8592,19 @@ def _learn_from_round(bot_data: dict, league_id: int,
                 if tip == ft_out:
                     sa[sig_name]["correct"] += 1
 
+        # ── Multi-market self-learning weight update ──────────────────────────
+        # Only when we have a real (non-bootstrap) prediction and actual result.
+        if not is_bootstrap and our_out and odds_snap:
+            update_market_learning(bot_data, our_out, ft_out, odds_snap)
+
+        # ── Loss-streak risk control ──────────────────────────────────────────
+        if not is_bootstrap and our_out:
+            risk = _risk_control(bot_data)
+            if our_out == ft_out:
+                risk["loss_streak"] = 0
+            else:
+                risk["loss_streak"] = risk.get("loss_streak", 0) + 1
+
     if n_matches == 0:
         return
 
@@ -8572,32 +8642,6 @@ def _learn_from_round(bot_data: dict, league_id: int,
     model["recent_10_correct"] = r10c
     model["recent_10_total"]   = r10t
     model["recent_10_acc"]     = round(r10c/r10t, 4) if r10t > 0 else 0.0
-
-    # ── Rolling phase tracker — last 10 rounds outcome distribution ───────────
-    # Tracks HOME/DRAW/AWAY dominance so the bot knows which direction the
-    # league is currently in. Self-adjusts every round automatically.
-    _phase_q = model.setdefault("phase_q", [])
-    _phase_q.append({"home": home_wins, "draw": draws, "away": away_wins, "n": n_matches})
-    if len(_phase_q) > 10: _phase_q.pop(0)
-    _ph_home  = sum(r["home"] for r in _phase_q)
-    _ph_draw  = sum(r["draw"] for r in _phase_q)
-    _ph_away  = sum(r["away"] for r in _phase_q)
-    _ph_total = max(_ph_home + _ph_draw + _ph_away, 1)
-    model["phase_home_pct"] = round(_ph_home  / _ph_total * 100)
-    model["phase_draw_pct"] = round(_ph_draw  / _ph_total * 100)
-    model["phase_away_pct"] = round(_ph_away  / _ph_total * 100)
-    # Phase label: what direction is dominant RIGHT NOW in this league
-    # Phase thresholds calibrated for virtual football distributions:
-    # typical: HOME~45% DRAW~24% AWAY~31%
-    # HOME phase  = ≥50% home wins  (clearly above normal)
-    # AWAY phase  = ≥35% away wins  (clearly above normal for virtual)
-    # DRAW phase  = ≥30% draws      (above normal)
-    # NEUTRAL     = none dominant   → both HOME and AWAY allowed
-    if   model["phase_home_pct"] >= 50:  model["phase_label"] = "HOME"
-    elif model["phase_away_pct"] >= 35:  model["phase_label"] = "AWAY"
-    elif model["phase_draw_pct"] >= 30:  model["phase_label"] = "DRAW"
-    else:                                 model["phase_label"] = "NEUTRAL"
-
 
     fp_count = sum(len(v) for v in fp_db.values())
 
@@ -8793,7 +8837,6 @@ async def _learning_job(context):
         log.info("⚙️  One-time migration: clearing poisoned band calibration data "
                  "(margin_acc / btts_band_acc / o25_band_acc) — will rebuild from live rounds")
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if isinstance(m, dict):
                 m.pop("margin_acc",     None)
@@ -8812,7 +8855,6 @@ async def _learning_job(context):
         log.info("⚙️  One-time migration: trimming fp_db to 15 records per fixture")
         total_removed = 0
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict): continue
             fp_db = m.get("fingerprint_db", {})
@@ -8836,7 +8878,6 @@ async def _learning_job(context):
     if not bot_data.get("_fpdb_decontaminated_v1"):
         log.info("⚙️  One-time migration: purging cross-contaminated fp_db records")
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -8910,7 +8951,6 @@ async def _learning_job(context):
         log.info("⚙️  Migration v4: wiping corrupted fp_db + match_log, forcing clean rebuild")
         wiped_leagues = 0
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -8963,7 +9003,6 @@ async def _learning_job(context):
     if not bot_data.get("_ml_season_fixed_v6"):
         restored_leagues = 0
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -9004,7 +9043,6 @@ async def _learning_job(context):
     if not bot_data.get("_ml_bootstrap_purge_v7"):
         purged_leagues = 0
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict):
                 continue
@@ -9525,7 +9563,6 @@ async def cmd_resetdata(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     wiped = []
     for lid in LEAGUES:
-        if lid not in ACTIVE_LEAGUES: continue
         m = c.bot_data.get(f"model_{lid}")
         if not isinstance(m, dict):
             continue
@@ -10463,7 +10500,6 @@ async def _run_auto_post(bot, bot_data: dict):
         _had_events   = False  # tracks if any league had new events to evaluate
 
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             try:
                 # Only use already-cached stats — skip if not loaded yet
                 stats = bot_data.get(f"stats_{lid}")
@@ -10924,51 +10960,24 @@ async def _run_auto_post(bot, bot_data: dict):
                     #   4. Momentum: predicted winner win% >= 60 (stable/rising)
                     #               predicted loser  win% <= 30 (stable/falling)
                     _repeat_outcome   = _repeat.get("outcome", "")   # "HOME" / "AWAY"
-                    _repeat_outcome   = _repeat.get("outcome", "")   # "HOME"/"AWAY"
                     _htft_in_repeat   = "HT/FT" in _repeat.get("markets_matched", [])
                     _top_fire         = bool(_fire)
-                    _cycle_mkt        = _repeat.get("cycle_tip_market", "1X2")
-
-                    if _cycle_mkt in ("BTTS", "O/U"):
-                        # No direction required — cycle says use BTTS/O/U
-                        # Only need top-line fire + markets confirmed
-                        _overall_confirms = True
-                        _htft_agrees      = True
-                        _mom_ok           = True
-                    else:
-                        # Standard 1X2 direction checks
-                        _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
-                        _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
-                        if _has_mom:
-                            if _tip_g == "HOME":
-                                _winner_wp = _hm_g.get("win_pct", 0)
-                                _loser_wp  = _am_g.get("win_pct", 0)
-                            else:
-                                _winner_wp = _am_g.get("win_pct", 0)
-                                _loser_wp  = _hm_g.get("win_pct", 0)
-                            _mom_ok = (_winner_wp >= 60) and (_loser_wp <= 30)
+                    _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
+                    _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
+                    # Momentum gate — based on each team's own win%, not tip direction
+                    if _has_mom:
+                        if _tip_g == "HOME":
+                            _winner_wp = _hm_g.get("win_pct", 0)
+                            _loser_wp  = _am_g.get("win_pct", 0)
                         else:
-                            _mom_ok = True
+                            _winner_wp = _am_g.get("win_pct", 0)
+                            _loser_wp  = _hm_g.get("win_pct", 0)
+                        _mom_ok = (_winner_wp >= 60) and (_loser_wp <= 30)
+                    else:
+                        _mom_ok = True  # no momentum data yet — allow through
 
                     if not (_top_fire and _overall_confirms and _htft_agrees and _mom_ok):
-                        continue  # ❌ Direction-confirm filter
-
-                    # ── LEAGUE PHASE GATE ─────────────────────────────────
-                    # ── LEAGUE PHASE GATE ─────────────────────────────────
-                    # The tip must align with the current league cycle phase.
-                    # Phase is built from actual last-10-round win distribution.
-                    # Only confirmed phase directions fire — NEUTRAL allows both.
-                    _phase_label = league_model.get("phase_label", "NEUTRAL")
-                    _phase_home  = league_model.get("phase_home_pct", 45)
-                    _phase_away  = league_model.get("phase_away_pct", 30)
-                    # Phase is confirmed HOME: only HOME tips fire
-                    if _phase_label == "HOME" and _tip_g != "HOME":
-                        continue  # ❌ League in HOME phase — tip must be HOME
-                    # Phase is confirmed AWAY: only AWAY tips fire
-                    if _phase_label == "AWAY" and _tip_g != "AWAY":
-                        continue  # ❌ League in AWAY phase — tip must be AWAY
-                    # Phase is DRAW or NEUTRAL: both HOME and AWAY allowed
-                    # (DRAW phase = no strong direction, let fixture decide)
+                        continue  # ❌ Direction-confirm filter — skip this match
 
                     # ── Gate scores summary line ───────────────────────────────
                     _gate_line = (
@@ -10982,40 +10991,9 @@ async def _run_auto_post(bot, bot_data: dict):
                     )
 
                     # ── Final card ────────────────────────────────────────────
-                    # Card tip — cycle overrides stats prediction
-                    # If cycle says 1X2 direction, use that. If BTTS/O/U, use that.
-                    if _cycle_mkt == "BTTS":
-                        _btts_hist = [s[1] > 0 and s[2] > 0
-                                      for s in [tuple(int(x) for x in sc.split("-"))
-                                      for sc in _repeat.get("score_history", [])
-                                      if "-" in sc]]
-                        _btts_lbl  = "Yes" if (sum(_btts_hist)/len(_btts_hist) >= 0.6 if _btts_hist else True) else "No"
-                        _card_tip  = f"BTTS {_btts_lbl}"
-                    elif _cycle_mkt == "O/U":
-                        _sh_hist   = _repeat.get("score_history", [])
-                        _tots      = [sum(int(x) for x in sc.split("-")) for sc in _sh_hist if "-" in sc]
-                        _ou_dir    = "Over" if (sum(_tots)/len(_tots) > 2.5 if _tots else True) else "Under"
-                        _card_tip  = f"{_ou_dir} 2.5"
-                    else:
-                        # 1X2 — use cycle direction if clear, else stats tip
-                        _rep_out = _repeat.get("outcome", "")  # HOME or AWAY from cycle
-                        if _rep_out in ("HOME", "AWAY"):
-                            _dir_label = {"HOME": "Home WIN", "AWAY": "Away WIN"}.get(_rep_out, _rep_out)
-                            _card_tip  = _dir_label
-                        else:
-                            _card_tip  = p["tip"]  # fallback to stats
-
-                    # Icon matches cycle direction
-                    if _card_tip == "Home WIN":    _cycle_icon_tip = "🏠"
-                    elif _card_tip == "Away WIN":  _cycle_icon_tip = "✈️"
-                    elif "BTTS" in _card_tip:      _cycle_icon_tip = "⚽"
-                    elif "Over" in _card_tip:      _cycle_icon_tip = "📈"
-                    elif "Under" in _card_tip:     _cycle_icon_tip = "📉"
-                    else:                          _cycle_icon_tip = p["icon"]
-
                     card = (
                         f"*{m['home']}  v  {m['away']}*\n"
-                        f"{_cycle_icon_tip} *{_card_tip}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
+                        f"{p['icon']} *{p['tip']}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
                         f"🏠{p['hw']:.0f}%  🤝{p['dw']:.0f}%  ✈️{p['aw']:.0f}%\n"
                         + market_lines
                         + _fc_line
@@ -11359,7 +11337,6 @@ async def _standings_job(context):
     bot_data = context.bot_data
 
     for lid in LEAGUES:
-        if lid not in ACTIVE_LEAGUES: continue
         try:
             league_model = _get_model(bot_data, lid)
             fp_db        = league_model.get("fingerprint_db", {})
@@ -11452,7 +11429,6 @@ async def _data_collector_job(context):
 
     async with httpx.AsyncClient() as client:
         for lid, linfo in LEAGUES.items():
-            if lid not in ACTIVE_LEAGUES: continue
             name = linfo["name"]
             try:
                 league_model     = _get_model(bot_data, lid)
@@ -11485,61 +11461,45 @@ async def _data_collector_job(context):
 
                 if events and round_id:
                     ck = f"{lid}:{round_id}"
-
-                    # ── ALWAYS save odds first — even if round already collected ──
-                    # On fresh start the odds_store is empty. We must save all 5
-                    # markets for every upcoming round immediately so they are ready
-                    # when that round plays and outcomes come in.
-                    # Odds are only saved if not already present for this round+fixture.
-                    _os     = bot_data.setdefault("odds_store", {})
-                    _lid_os = _os.setdefault(str(lid), {})
-                    _rid_os = _lid_os.setdefault(str(round_id), {})
-                    _odds_saved = 0
-
-                    for raw in events:
-                        try:
-                            m       = _norm_event(raw)
-                            ev_odds = _extract_odds(raw)
-                            if not m["home"] or not m["away"]:
-                                continue
-                            if not ev_odds or not ev_odds.get("1x2"):
-                                continue
-                            _canon = "|".join(sorted([
-                                m["home"].strip().upper(),
-                                m["away"].strip().upper()
-                            ]))
-                            # Only save if not already stored for this round
-                            # (never overwrite outcome/score that was already written)
-                            if _canon not in _rid_os:
-                                _rid_os[_canon] = {
-                                    "odds_snapshot": ev_odds,
-                                    "home":          m["home"],
-                                    "away":          m["away"],
-                                    "round_id":      str(round_id),
-                                    "league_id":     lid,
-                                    "season_id":     _cur_season_id or "",
-                                    "saved_ts":      time.time(),
-                                    "outcome":       None,
-                                    "score_h":       None,
-                                    "score_a":       None,
-                                    "correct":       None,
-                                }
-                                _odds_saved += 1
-                        except Exception as _oe:
-                            log.warning(f"COLLECTOR [{name}] odds save error: {_oe}")
-
-                    if _odds_saved:
-                        log.info(f"💾 COLLECTOR [{name}] rnd={round_id}: saved {_odds_saved} odds entries")
-
-                    # ── Queue predictions for learning — only once per round ──
                     if ck not in collected:
                         match_preds = []
+
+                        # ── Save live server odds to dedicated odds_store ──────
+                        # This is authoritative — fetched fresh from betPawa server.
+                        # Used by _detect_odds_repeat as the historical comparison source.
+                        # Key: odds_store[lid][round_id][canonical_fixture_key]
+                        _os = bot_data.setdefault("odds_store", {})
+                        _lid_os = _os.setdefault(str(lid), {})
+                        _rid_os = _lid_os.setdefault(str(round_id), {})
+
                         for raw in events:
                             try:
                                 m       = _norm_event(raw)
                                 ev_odds = _extract_odds(raw)
                                 if not m["home"] or not m["away"]:
                                     continue
+
+                                # Save odds if they have real 1x2 data from server
+                                if ev_odds and ev_odds.get("1x2"):
+                                    _canon = sorted([
+                                        m["home"].strip().upper(),
+                                        m["away"].strip().upper()
+                                    ])
+                                    _fk = "|".join(_canon)
+                                    _rid_os[_fk] = {
+                                        "odds_snapshot": ev_odds,
+                                        "home":          m["home"],
+                                        "away":          m["away"],
+                                        "round_id":      str(round_id),
+                                        "league_id":     lid,
+                                        "season_id":     _cur_season_id or "",
+                                        "saved_ts":      time.time(),
+                                        "outcome":       None,   # filled in after round ends
+                                        "score_h":       None,
+                                        "score_a":       None,
+                                        "correct":       None,   # filled after learning
+                                    }
+
                                 p = predict_match(
                                     m["home"], m["away"], stats,
                                     ev_odds, league_model
@@ -11583,7 +11543,6 @@ async def _data_collector_job(context):
                     else:
                         log.info(f"📡 COLLECTOR [{name}] rnd={round_id} already queued, skipping")
 
-
                 # ── B) Backfill past rounds — fill every gap in match_log ─────
                 # The old approach skipped backfill once fp_db had >= 10 rounds,
                 # meaning the bot permanently fell behind after any restart.
@@ -11613,7 +11572,7 @@ async def _data_collector_job(context):
                     # Process at most 5 missing rounds per tick (oldest-first so
                     # standings build up chronologically)
                     backfilled   = 0
-                    _max_per_tick = 15
+                    _max_per_tick = 5
                     # Build a quick lookup: rid → round dict (for seasonId)
                     rid_to_round = {
                         str(r.get("id") or r.get("gameRoundId") or ""): r
@@ -11630,50 +11589,76 @@ async def _data_collector_job(context):
                         evs_sc = _filter_league(evs_sc, lid)
                         scored = [e for e in evs_sc if _norm_event(e)["hs"] is not None]
                         if not scored:
+                            # No scores yet (round still pending) — mark done so we skip next tick
                             collected[bk] = 1
                             continue
 
-                        # Fetch odds snapshot (upcoming page)
-                        # Historical rounds: betPawa strips all odds from completed rounds.
-                        # PAGE_UPCOMING and PAGE_MATCHUPS both return with_markets=0.
-                        # Odds are only available when a round is live/upcoming.
-                        # The live collector captures them in real-time going forward.
-                        odds_map = {}  # empty — no odds available for past rounds
+                        # Fetch odds snapshot for this past round (upcoming page)
+                        evs_up  = await fetch_round_events(client, rid, PAGE_UPCOMING)
+                        evs_up  = _filter_league(evs_up, lid)
+                        odds_map = {
+                            _fixture_key(_norm_event(e)["home"], _norm_event(e)["away"]): _extract_odds(e)
+                            for e in evs_up
+                        }
 
-                        # Build predictions + results
+                        # Build predictions + results and learn immediately
                         preds   = []
                         results = []
                         for e in scored:
                             nm      = _norm_event(e)
                             fk      = _fixture_key(nm["home"], nm["away"])
                             ev_odds = odds_map.get(fk, {})
-                            p = predict_match(nm["home"], nm["away"], stats, ev_odds, league_model)
-                            preds.append({"home": nm["home"], "away": nm["away"], "tip": p["tip"],
-                                          "conf": p.get("conf", 50.0), "btts_pred": p.get("btts", 50.0) >= 50,
-                                          "btts_prob": p.get("btts", 50.0), "over25_pred": p.get("over25", 50.0) >= 50,
-                                          "over25_prob": p.get("over25", 50.0), "_odds_snapshot": ev_odds})
+                            p = predict_match(
+                                nm["home"], nm["away"], stats,
+                                ev_odds, league_model
+                            )
+                            preds.append({
+                                "home":           nm["home"],
+                                "away":           nm["away"],
+                                "tip":            p["tip"],
+                                "conf":           p.get("conf", 50.0),
+                                "btts_pred":      p.get("btts", 50.0) >= 50,
+                                "btts_prob":      p.get("btts", 50.0),
+                                "over25_pred":    p.get("over25", 50.0) >= 50,
+                                "over25_prob":    p.get("over25", 50.0),
+                                "_odds_snapshot": ev_odds,
+                            })
                             ht_h, ht_a = _extract_ht_score(e)
-                            results.append({"home": nm["home"], "away": nm["away"],
-                                            "actual_h": nm["hs"], "actual_a": nm["as_"],
-                                            "ht_h": ht_h, "ht_a": ht_a})
-
-                        # ── Save odds + scores to odds_store + score_history ──
-                        # NOTE: odds not available for past rounds (betPawa strips them).
-                        # odds_store and score_history built from LIVE rounds only.
+                            results.append({
+                                "home":     nm["home"],
+                                "away":     nm["away"],
+                                "actual_h": nm["hs"],
+                                "actual_a": nm["as_"],
+                                "ht_h":     ht_h,
+                                "ht_a":     ht_a,
+                            })
 
                         if preds and results:
+                            # Use this past round's own season_id from the API.
+                            # Do NOT fall back to _cur_season_id — past rounds may
+                            # belong to a previous season.
                             _past_season_id = str(r.get("_seasonId") or r.get("seasonId") or "")
-                            _learn_from_round(bot_data, lid, preds, results,
-                                              round_id=int(rid) if rid.isdigit() else 0,
-                                              season_id=_past_season_id)
-                            _learn_algo_signals(_get_model(bot_data, lid), preds, results,
-                                                round_id_int=int(rid) if rid.isdigit() else 0)
-                            _ai_postmatch_analysis(_get_model(bot_data, lid), preds, results,
-                                                   standings=bot_data.get(f"standings_{lid}"),
-                                                   round_id=int(rid) if rid.isdigit() else 0)
+                            _learn_from_round(
+                                bot_data, lid, preds, results,
+                                round_id=int(rid) if rid.isdigit() else 0,
+                                season_id=_past_season_id
+                            )
+                            _learn_algo_signals(
+                                _get_model(bot_data, lid), preds, results,
+                                round_id_int=int(rid) if rid.isdigit() else 0
+                            )
+                            _ai_postmatch_analysis(
+                                _get_model(bot_data, lid), preds, results,
+                                standings=bot_data.get(f"standings_{lid}"),
+                                round_id=int(rid) if rid.isdigit() else 0,
+                            )
                             collected[bk] = 1
                             backfilled += 1
-                            log.info(f"📚 COLLECTOR BACKFILL [{name}] rnd={rid} learned {len(results)} matches (gap-fill)")
+                            log.info(
+                                f"📚 COLLECTOR BACKFILL [{name}] rnd={rid} "
+                                f"learned {len(results)} matches (gap-fill)"
+                            )
+
                 except Exception as e:
                     log.warning(
                         f"COLLECTOR backfill [{name}]: {e}\n{traceback.format_exc()}"
@@ -11712,7 +11697,6 @@ async def _stats_loader_job(context):
     ctx = _FakeCtx(context.bot_data)
     async with httpx.AsyncClient() as client:
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             try:
                 await _ensure_stats(ctx, lid, client)
                 log.info(f"📦 Stats refreshed for league {lid}")
@@ -12007,7 +11991,6 @@ async def _do_rawstatus(message, c):
     try:
         async with httpx.AsyncClient() as client:
             for lid, linfo in LEAGUES.items():
-                if lid not in ACTIVE_LEAGUES: continue
                 try:
                     rname, _, events = await fetch_live_round(client, lid)
                     if not events:
@@ -12088,7 +12071,6 @@ async def _do_rawstatus(message, c):
     # ── 4. Per-league storage health ─────────────────────────────────────────
     store_lines = []
     for lid, linfo in LEAGUES.items():
-        if lid not in ACTIVE_LEAGUES: continue
         model  = bd.get(f"model_{lid}", {})
         rds    = model.get("rounds_learned", 0)
         fp_db  = model.get("fingerprint_db", {})
@@ -12215,7 +12197,6 @@ async def _do_brainstat(message, c):
     league_scores, league_lines = [], []
 
     for lid, linfo in LEAGUES.items():
-        if lid not in ACTIVE_LEAGUES: continue
         model = c.bot_data.get(f"model_{lid}")
         if not model or model.get("rounds_learned", 0) == 0:
             league_lines.append(f"┌ {linfo['flag']} *{linfo['name']}*\n└ ⚫ No data yet\n")
@@ -12356,7 +12337,33 @@ async def _do_brainstat(message, c):
         f"{'━'*26}\n\n"
     )
 
-    await _send(message, header + "\n".join(league_lines), parse_mode="Markdown")
+    # ── Multi-market engine status ────────────────────────────────────────────
+    _wts  = c.bot_data.get("ml_weights", {})
+    _risk = c.bot_data.get("risk", {})
+    _streak = _risk.get("loss_streak", 0)
+    if _wts:
+        def _wline(k):
+            rec = _wts.get(k, {"correct": 1, "total": 2})
+            t = max(rec.get("total", 2), 2)
+            c2 = rec.get("correct", 1)
+            pct = c2 / t * 100
+            bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+            return f"  `{k:<5}` {bar} {pct:.0f}% ({c2}/{t})"
+        mm_lines = "\n".join(_wline(k) for k in ("1x2", "ou", "btts", "htft", "dc"))
+        streak_icon = "🟢" if _streak == 0 else ("🟡" if _streak < 3 else ("🔴" if _streak < 5 else "⛔"))
+        mm_block = (
+            f"{'━'*26}\n"
+            f"📊 *Multi-Market Engine*\n"
+            f"{mm_lines}\n"
+            f"{streak_icon} Loss streak: *{_streak}*"
+            + (" — conf −20%" if _streak >= 3 else "")
+            + (" — FORCED DRAW" if _streak >= 5 else "")
+            + "\n"
+        )
+    else:
+        mm_block = f"{'━'*26}\n📊 *Multi-Market Engine:* building…\n"
+
+    await _send(message, header + "\n".join(league_lines) + "\n" + mm_block, parse_mode="Markdown")
 
 
 async def cmd_brainstat(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -12456,7 +12463,6 @@ async def _do_backup_inner(message, c):
     brain_data = {}
 
     for lid in LEAGUES:
-        if lid not in ACTIVE_LEAGUES: continue
         m = bd.get(f"model_{lid}")
         if not isinstance(m, dict):
             continue
@@ -12476,6 +12482,7 @@ async def _do_backup_inner(message, c):
             m["_ml_seen"] = _ml_seen_raw   # restore on live model (we only removed from copy)
         m_copy.pop("_cached_standings", None)
         m_copy.pop("_ml_seen", None)   # ensure not in copy regardless
+        m_copy.pop("_bot_data", None)  # live reference — never serialise
 
         brain_data[str(lid)] = {
             "fingerprint_db": m_copy.pop("fingerprint_db", {}),
@@ -12504,7 +12511,8 @@ async def _do_backup_inner(message, c):
         "strategy_stats":      bd.get("strategy_stats", {}),
         "odds_repeat_stats":   bd.get("odds_repeat_stats", {}),
         "odds_store":          bd.get("odds_store", {}),
-        "score_history_7794":  bd.get("score_history_7794", {}),
+        "ml_weights":          bd.get("ml_weights", {}),   # multi-market self-learning
+        "risk":                bd.get("risk", {}),          # loss-streak control
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -12789,10 +12797,13 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
         bot_data["odds_store"] = data["odds_store"]
         log.info(f"✅ Restored odds_store from backup")
 
-    if "score_history_7794" in data and data["score_history_7794"]:
-        bot_data["score_history_7794"] = data["score_history_7794"]
-        total_sh = sum(len(v) for v in data["score_history_7794"].values())
-        log.info(f"✅ Restored score_history_7794: {len(data["score_history_7794"])} fixtures, {total_sh} records")
+    if "ml_weights" in data and data["ml_weights"]:
+        bot_data["ml_weights"] = data["ml_weights"]
+        log.info(f"✅ Restored ml_weights from backup")
+
+    if "risk" in data and data["risk"]:
+        bot_data["risk"] = data["risk"]
+        log.info(f"✅ Restored risk/loss_streak from backup")
 
     models = data.get("models", {})
     users  = data.get("users", {})
@@ -13129,6 +13140,16 @@ def _load_baked_data(bot_data: dict, baked: dict):
             acc["allowed_channels"] = promoted
             log.info(f"💾 Auto-promoted {len(promoted)} channels from auto_chats to allowed_channels")
 
+    # Multi-market learning weights — restore if present
+    if baked.get("ml_weights"):
+        bot_data["ml_weights"] = baked["ml_weights"]
+        log.info(f"💾 Restored ml_weights from baked data")
+
+    # Loss-streak risk state — restore if present
+    if baked.get("risk"):
+        bot_data["risk"] = baked["risk"]
+        log.info(f"💾 Restored risk/loss_streak from baked data")
+
     # Learned models — overwrite unless live pickle has strictly more rounds
     if baked.get("models"):
         restored_models = 0
@@ -13258,6 +13279,7 @@ def _load_baked_data(bot_data: dict, baked: dict):
                     }
             # Never carry _cached_standings into the saved model — it's ephemeral
             m.pop("_cached_standings", None)
+            m.pop("_bot_data", None)   # live reference — strip on restore
 
             # ── Apply ai_brain migration: if old keys present, convert them ──
             # This ensures brain files saved before the new AI engine work perfectly.
@@ -13441,7 +13463,6 @@ def main():
         log.info(f"   Users    : {len(users)} ({list(users.keys())})")
         log.info(f"   Channels : {len(channels)} ({list(channels)})")
         for lid in LEAGUES:
-            if lid not in ACTIVE_LEAGUES: continue
             m = bd.get(f"model_{lid}")
             if isinstance(m, dict) and m.get("rounds_learned", 0) > 0:
                 log.info(f"   League {lid}: {m['rounds_learned']} rounds learned, "
@@ -13451,7 +13472,7 @@ def main():
                 log.info(f"   League {lid}: no prior learning — will bootstrap")
         log.info("-" * 60)
         async with httpx.AsyncClient() as client:
-            for test_lid, test_name in [(lid, LEAGUES[lid]["name"]) for lid in ACTIVE_LEAGUES if lid in LEAGUES]:
+            for test_lid, test_name in [(7794, "England"), (7795, "Spain")]:
                 log.info(f"--- League {test_lid} {test_name} ---")
                 past   = await fetch_round_list(client, test_lid, past=True)
                 actual = await fetch_round_list(client, test_lid, past=False)
