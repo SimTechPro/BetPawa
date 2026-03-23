@@ -3499,12 +3499,11 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     consistency_pct   = round(consistency_count / total_known * 100)
 
     # ── SCORE CYCLE DETECTION ────────────────────────────────────────────────
-    # England: read from score_history_7794 (fixture+odds fingerprint keyed).
-    # Other leagues: fall back to verified records.
+    # Build full sequence from score_history (England) or verified records
     _full_seq = []
     if league_id == 7794 and bot_data:
-        _c1x2 = current_odds.get("1x2", {})
-        _ofp  = f"{_c1x2.get('1',0)}-{_c1x2.get('X',0)}-{_c1x2.get('2',0)}"
+        _c1x2   = current_odds.get("1x2", {})
+        _ofp    = f"{_c1x2.get('1',0)}-{_c1x2.get('X',0)}-{_c1x2.get('2',0)}"
         _sh_key = f"{fk}|{_ofp}"
         for _r in bot_data.get("score_history_7794", {}).get(_sh_key, []):
             if _r.get("outcome") and _r.get("score_h") is not None:
@@ -3512,30 +3511,94 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     if not _full_seq:
         for q in _all_with_outcome:
             rec = q["record"]
-            out = rec.get("outcome", ""); sh = rec.get("score_h"); sa = rec.get("score_a")
+            out = rec.get("outcome",""); sh = rec.get("score_h"); sa = rec.get("score_a")
             if out and sh is not None and sa is not None:
                 _full_seq.append((out, sh, sa))
 
-    _cycle_next = _cycle_next_score = _cycle_period = _cycle_pos = None
-    _seq = [s[0] for s in _full_seq]
+    _seq              = [s[0] for s in _full_seq]
+    _cycle_next       = None   # next expected direction
+    _cycle_next_score = None   # next expected score (only when score repeats exactly)
+    _cycle_period     = None
+    _cycle_tip_market = "1X2" # default market for prediction
+
+    # Detect repeating period (needs 2x period records minimum)
     if len(_full_seq) >= 2:
         if league_id == 7794:
             _n = len(_full_seq)
             for _period in range(1, _n // 2 + 1):
                 _pat = _full_seq[:_period]
                 if all(_full_seq[_i] == _pat[_i % _period] for _i in range(_n)):
-                    _cycle_period = _period
-                    _cycle_pos    = _n % _period
-                    _nxt          = _pat[_cycle_pos]
+                    _cycle_period     = _period
+                    _nxt              = _pat[_n % _period]
                     _cycle_next       = _nxt[0]
                     _cycle_next_score = f"{_nxt[1]}-{_nxt[2]}"
                     break
+        # Direction-only fallback when no score cycle confirmed
         if not _cycle_period:
-            _alt = all(_seq[i] != _seq[i+1] for i in range(len(_seq)-1)) if len(_seq) >= 2 else False
+            _alt        = all(_seq[i] != _seq[i+1] for i in range(len(_seq)-1)) if len(_seq) >= 2 else False
             _cycle_next = ("HOME" if _seq[-1] == "AWAY" else "AWAY") if _alt else dominant_out
 
+    # ── THREE CASES ───────────────────────────────────────────────────────────
+    #
+    # CASE 1 — Same direction, same score every time:
+    #   cycle_next = HOME/AWAY, cycle_next_score set → 1X2, show "2-4 👉 2-4"
+    #
+    # CASE 2 — Same direction, score varies:
+    #   cycle_next = HOME/AWAY, no exact score → 1X2, show "1-5 👉 2-4" (next from pattern)
+    #
+    # CASE 3 — No clear direction (DRAW or ambiguous):
+    #   cycle_next = DRAW or None → BTTS/O/U, show "1-5 👉 1-2, 4-1" (all possible next)
+    #
+    _last_played = _full_seq[-1] if _full_seq else None
+    _cur_str     = f"{_last_played[1]}-{_last_played[2]}" if _last_played else ""
+    dir_icons    = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}
+
+    if _cycle_next in ("HOME", "AWAY"):
+        # CASE 1 or 2 — directional → always 1X2
+        _cycle_tip_market = "1X2"
+
+        if _cycle_period and _cycle_next_score:
+            # Check if score repeats exactly (all records have same score)
+            _unique_scores = {(s[1], s[2]) for s in _full_seq}
+            if len(_unique_scores) == 1:
+                # CASE 1: same score always — "2-4 👉 2-4"
+                scores_str = f"`{_cur_str}` 👉 `{_cycle_next_score}`"
+            else:
+                # CASE 2: direction same, score varies — show current → next from cycle
+                scores_str = f"`{_cur_str}` 👉 `{_cycle_next_score}`"
+            # Both cases show current → next, difference is in the note on the card
+            _score_exact = len(_unique_scores) == 1
+        else:
+            # No confirmed cycle yet — direction only
+            _score_exact = False
+            _nxt_icon    = dir_icons.get(_cycle_next, "")
+            scores_str   = f"`{_cur_str}` 👉 {_nxt_icon} {_cycle_next}" if _cur_str else ""
+
+    else:
+        # CASE 3 — DRAW or no direction → BTTS or O/U
+        _score_exact = False
+        _totals      = [s[1] + s[2] for s in _full_seq]
+        _all_over    = all(t > 2 for t in _totals) if _totals else False
+        _all_under   = all(t <= 2 for t in _totals) if _totals else False
+        _cycle_tip_market = "O/U" if (_all_over or _all_under) else "BTTS"
+
+        # Show all possible next scores from this cycle position
+        if _cycle_period and len(_full_seq) >= _cycle_period:
+            _n        = len(_full_seq)
+            _next_pos = _n % _cycle_period
+            # Collect all scores that appeared at this position across cycles
+            _pos_scores = list(dict.fromkeys(
+                f"{_full_seq[_i][1]}-{_full_seq[_i][2]}"
+                for _i in range(_next_pos, _n, _cycle_period)
+            ))
+            _nxt_part  = ", ".join(f"`{s}`" for s in _pos_scores)
+            scores_str = f"`{_cur_str}` 👉 {_nxt_part}" if _cur_str else _nxt_part
+        else:
+            # No full cycle — show all unique scores seen as possibilities
+            _possible  = ", ".join(f"`{s[1]}-{s[2]}`" for s in dict.fromkeys(_full_seq))
+            scores_str = f"`{_cur_str}` 👉 {_possible}" if _cur_str else _possible
+
     # ── MAINTENANCE CHECK ─────────────────────────────────────────────────────
-    # Last 2 verified results must both match expected cycle direction.
     _expected_dir = _cycle_next if _cycle_next else dominant_out
     _sorted_v = sorted(
         [q for q in verified if q["record"].get("outcome")],
@@ -3548,21 +3611,8 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
             return {"matched": False, "repeat_count": repeat_count,
                     "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {_expected_dir}"}
 
-    # ── Score display: current in-progress loop only ──────────────────────────
-    dir_icons = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}
-    disp_lines = []
-    for (out_s, sh_s, sa_s) in _full_seq:
-        disp_lines.append(f"{dir_icons.get(out_s,'')} {sh_s}-{sa_s}")
-    if _cycle_period and len(disp_lines) >= _cycle_period:
-        _pos_now = len(_full_seq) % _cycle_period
-        _cur_run = disp_lines[-_cycle_period:] if _pos_now == 0 else disp_lines[-_pos_now:]
-        scores_str = "  ·  ".join(_cur_run)
-    else:
-        scores_str = "  ·  ".join(disp_lines[-3:]) if disp_lines else ""
-
-    # ── All checks passed ─────────────────────────────────────────────────────
+    # ── CONFIDENCE ────────────────────────────────────────────────────────────
     match_pct = round(n_matched / n_available * 100)
-    # Compute confidence from raw odds closeness across all matched markets
     diffs = []
     snap_b = best_record.get("odds_snapshot") or {}
     for mk in matched_markets:
@@ -3576,55 +3626,54 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
             if cur_btts and _get_btts(snap_b):
                 diffs.append(abs(float(cur_btts) - float(_get_btts(snap_b))))
         elif mk.startswith("O/U"):
-            # Dynamic O/U key e.g. "O/U6_O", "O/U10_U"
-            _cur_pv = cur_ou_map.get(mk)
-            _rec_pv = {f"O/U{s}{l}_{sd}": p for sd,l,p in snap_b.get("ou",[]) for s in [""]}.get(mk)
-            # simpler: rebuild rec_ou_map for snap_b
             _snap_b_ou = {f"O/U{_sl}_{_ss}": _sp for _ss,_sl,_sp in snap_b.get("ou",[])}
+            _cur_pv = cur_ou_map.get(mk)
             _rec_pv = _snap_b_ou.get(mk)
             if _cur_pv and _rec_pv:
                 diffs.append(abs(float(_cur_pv) - float(_rec_pv)))
     avg_diff   = sum(diffs)/len(diffs) if diffs else 0
     confidence = round(max(0, 100 - avg_diff * 1000))
 
-    # Use cycle_next as the authoritative direction when cycle is detected
+    # ── EFFECTIVE OUTCOME AND TIER ─────────────────────────────────────────────
     _effective_out = _cycle_next if _cycle_next else dominant_out
     out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(_effective_out, _effective_out)
 
     if consistency_pct == 100 and repeat_count >= 2:
         tier     = "💎 ELITE LOCK"
-        tier_msg = f"all 5 markets identical — 100% same result every time"
+        tier_msg = "all 5 markets identical — 100% same result every time"
     elif consistency_pct >= 67:
         tier     = "🏆 ELITE"
         tier_msg = f"all 5 markets confirmed — {consistency_pct}% same result"
-
-    scores_str = "  ·  ".join(score_lines[:3])
-    # Show current in-progress cycle run only
-    # cycle_pos_now = how many steps into the current (incomplete) loop
-    # If pos=0 (loop just completed): show the last full period so pattern is visible
-    if _cycle_period:
-        _cycle_pos_now = len(_full_seq) % _cycle_period
-        if _cycle_pos_now == 0:
-            _cur_run = score_lines[-_cycle_period:]  # last completed loop
-        else:
-            _cur_run = score_lines[-_cycle_pos_now:]  # current partial loop
-        scores_str = "  ·  ".join(_cur_run)
     else:
-        scores_str = "  ·  ".join(score_lines[-3:])  # last 3 if no cycle yet
-    # Cycle next — show predicted direction AND score if full cycle detected
-    _cycle_icon = "🏠" if _cycle_next == "HOME" else ("✈️" if _cycle_next == "AWAY" else "")
-    if _cycle_period and _cycle_next_score:
-        _period_label = f"period {_cycle_period}" if _cycle_period > 1 else ""
-        _cycle_str = (f"{_cycle_icon} *{_cycle_next}*  `{_cycle_next_score}` "
-                      f"— score cycle ({_period_label})")
-    elif _cycle_next:
-        _cycle_str = f"{_cycle_icon} *{_cycle_next}* next in cycle"
-    else:
-        _cycle_str = ""
+        tier     = "⭐ PREMIUM"
+        tier_msg = f"{consistency_pct}% consistent"
 
     _period_info = f" · {_cycle_period}-step cycle" if _cycle_period else ""
 
-    # Map matched markets to 5 core slots for display
+    # Cycle display line
+    _cycle_icon = dir_icons.get(_cycle_next, "")
+    if _cycle_tip_market == "1X2":
+        if _cycle_next_score:
+            _note = " *(exact repeat)*" if _score_exact else " *(score varies)*"
+            _cycle_str = f"{_cycle_icon} *{_cycle_next}* — `{_cycle_next_score}`{_note}"
+        elif _cycle_next:
+            _cycle_str = f"{_cycle_icon} *{_cycle_next}* next in cycle"
+        else:
+            _cycle_str = ""
+    else:
+        # BTTS or O/U — show which market and why
+        _totals    = [s[1] + s[2] for s in _full_seq]
+        _avg_tot   = round(sum(_totals) / len(_totals), 1) if _totals else 0
+        _btts_cnt  = sum(1 for s in _full_seq if s[1] > 0 and s[2] > 0)
+        _btts_pct  = round(_btts_cnt / len(_full_seq) * 100) if _full_seq else 0
+        if _cycle_tip_market == "O/U":
+            _ou_dir    = "Over" if _all_over else "Under"
+            _cycle_str = f"📊 *{_ou_dir} 2.5* — avg {_avg_tot} goals  (no clear 1X2 direction)"
+        else:
+            _btts_lbl  = "Yes" if _btts_pct >= 60 else "No"
+            _cycle_str = f"⚽ *BTTS {_btts_lbl}* — {_btts_pct}% both score  (no clear 1X2 direction)"
+
+    # Map markets to 5 core slots
     _core5 = {"1X2": False, "DC": False, "BTTS": False, "O/U": False, "HT/FT": False}
     for _mk in matched_markets:
         if _mk == "1X2":            _core5["1X2"]  = True
@@ -3634,16 +3683,14 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         elif _mk == "HT/FT":        _core5["HT/FT"]= True
     _verified_count = sum(_core5.values())
 
-    # Count occurrences of the effective direction (cycle_next or dominant)
     _effective_count = outcome_counts.get(_effective_out, 0)
-    # If cycle overrides dominant, note it clearly
     _cycle_override  = (_cycle_next and _cycle_next != dominant_out)
     _override_note   = f" *(cycle override — dominant was {dominant_out})*" if _cycle_override else ""
 
     star_label = (
         f"{tier} — {tier_msg}{_period_info}\n"
         f"┆    📌 Result: *{out_label}*  ({_effective_count}/{repeat_count}x){_override_note}\n"
-        + (f"┆    🔄 Cycle: {scores_str}\n" if scores_str else "")
+        + (f"┆    🔄 {scores_str}\n" if scores_str else "")
         + (f"┆    ➡️  {_cycle_str}\n" if _cycle_str else "")
         + f"┆    🔑 Markets verified: {_verified_count}/5\n"
         f"┆    🎯 Odds precision: {confidence}%  ·  ±5% tolerance"
@@ -3662,9 +3709,11 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         "consistency_count": consistency_count,
         "tier":              tier,
         "cycle_next":        _cycle_next,
-        "score_history":     score_lines,
+        "cycle_tip_market":  _cycle_tip_market,
+        "score_history":     [f"{s[1]}-{s[2]}" for s in _full_seq],
         "star_label":        star_label,
     }
+
     """
     Full H2H analysis between two teams — used when odds don't match well.
 
@@ -7857,31 +7906,40 @@ def _save_score_history(bot_data: dict, league_id: int,
                         round_id: int):
     """
     Save a match result to score_history_7794 (England only).
-    Keyed by fixture+odds_fingerprint — same odds = same cycle track.
-    Records new scores and cycle repeats independently per fixture.
-    Called from both live learning and backfill so nothing is missed.
+    Scores normalised to canonical (sorted) team order so score_h always
+    belongs to the alphabetically-first team, regardless of who was home.
+    Outcome re-derived from normalised score — never trust the passed-in outcome.
     """
     if league_id != 7794:
         return
     o1x2 = odds_snapshot.get("1x2", {})
     if not o1x2:
-        return  # no 1x2 odds — cannot fingerprint
-    ofp    = f"{o1x2.get('1',0)}-{o1x2.get('X',0)}-{o1x2.get('2',0)}"
-    canon  = "|".join(sorted([home.strip().upper(), away.strip().upper()]))
-    sh_key = f"{canon}|{ofp}"
-    store  = bot_data.setdefault("score_history_7794", {})
-    hist   = store.setdefault(sh_key, [])
-    # Never add the same round twice
+        return
+    ofp        = f"{o1x2.get('1',0)}-{o1x2.get('X',0)}-{o1x2.get('2',0)}"
+    team_a     = home.strip().upper()
+    team_b     = away.strip().upper()
+    canon      = "|".join(sorted([team_a, team_b]))
+    sh_key     = f"{canon}|{ofp}"
+    # Normalise score to canonical order
+    # canon.split("|")[0] is alphabetically first team
+    if team_a == canon.split("|")[0]:
+        c_sh, c_sa = score_h, score_a   # home=canon-first, no swap
+    else:
+        c_sh, c_sa = score_a, score_h   # away=canon-first, swap
+    # Re-derive outcome from normalised score
+    c_outcome = "HOME" if c_sh > c_sa else ("AWAY" if c_sa > c_sh else "DRAW")
+    store = bot_data.setdefault("score_history_7794", {})
+    hist  = store.setdefault(sh_key, [])
     if any(r["round_id"] == round_id for r in hist):
         return
-    seen_scores = {(r["score_h"], r["score_a"]) for r in hist}
+    seen = {(r["score_h"], r["score_a"]) for r in hist}
     hist.append({
-        "outcome":      outcome,
-        "score_h":      score_h,
-        "score_a":      score_a,
+        "outcome":      c_outcome,
+        "score_h":      c_sh,
+        "score_a":      c_sa,
         "round_id":     round_id,
-        "is_new_score": (score_h, score_a) not in seen_scores,
-        "is_repeat":    (score_h, score_a) in seen_scores,
+        "is_new_score": (c_sh, c_sa) not in seen,
+        "is_repeat":    (c_sh, c_sa) in seen,
     })
     hist.sort(key=lambda x: x["round_id"])
 
@@ -10786,24 +10844,34 @@ async def _run_auto_post(bot, bot_data: dict):
                     #   4. Momentum: predicted winner win% >= 60 (stable/rising)
                     #               predicted loser  win% <= 30 (stable/falling)
                     _repeat_outcome   = _repeat.get("outcome", "")   # "HOME" / "AWAY"
+                    _repeat_outcome   = _repeat.get("outcome", "")   # "HOME"/"AWAY"
                     _htft_in_repeat   = "HT/FT" in _repeat.get("markets_matched", [])
                     _top_fire         = bool(_fire)
-                    _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
-                    _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
-                    # Momentum gate — based on each team's own win%, not tip direction
-                    if _has_mom:
-                        if _tip_g == "HOME":
-                            _winner_wp = _hm_g.get("win_pct", 0)
-                            _loser_wp  = _am_g.get("win_pct", 0)
-                        else:
-                            _winner_wp = _am_g.get("win_pct", 0)
-                            _loser_wp  = _hm_g.get("win_pct", 0)
-                        _mom_ok = (_winner_wp >= 60) and (_loser_wp <= 30)
+                    _cycle_mkt        = _repeat.get("cycle_tip_market", "1X2")
+
+                    if _cycle_mkt in ("BTTS", "O/U"):
+                        # No direction required — cycle says use BTTS/O/U
+                        # Only need top-line fire + markets confirmed
+                        _overall_confirms = True
+                        _htft_agrees      = True
+                        _mom_ok           = True
                     else:
-                        _mom_ok = True  # no momentum data yet — allow through
+                        # Standard 1X2 direction checks
+                        _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
+                        _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
+                        if _has_mom:
+                            if _tip_g == "HOME":
+                                _winner_wp = _hm_g.get("win_pct", 0)
+                                _loser_wp  = _am_g.get("win_pct", 0)
+                            else:
+                                _winner_wp = _am_g.get("win_pct", 0)
+                                _loser_wp  = _hm_g.get("win_pct", 0)
+                            _mom_ok = (_winner_wp >= 60) and (_loser_wp <= 30)
+                        else:
+                            _mom_ok = True
 
                     if not (_top_fire and _overall_confirms and _htft_agrees and _mom_ok):
-                        continue  # ❌ Direction-confirm filter — skip this match
+                        continue  # ❌ Direction-confirm filter
 
                     # ── LEAGUE PHASE GATE ─────────────────────────────────
                     # ── LEAGUE PHASE GATE ─────────────────────────────────
@@ -10834,9 +10902,25 @@ async def _run_auto_post(bot, bot_data: dict):
                     )
 
                     # ── Final card ────────────────────────────────────────────
+                    # Card tip — use BTTS/O/U label when cycle says no 1X2 direction
+                    if _cycle_mkt == "BTTS":
+                        _btts_hist = [s[1] > 0 and s[2] > 0
+                                      for s in [tuple(int(x) for x in sc.split("-"))
+                                      for sc in _repeat.get("score_history", [])
+                                      if "-" in sc]]
+                        _btts_lbl  = "Yes" if (sum(_btts_hist)/len(_btts_hist) >= 0.6 if _btts_hist else True) else "No"
+                        _card_tip  = f"BTTS {_btts_lbl}"
+                    elif _cycle_mkt == "O/U":
+                        _sh_hist   = _repeat.get("score_history", [])
+                        _tots      = [sum(int(x) for x in sc.split("-")) for sc in _sh_hist if "-" in sc]
+                        _ou_dir    = "Over" if (sum(_tots)/len(_tots) > 2.5 if _tots else True) else "Under"
+                        _card_tip  = f"{_ou_dir} 2.5"
+                    else:
+                        _card_tip  = p["tip"]  # normal 1X2
+
                     card = (
                         f"*{m['home']}  v  {m['away']}*\n"
-                        f"{p['icon']} *{p['tip']}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
+                        f"{p['icon']} *{_card_tip}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
                         f"🏠{p['hw']:.0f}%  🤝{p['dw']:.0f}%  ✈️{p['aw']:.0f}%\n"
                         + market_lines
                         + _fc_line
@@ -11434,7 +11518,7 @@ async def _data_collector_job(context):
                     # Process at most 5 missing rounds per tick (oldest-first so
                     # standings build up chronologically)
                     backfilled   = 0
-                    _max_per_tick = 5
+                    _max_per_tick = 15
                     # Build a quick lookup: rid → round dict (for seasonId)
                     rid_to_round = {
                         str(r.get("id") or r.get("gameRoundId") or ""): r
@@ -11455,12 +11539,11 @@ async def _data_collector_job(context):
                             continue
 
                         # Fetch odds snapshot (upcoming page)
-                        evs_up  = await fetch_round_events(client, rid, PAGE_UPCOMING)
-                        evs_up  = _filter_league(evs_up, lid)
-                        odds_map = {
-                            _fixture_key(_norm_event(e)["home"], _norm_event(e)["away"]): _extract_odds(e)
-                            for e in evs_up
-                        }
+                        # Historical rounds: betPawa strips all odds from completed rounds.
+                        # PAGE_UPCOMING and PAGE_MATCHUPS both return with_markets=0.
+                        # Odds are only available when a round is live/upcoming.
+                        # The live collector captures them in real-time going forward.
+                        odds_map = {}  # empty — no odds available for past rounds
 
                         # Build predictions + results
                         preds   = []
@@ -11480,46 +11563,10 @@ async def _data_collector_job(context):
                                             "ht_h": ht_h, "ht_a": ht_a})
 
                         # ── Save odds + scores to odds_store + score_history ──
-                        # ALL 5 markets stored. Every fixture gets its own cycle track.
-                        _bf_os     = bot_data.setdefault("odds_store", {})
-                        _bf_lid_os = _bf_os.setdefault(str(lid), {})
-                        _bf_rid_os = _bf_lid_os.setdefault(str(rid), {})
-                        for _bfe, _bfr in zip(scored, results):
-                            try:
-                                _bfnm = _norm_event(_bfe)
-                                _bffk = _fixture_key(_bfnm["home"], _bfnm["away"])
-                                _bfeo = odds_map.get(_bffk, {})
-                                if not _bfeo or not _bfeo.get("1x2"):
-                                    continue
-                                _bfc  = "|".join(sorted([_bfnm["home"].strip().upper(), _bfnm["away"].strip().upper()]))
-                                _bfft = ("HOME" if _bfr["actual_h"] > _bfr["actual_a"]
-                                         else "AWAY" if _bfr["actual_a"] > _bfr["actual_h"] else "DRAW")
-                                if _bfc not in _bf_rid_os:
-                                    _bf_rid_os[_bfc] = {
-                                        "odds_snapshot": _bfeo,
-                                        "home":      _bfnm["home"],
-                                        "away":      _bfnm["away"],
-                                        "round_id":  str(rid),
-                                        "league_id": lid,
-                                        "season_id": str(r.get("_seasonId") or ""),
-                                        "saved_ts":  time.time(),
-                                        "outcome":   _bfft,
-                                        "score_h":   _bfr["actual_h"],
-                                        "score_a":   _bfr["actual_a"],
-                                        "correct":   None,
-                                    }
-                                # Score history via helper (England only)
-                                _save_score_history(
-                                    bot_data, lid,
-                                    _bfnm["home"], _bfnm["away"],
-                                    _bfeo, _bfft,
-                                    _bfr["actual_h"], _bfr["actual_a"],
-                                    int(rid) if rid.isdigit() else 0
-                                )
-                            except Exception as _bfe2:
-                                log.warning(f"BACKFILL save error [{name}]: {_bfe2}")
+                        # NOTE: odds not available for past rounds (betPawa strips them).
+                        # odds_store and score_history are built from LIVE rounds only.
+                        # The live collector saves odds every tick for upcoming rounds.
 
-                        if preds and results:
                             _past_season_id = str(r.get("_seasonId") or r.get("seasonId") or "")
                             _learn_from_round(bot_data, lid, preds, results,
                                               round_id=int(rid) if rid.isdigit() else 0,
