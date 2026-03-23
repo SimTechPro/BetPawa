@@ -3565,7 +3565,12 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         if len(_all_dirs) > 1:
             # Multiple directions in next candidates — no clear 1X2
             _cycle_next = "DRAW"  # signals: use BTTS/O/U
-    elif len(_full_seq) >= 2:
+    elif _last_out and not _next_candidates:
+        # Only 1 record — no transitions yet. Use the known outcome as direction.
+        # BTTS/O/U only fires when we actually have conflicting directions from 2+ records.
+        _cycle_next       = _last_out
+        _cycle_next_score = None  # score unknown until next round plays
+    if not _cycle_next and len(_full_seq) >= 2:
         # No transition map data yet — fall back to period detection
         if league_id == 7794:
             _n = len(_full_seq)
@@ -3594,9 +3599,21 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     #
     _last_played = _full_seq[-1] if _full_seq else None
     # ── DISPLAY: current → all known next scores ────────────────────────────
-    _cur_str  = _last_sc if _last_sc else (
-        f"{_full_seq[-1][1]}-{_full_seq[-1][2]}" if _full_seq else ""
-    )
+    # Show score in current round perspective (home team first on card)
+    # _last_sc is canonical (sorted alphabetically), but card shows home v away
+    # so we may need to flip the score for display
+    _canon_first = fk.split("|")[0] if "|" in fk else home.strip().upper()
+    _home_upper  = home.strip().upper()
+    if _last_sc and "-" in _last_sc:
+        _lh, _la = _last_sc.split("-", 1)
+        if _home_upper == _canon_first:
+            _cur_str = _last_sc          # home = canonical-first, no flip
+        else:
+            _cur_str = f"{_la}-{_lh}"   # flip: show from current home perspective
+    else:
+        _cur_str = _last_sc if _last_sc else (
+            f"{_full_seq[-1][1]}-{_full_seq[-1][2]}" if _full_seq else ""
+        )
     dir_icons = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}
 
     if _cycle_next in ("HOME", "AWAY"):
