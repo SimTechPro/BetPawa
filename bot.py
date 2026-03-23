@@ -3498,79 +3498,9 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     total_known       = sum(outcome_counts.values())
     consistency_pct   = round(consistency_count / total_known * 100)
 
-    # Detect cycle rotation pattern from the full sequence
-    # ── FULL SCORE CYCLE DETECTION ──────────────────────────────────────────
-    # ── FULL SCORE CYCLE DETECTION (England only — 7794) ──────────────────
-    # For England: use score_history_7794 keyed by fixture+odds fingerprint
-    # This gives the complete cross-round history for the EXACT same odds.
-    # Other leagues: direction-only from verified records.
-    _full_seq = []
-
-    if league_id == 7794 and bot_data:
-        # Build odds fingerprint from current odds (1x2)
-        _cur_1x2_fp = current_odds.get("1x2", {})
-        _ofp = f"{_cur_1x2_fp.get('1',0)}-{_cur_1x2_fp.get('X',0)}-{_cur_1x2_fp.get('2',0)}"
-        _sh_key = f"{fk}|{_ofp}"  # fk = canonical fixture key (already computed above)
-        _sh_store = bot_data.get("score_history_7794", {})
-        _fh = _sh_store.get(_sh_key, [])
-        # Build full_seq from score_history — complete picture of this odds pattern
-        for _r in _fh:
-            _out = _r.get("outcome", "")
-            _sh  = _r.get("score_h")
-            _sa  = _r.get("score_a")
-            if _out and _sh is not None and _sa is not None:
-                _full_seq.append((_out, _sh, _sa))
-
-    # Fallback: build from verified records (all leagues, or England if no history yet)
-    if not _full_seq:
-        for q in _all_with_outcome:
-            rec = q["record"]
-            out = rec.get("outcome", "")
-            sh  = rec.get("score_h")
-            sa  = rec.get("score_a")
-            if out and sh is not None and sa is not None:
-                _full_seq.append((out, sh, sa))
-
-    _cycle_next       = None
-    _cycle_next_score = None
-    _cycle_period     = None
-    _cycle_pos        = None
-
-    if len(_full_seq) >= 2:
-        if league_id == 7794:  # England only — full score cycle tracking
-            _n = len(_full_seq)
-            for _period in range(1, _n // 2 + 1):
-                _pattern = _full_seq[:_period]
-                _matches = all(_full_seq[_i] == _pattern[_i % _period] for _i in range(_n))
-                if _matches:
-                    _cycle_period     = _period
-                    _cycle_pos        = _n % _period
-                    _next_in_pat      = _pattern[_cycle_pos]
-                    _cycle_next       = _next_in_pat[0]
-                    _cycle_next_score = f"{_next_in_pat[1]}-{_next_in_pat[2]}"
-                    break
-
-        # Direction-only fallback (all leagues including England if no score cycle)
-        if not _cycle_period:
-            _dir_seq     = [s[0] for s in _full_seq]
-            _alternating = all(_dir_seq[i] != _dir_seq[i+1] for i in range(len(_dir_seq)-1))
-            _cycle_next  = ("HOME" if _dir_seq[-1] == "AWAY" else "AWAY") if _alternating else dominant_out
-
-    # Annotate score_lines with 🔁 at cycle restart points (England only)
-    _annotated_lines = []
-    for _i, (_sl, _q) in enumerate(zip(score_lines, _all_with_outcome)):
-        _entry = _sl
-        if _cycle_period and _i > 0 and _i % _cycle_period == 0:
-            _entry = "🔁 " + _entry
-        _annotated_lines.append(_entry)
-    score_lines = _annotated_lines
-
-    _seq = [s[0] for s in _full_seq]  # direction sequence for maintenance check
-    if consistency_pct < 67:
-        return {"matched": False, "repeat_count": repeat_count,
-                "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
-
-    # ── FULL SCORE CYCLE DETECTION ────────────────────────────────────────
+    # ── SCORE CYCLE DETECTION ────────────────────────────────────────────────
+    # England: read from score_history_7794 (fixture+odds fingerprint keyed).
+    # Other leagues: fall back to verified records.
     _full_seq = []
     if league_id == 7794 and bot_data:
         _c1x2 = current_odds.get("1x2", {})
@@ -3580,7 +3510,7 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
             if _r.get("outcome") and _r.get("score_h") is not None:
                 _full_seq.append((_r["outcome"], _r["score_h"], _r["score_a"]))
     if not _full_seq:
-        for q in _all_with_outcome_sorted:
+        for q in _all_with_outcome:
             rec = q["record"]
             out = rec.get("outcome", ""); sh = rec.get("score_h"); sa = rec.get("score_a")
             if out and sh is not None and sa is not None:
@@ -3597,22 +3527,15 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
                     _cycle_period = _period
                     _cycle_pos    = _n % _period
                     _nxt          = _pat[_cycle_pos]
-                    _cycle_next        = _nxt[0]
-                    _cycle_next_score  = f"{_nxt[1]}-{_nxt[2]}"
+                    _cycle_next       = _nxt[0]
+                    _cycle_next_score = f"{_nxt[1]}-{_nxt[2]}"
                     break
         if not _cycle_period:
             _alt = all(_seq[i] != _seq[i+1] for i in range(len(_seq)-1)) if len(_seq) >= 2 else False
             _cycle_next = ("HOME" if _seq[-1] == "AWAY" else "AWAY") if _alt else dominant_out
 
-    # Annotate score_lines: show only current in-progress loop
-    if _cycle_period and len(score_lines) >= _cycle_period:
-        _pos_now = len(_full_seq) % _cycle_period
-        _cur_run = score_lines[-_cycle_period:] if _pos_now == 0 else score_lines[-_pos_now:]
-        scores_str = "  ·  ".join(_cur_run)
-    else:
-        scores_str = "  ·  ".join(score_lines[-3:])
-
-    # ── MAINTENANCE CHECK ─────────────────────────────────────────────────
+    # ── MAINTENANCE CHECK ─────────────────────────────────────────────────────
+    # Last 2 verified results must both match expected cycle direction.
     _expected_dir = _cycle_next if _cycle_next else dominant_out
     _sorted_v = sorted(
         [q for q in verified if q["record"].get("outcome")],
@@ -3625,25 +3548,17 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
             return {"matched": False, "repeat_count": repeat_count,
                     "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {_expected_dir}"}
 
-    # ── RECENCY CHECK: detect if pattern has cycled ──────────────────────────
-    # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
-    # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
-    # Uses cycle_next as the expected direction:
-    # - If alternating cycle: expects opposite of last result
-    # - If consistent cycle: expects same as dominant
-    # The last 2 results must BOTH match the expected direction to fire.
-    _expected_dir = _cycle_next if _cycle_next else dominant_out
-    _sorted_verified = sorted(
-        [q for q in verified if q["record"].get("outcome")],
-        key=lambda q: int(q["record"].get("round_id", 0) or 0),
-        reverse=True
-    )
-    if len(_sorted_verified) >= 2:
-        _r1 = _sorted_verified[0]["record"].get("outcome")
-        _r2 = _sorted_verified[1]["record"].get("outcome")
-        if not (_r1 == _expected_dir and _r2 == _expected_dir):
-            return {"matched": False, "repeat_count": repeat_count,
-                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {_expected_dir} to restore"}
+    # ── Score display: current in-progress loop only ──────────────────────────
+    dir_icons = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}
+    disp_lines = []
+    for (out_s, sh_s, sa_s) in _full_seq:
+        disp_lines.append(f"{dir_icons.get(out_s,'')} {sh_s}-{sa_s}")
+    if _cycle_period and len(disp_lines) >= _cycle_period:
+        _pos_now = len(_full_seq) % _cycle_period
+        _cur_run = disp_lines[-_cycle_period:] if _pos_now == 0 else disp_lines[-_pos_now:]
+        scores_str = "  ·  ".join(_cur_run)
+    else:
+        scores_str = "  ·  ".join(disp_lines[-3:]) if disp_lines else ""
 
     # ── All checks passed ─────────────────────────────────────────────────────
     match_pct = round(n_matched / n_available * 100)
@@ -11358,6 +11273,7 @@ async def _data_collector_job(context):
 
     async with httpx.AsyncClient() as client:
         for lid, linfo in LEAGUES.items():
+            if lid not in ACTIVE_LEAGUES: continue
             name = linfo["name"]
             try:
                 league_model     = _get_model(bot_data, lid)
@@ -11950,6 +11866,7 @@ async def _do_rawstatus(message, c):
     try:
         async with httpx.AsyncClient() as client:
             for lid, linfo in LEAGUES.items():
+                if lid not in ACTIVE_LEAGUES: continue
                 try:
                     rname, _, events = await fetch_live_round(client, lid)
                     if not events:
@@ -12030,6 +11947,7 @@ async def _do_rawstatus(message, c):
     # ── 4. Per-league storage health ─────────────────────────────────────────
     store_lines = []
     for lid, linfo in LEAGUES.items():
+        if lid not in ACTIVE_LEAGUES: continue
         model  = bd.get(f"model_{lid}", {})
         rds    = model.get("rounds_learned", 0)
         fp_db  = model.get("fingerprint_db", {})
@@ -12156,6 +12074,7 @@ async def _do_brainstat(message, c):
     league_scores, league_lines = [], []
 
     for lid, linfo in LEAGUES.items():
+        if lid not in ACTIVE_LEAGUES: continue
         model = c.bot_data.get(f"model_{lid}")
         if not model or model.get("rounds_learned", 0) == 0:
             league_lines.append(f"┌ {linfo['flag']} *{linfo['name']}*\n└ ⚫ No data yet\n")
