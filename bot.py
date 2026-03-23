@@ -646,10 +646,9 @@ def _extract_odds(event: dict) -> dict:
 def _ml_weights(bot_data: dict) -> dict:
     """
     Return the self-learning market weight dict from bot_data.
-    Initialises with Laplace-smoothed defaults (correct=1, total=2 → 50%)
-    so the engine produces sensible output before any results are known.
-    Stored globally in bot_data (not per-league) so all leagues share the
-    same weight table and learn faster.
+    Initialised with Laplace-smoothed defaults (50% accuracy) so the engine
+    produces sensible output from round 1. Forward-compat patches missing keys.
+    Stored globally in bot_data — all leagues share one table and learn faster.
     """
     if "ml_weights" not in bot_data:
         bot_data["ml_weights"] = {
@@ -659,7 +658,6 @@ def _ml_weights(bot_data: dict) -> dict:
             "htft": {"correct": 1, "total": 2},
             "dc":   {"correct": 1, "total": 2},
         }
-    # Forward-compat: patch any missing keys
     w = bot_data["ml_weights"]
     for k in ("1x2", "ou", "btts", "htft", "dc"):
         w.setdefault(k, {"correct": 1, "total": 2})
@@ -671,9 +669,8 @@ def _ml_weights(bot_data: dict) -> dict:
 def _risk_control(bot_data: dict) -> dict:
     """
     Return the loss-streak risk control dict from bot_data.
-    loss_streak is reset to 0 on each correct prediction and incremented
-    on each wrong one.  When streak >= 3 confidence is trimmed; >= 5 the
-    tip is forced to DRAW (safest) until the streak breaks.
+    loss_streak is reset to 0 on each correct prediction and incremented on
+    each wrong one.  streak >= 3 => conf -20 pts; streak >= 5 => force DRAW.
     """
     if "risk" not in bot_data:
         bot_data["risk"] = {"loss_streak": 0}
@@ -685,35 +682,23 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
     """
     Unified multi-market prediction engine.
     Uses: 1X2, O/U (2.5 line), BTTS, HT/FT, Double Chance.
-
-    Market weights are self-learning: each market's score contribution is
-    proportional to how often that market's implied signal was correct in
-    past results (tracked by update_market_learning).
-
-    Returns:
-        {
-          "pick":       "HOME" | "DRAW" | "AWAY",
-          "confidence": float (0-100),
-          "scores":     {"HOME": float, "DRAW": float, "AWAY": float},
-          "used":       list[str],          # which markets contributed
-        }
+    Market weights are self-learning via update_market_learning().
+    Returns: {"pick": "HOME"|"DRAW"|"AWAY", "confidence": float, "scores": dict, "used": list}
     """
     if bot_data is None:
         bot_data = {}
-
     weights = _ml_weights(bot_data)
 
     def w(key: str) -> float:
-        """Dynamic weight for a market key, scaled to 0.5 – 3.0."""
         rec = weights.get(key, {"correct": 1, "total": 2})
         t   = max(rec.get("total", 2), 2)
         c   = rec.get("correct", 1)
-        return (c / t) * 3.0   # range: ~0 to 3.0; at 50% accuracy = 1.5
+        return (c / t) * 3.0
 
     score: dict[str, float] = {"HOME": 0.0, "DRAW": 0.0, "AWAY": 0.0}
     used: list[str] = []
 
-    # ── 1. 1X2 (base probability) ─────────────────────────────────────────────
+    # 1. 1X2
     o1x2 = odds.get("1x2", {})
     if o1x2:
         try:
@@ -730,7 +715,7 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
-    # ── 2. Over/Under 2.5 (game type signal) ─────────────────────────────────
+    # 2. O/U 2.5
     ou = odds.get("ou", [])
     ou25 = [x for x in ou if str(x[1]) == "2.5"]
     if ou25:
@@ -739,16 +724,16 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
             under = next((p for s, l, p in ou25 if s == "U"), None)
             if over and under:
                 wt = w("ou")
-                if under < over:           # low scoring → draw favoured
+                if under < over:
                     score["DRAW"] += wt
-                else:                      # high scoring → decisive result
+                else:
                     score["HOME"] += wt / 2
                     score["AWAY"] += wt / 2
                 used.append("ou")
         except (TypeError, ValueError):
             pass
 
-    # ── 3. BTTS (goal symmetry) ───────────────────────────────────────────────
+    # 3. BTTS
     btts = odds.get("btts", {})
     if btts:
         try:
@@ -756,9 +741,9 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
             no  = btts.get("No")
             if yes and no:
                 wt = w("btts")
-                if yes < no:               # both teams likely to score → narrow
+                if yes < no:
                     score["DRAW"] += wt
-                else:                      # one-sided → boost whichever team is leading
+                else:
                     if score["HOME"] >= score["AWAY"]:
                         score["HOME"] += wt
                     else:
@@ -767,7 +752,7 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
         except (TypeError, ValueError):
             pass
 
-    # ── 4. HT/FT (game-flow signal) ──────────────────────────────────────────
+    # 4. HT/FT
     htft = odds.get("htft", {})
     if htft:
         try:
@@ -787,7 +772,7 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
         except (TypeError, ValueError, StopIteration):
             pass
 
-    # ── 5. Double Chance (market safety signal) ───────────────────────────────
+    # 5. Double Chance
     dc = odds.get("dc", {})
     if dc:
         try:
@@ -798,47 +783,24 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
             elif best_dc == "X2":
                 score["AWAY"] += wt / 2
             elif best_dc == "12":
-                score["DRAW"] -= wt / 2   # draw is the risky side
+                score["DRAW"] -= wt / 2
             used.append("dc")
         except (TypeError, ValueError, StopIteration):
             pass
 
-    # ── Final decision ────────────────────────────────────────────────────────
     sorted_scores = sorted(score.items(), key=lambda x: x[1], reverse=True)
     top, second   = sorted_scores[0], sorted_scores[1]
-
-    # Anti-random filter: if top two are too close, default to DRAW
-    if abs(top[1] - second[1]) < 1.5:
-        pick = "DRAW"
-    else:
-        pick = top[0]
-
+    pick = "DRAW" if abs(top[1] - second[1]) < 1.5 else top[0]
     total_score = sum(score.values())
-    if total_score > 0:
-        confidence = round((top[1] / total_score) * 100, 1)
-    else:
-        confidence = 33.0
+    confidence  = round((top[1] / total_score) * 100, 1) if total_score > 0 else 33.0
 
-    return {
-        "pick":       pick,
-        "confidence": confidence,
-        "scores":     score,
-        "used":       used,
-    }
+    return {"pick": pick, "confidence": confidence, "scores": score, "used": used}
 
 
 def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: dict) -> None:
     """
     Called after each match result is known.
-    Updates the self-learning weight table for each market that had a view
-    on this match, incrementing 'correct' when the market's implied signal
-    matched the actual outcome.
-
-    Args:
-        bot_data:  the application's persistent bot_data dict
-        predicted: "HOME" | "DRAW" | "AWAY"  — our predicted outcome
-        actual:    "HOME" | "DRAW" | "AWAY"  — the real FT outcome
-        odds:      the odds dict returned by _extract_odds for the match
+    Updates self-learning weight table for each market that had a signal.
     """
     weights = _ml_weights(bot_data)
 
@@ -847,18 +809,16 @@ def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: di
         if correct:
             weights[key]["correct"] += 1
 
-    # 1X2 — implied favourite matches actual?
     o1x2 = odds.get("1x2", {})
     if o1x2:
         try:
-            fav  = min(o1x2, key=lambda k: o1x2[k])
+            fav    = min(o1x2, key=lambda k: o1x2[k])
             mapped = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(fav)
             if mapped:
                 _update("1x2", mapped == actual)
         except (TypeError, ValueError):
             pass
 
-    # O/U 2.5 — under favoured → DRAW implied; over → decisive
     ou = odds.get("ou", [])
     ou25 = [x for x in ou if str(x[1]) == "2.5"]
     if ou25:
@@ -866,31 +826,24 @@ def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: di
             over  = next((p for s, l, p in ou25 if s == "O"), None)
             under = next((p for s, l, p in ou25 if s == "U"), None)
             if over and under:
-                implied_draw = (under < over)
-                actual_draw  = (actual == "DRAW")
-                _update("ou", implied_draw == actual_draw)
+                _update("ou", (under < over) == (actual == "DRAW"))
         except (TypeError, ValueError):
             pass
 
-    # BTTS — yes < no → both score → narrower result (draw-leaning)
     btts = odds.get("btts", {})
     if btts:
         try:
             yes = btts.get("Yes")
             no  = btts.get("No")
             if yes and no:
-                implied_btts = (yes < no)
-                actual_btts  = (actual != "DRAW")   # rough: decisive → one team scored more
-                _update("btts", implied_btts == actual_btts)
+                _update("btts", (yes < no) == (actual != "DRAW"))
         except (TypeError, ValueError):
             pass
 
-    # HT/FT — lowest-priced outcome maps to a result; was it correct?
     htft = odds.get("htft", {})
     if htft:
         try:
-            best = min(htft.items(), key=lambda x: x[1])[0]
-            # first character: 1=Home, X=Draw, 2=Away at FT
+            best    = min(htft.items(), key=lambda x: x[1])[0]
             ft_char = best.split("/")[-1] if "/" in best else ""
             mapped  = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(ft_char)
             if mapped:
@@ -898,7 +851,6 @@ def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: di
         except (TypeError, ValueError, StopIteration):
             pass
 
-    # DC — cheapest DC option; does the actual outcome fall within it?
     dc = odds.get("dc", {})
     if dc:
         try:
@@ -3156,46 +3108,34 @@ def predict_match(home: str, away: str, stats: dict,
         conf = round(min(97.0, conf - calib * 0.15), 1)
 
     # ── Multi-market engine blend ─────────────────────────────────────────────
-    # Run the dedicated multi-market predictor and let it nudge the ensemble.
-    # Weight: 15% blend so it adds signal without overriding odds-dominant model.
-    # bot_data is carried inside model["_bot_data"] when available; otherwise
-    # the engine runs with default (equal) weights.
-    _bd_ref = model.get("_bot_data") if model else None
-    mm_result = multi_market_predict(odds if odds else {}, bot_data=_bd_ref)
-    mm_pick = mm_result.get("pick", "")
-    MM_BLEND = 0.15   # 15 % influence
-    if mm_pick == "HOME":
-        hw = hw * (1 - MM_BLEND) + MM_BLEND
-        dw = dw * (1 - MM_BLEND)
-        aw = aw * (1 - MM_BLEND)
-    elif mm_pick == "DRAW":
-        dw = dw * (1 - MM_BLEND) + MM_BLEND
-        hw = hw * (1 - MM_BLEND)
-        aw = aw * (1 - MM_BLEND)
-    elif mm_pick == "AWAY":
-        aw = aw * (1 - MM_BLEND) + MM_BLEND
-        hw = hw * (1 - MM_BLEND)
-        dw = dw * (1 - MM_BLEND)
-    # Re-normalise after blend
-    _mm_t = hw + dw + aw or 1.0
-    hw /= _mm_t; dw /= _mm_t; aw /= _mm_t
-    # Tiny confidence nudge when multi-market agrees with our tip
-    if mm_pick and mm_pick == tip_outcome:
-        conf = round(min(97.0, conf + 1.5), 1)
+    # 15% blend nudges the ensemble without overriding odds-dominant model.
+    # bot_data passed explicitly via model["_bd"] — no circular reference.
+    _bd_ref = model.get("_bd") if model else None
+    if odds:
+        mm_result  = multi_market_predict(odds, bot_data=_bd_ref if _bd_ref is not None else {})
+        mm_pick    = mm_result.get("pick", "")
+        MM_BLEND   = 0.15
+        if mm_pick == "HOME":
+            hw = hw * (1 - MM_BLEND) + MM_BLEND; dw *= (1 - MM_BLEND); aw *= (1 - MM_BLEND)
+        elif mm_pick == "DRAW":
+            dw = dw * (1 - MM_BLEND) + MM_BLEND; hw *= (1 - MM_BLEND); aw *= (1 - MM_BLEND)
+        elif mm_pick == "AWAY":
+            aw = aw * (1 - MM_BLEND) + MM_BLEND; hw *= (1 - MM_BLEND); dw *= (1 - MM_BLEND)
+        _mm_t = hw + dw + aw or 1.0
+        hw /= _mm_t; dw /= _mm_t; aw /= _mm_t
+        if mm_pick and mm_pick == tip_outcome:
+            conf = round(min(97.0, conf + 1.5), 1)
 
     # ── Loss-streak risk protection ───────────────────────────────────────────
-    # Applied here so every prediction path respects the streak state.
     if _bd_ref is not None:
         _risk = _risk_control(_bd_ref)
         _streak = _risk.get("loss_streak", 0)
         if _streak >= 3:
             conf = round(max(40.0, conf - 20.0), 1)
-        if _streak >= 5:
-            # Force to DRAW (safest bet) when deeply in a losing streak
-            if tip_outcome != "DRAW":
-                tip        = "DRAW / CLOSE"
-                icon       = "🤝"
-                tip_outcome = "DRAW"
+        if _streak >= 5 and tip_outcome != "DRAW":
+            tip         = "DRAW / CLOSE"
+            icon        = "\U0001f91d"
+            tip_outcome = "DRAW"
 
     # ── 9. Side markets — use odds if available, else blend stats + learned rates ─
     p  = hst["p"] or 1
@@ -6644,10 +6584,8 @@ def _get_model(bot_data: dict, league_id: int) -> dict:
             for stale in ("fixture_trust",):
                 old_ai.pop(stale, None)
 
-    # Always attach a live reference to bot_data so predict_match can access
-    # _ml_weights and _risk_control without needing bot_data passed explicitly.
-    # This is a transient reference — it is stripped before backup/JSON serialisation.
-    bot_data[key]["_bot_data"] = bot_data
+    # Strip any stale _bd reference before returning (prevents circular ref)
+    bot_data[key].pop("_bd", None)
     return bot_data[key]
 
 
@@ -8593,11 +8531,10 @@ def _learn_from_round(bot_data: dict, league_id: int,
                     sa[sig_name]["correct"] += 1
 
         # ── Multi-market self-learning weight update ──────────────────────────
-        # Only when we have a real (non-bootstrap) prediction and actual result.
         if not is_bootstrap and our_out and odds_snap:
             update_market_learning(bot_data, our_out, ft_out, odds_snap)
 
-        # ── Loss-streak risk control ──────────────────────────────────────────
+        # ── Loss-streak risk control tracker ─────────────────────────────────
         if not is_bootstrap and our_out:
             risk = _risk_control(bot_data)
             if our_out == ft_out:
@@ -10206,7 +10143,9 @@ async def cb_predict_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             league_model["_current_round_id"] = 0
         league_model["_current_season_id"] = str(_cur_season_id or "")
         league_model["_match_position"] = match_pos
+        league_model["_bd"] = c.bot_data
         p       = predict_match(m["home"], m["away"], stats, ev_odds, league_model)
+        league_model.pop("_bd", None)
         h2h_ln  = (f"  📋 H2H({h2h['n']}): H{h2h['hw']} D{h2h['d']} A{h2h['aw']}\n"
                    if h2h and h2h["n"] >= 2 else "")
         cs_preds = predict_correct_score(m["home"], m["away"], stats, p, ev_odds, top_n=3)
@@ -10246,7 +10185,9 @@ async def cb_compare_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             league_model["_current_round_id"] = 0
         league_model["_current_season_id"] = str(_cur_season_id or "")
         league_model["_match_position"] = match_pos
+        league_model["_bd"] = c.bot_data
         p       = predict_match(m["home"], m["away"], stats, ev_odds, league_model)
+        league_model.pop("_bd", None)
         total  += 1
         our_t   = p["tip"].split()[0]
         if hs is not None and as_ is not None:
@@ -12337,31 +12278,31 @@ async def _do_brainstat(message, c):
         f"{'━'*26}\n\n"
     )
 
-    # ── Multi-market engine status ────────────────────────────────────────────
-    _wts  = c.bot_data.get("ml_weights", {})
-    _risk = c.bot_data.get("risk", {})
+    # ── Multi-market engine status ──────────────────────────────────────────
+    _wts   = c.bot_data.get("ml_weights", {})
+    _risk  = c.bot_data.get("risk", {})
     _streak = _risk.get("loss_streak", 0)
     if _wts:
         def _wline(k):
             rec = _wts.get(k, {"correct": 1, "total": 2})
-            t = max(rec.get("total", 2), 2)
-            c2 = rec.get("correct", 1)
+            t   = max(rec.get("total", 2), 2)
+            c2  = rec.get("correct", 1)
             pct = c2 / t * 100
-            bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+            bar = "\u2588" * int(pct / 10) + "\u2591" * (10 - int(pct / 10))
             return f"  `{k:<5}` {bar} {pct:.0f}% ({c2}/{t})"
         mm_lines = "\n".join(_wline(k) for k in ("1x2", "ou", "btts", "htft", "dc"))
-        streak_icon = "🟢" if _streak == 0 else ("🟡" if _streak < 3 else ("🔴" if _streak < 5 else "⛔"))
+        s_icon = "\U0001f7e2" if _streak == 0 else ("\U0001f7e1" if _streak < 3 else ("\U0001f534" if _streak < 5 else "\u26d4"))
         mm_block = (
-            f"{'━'*26}\n"
-            f"📊 *Multi-Market Engine*\n"
+            f"{'\u2501'*26}\n"
+            f"\U0001f4ca *Multi-Market Engine*\n"
             f"{mm_lines}\n"
-            f"{streak_icon} Loss streak: *{_streak}*"
-            + (" — conf −20%" if _streak >= 3 else "")
-            + (" — FORCED DRAW" if _streak >= 5 else "")
+            f"{s_icon} Loss streak: *{_streak}*"
+            + (" \u2014 conf \u221220%" if _streak >= 3 else "")
+            + (" \u2014 FORCED DRAW" if _streak >= 5 else "")
             + "\n"
         )
     else:
-        mm_block = f"{'━'*26}\n📊 *Multi-Market Engine:* building…\n"
+        mm_block = f"{'\u2501'*26}\n\U0001f4ca *Multi-Market Engine:* building\u2026\n"
 
     await _send(message, header + "\n".join(league_lines) + "\n" + mm_block, parse_mode="Markdown")
 
@@ -12482,7 +12423,7 @@ async def _do_backup_inner(message, c):
             m["_ml_seen"] = _ml_seen_raw   # restore on live model (we only removed from copy)
         m_copy.pop("_cached_standings", None)
         m_copy.pop("_ml_seen", None)   # ensure not in copy regardless
-        m_copy.pop("_bot_data", None)  # live reference — never serialise
+        m_copy.pop("_bd", None)        # ephemeral reference — never serialise
 
         brain_data[str(lid)] = {
             "fingerprint_db": m_copy.pop("fingerprint_db", {}),
@@ -13140,12 +13081,10 @@ def _load_baked_data(bot_data: dict, baked: dict):
             acc["allowed_channels"] = promoted
             log.info(f"💾 Auto-promoted {len(promoted)} channels from auto_chats to allowed_channels")
 
-    # Multi-market learning weights — restore if present
     if baked.get("ml_weights"):
         bot_data["ml_weights"] = baked["ml_weights"]
         log.info(f"💾 Restored ml_weights from baked data")
 
-    # Loss-streak risk state — restore if present
     if baked.get("risk"):
         bot_data["risk"] = baked["risk"]
         log.info(f"💾 Restored risk/loss_streak from baked data")
@@ -13279,7 +13218,7 @@ def _load_baked_data(bot_data: dict, baked: dict):
                     }
             # Never carry _cached_standings into the saved model — it's ephemeral
             m.pop("_cached_standings", None)
-            m.pop("_bot_data", None)   # live reference — strip on restore
+            m.pop("_bd", None)   # ephemeral reference — strip on restore
 
             # ── Apply ai_brain migration: if old keys present, convert them ──
             # This ensures brain files saved before the new AI engine work perfectly.
