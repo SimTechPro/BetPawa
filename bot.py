@@ -10982,7 +10982,8 @@ async def _run_auto_post(bot, bot_data: dict):
                     )
 
                     # ── Final card ────────────────────────────────────────────
-                    # Card tip — use BTTS/O/U label when cycle says no 1X2 direction
+                    # Card tip — cycle overrides stats prediction
+                    # If cycle says 1X2 direction, use that. If BTTS/O/U, use that.
                     if _cycle_mkt == "BTTS":
                         _btts_hist = [s[1] > 0 and s[2] > 0
                                       for s in [tuple(int(x) for x in sc.split("-"))
@@ -10996,11 +10997,25 @@ async def _run_auto_post(bot, bot_data: dict):
                         _ou_dir    = "Over" if (sum(_tots)/len(_tots) > 2.5 if _tots else True) else "Under"
                         _card_tip  = f"{_ou_dir} 2.5"
                     else:
-                        _card_tip  = p["tip"]  # normal 1X2
+                        # 1X2 — use cycle direction if clear, else stats tip
+                        _rep_out = _repeat.get("outcome", "")  # HOME or AWAY from cycle
+                        if _rep_out in ("HOME", "AWAY"):
+                            _dir_label = {"HOME": "Home WIN", "AWAY": "Away WIN"}.get(_rep_out, _rep_out)
+                            _card_tip  = _dir_label
+                        else:
+                            _card_tip  = p["tip"]  # fallback to stats
+
+                    # Icon matches cycle direction
+                    if _card_tip == "Home WIN":    _cycle_icon_tip = "🏠"
+                    elif _card_tip == "Away WIN":  _cycle_icon_tip = "✈️"
+                    elif "BTTS" in _card_tip:      _cycle_icon_tip = "⚽"
+                    elif "Over" in _card_tip:      _cycle_icon_tip = "📈"
+                    elif "Under" in _card_tip:     _cycle_icon_tip = "📉"
+                    else:                          _cycle_icon_tip = p["icon"]
 
                     card = (
                         f"*{m['home']}  v  {m['away']}*\n"
-                        f"{p['icon']} *{_card_tip}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
+                        f"{_cycle_icon_tip} *{_card_tip}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
                         f"🏠{p['hw']:.0f}%  🤝{p['dw']:.0f}%  ✈️{p['aw']:.0f}%\n"
                         + market_lines
                         + _fc_line
