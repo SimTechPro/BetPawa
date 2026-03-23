@@ -3569,6 +3569,62 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
     if consistency_pct < 67:
         return {"matched": False, "repeat_count": repeat_count,
                 "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
+
+    # ── FULL SCORE CYCLE DETECTION ────────────────────────────────────────
+    _full_seq = []
+    if league_id == 7794 and bot_data:
+        _c1x2 = current_odds.get("1x2", {})
+        _ofp  = f"{_c1x2.get('1',0)}-{_c1x2.get('X',0)}-{_c1x2.get('2',0)}"
+        _sh_key = f"{fk}|{_ofp}"
+        for _r in bot_data.get("score_history_7794", {}).get(_sh_key, []):
+            if _r.get("outcome") and _r.get("score_h") is not None:
+                _full_seq.append((_r["outcome"], _r["score_h"], _r["score_a"]))
+    if not _full_seq:
+        for q in _all_with_outcome_sorted:
+            rec = q["record"]
+            out = rec.get("outcome", ""); sh = rec.get("score_h"); sa = rec.get("score_a")
+            if out and sh is not None and sa is not None:
+                _full_seq.append((out, sh, sa))
+
+    _cycle_next = _cycle_next_score = _cycle_period = _cycle_pos = None
+    _seq = [s[0] for s in _full_seq]
+    if len(_full_seq) >= 2:
+        if league_id == 7794:
+            _n = len(_full_seq)
+            for _period in range(1, _n // 2 + 1):
+                _pat = _full_seq[:_period]
+                if all(_full_seq[_i] == _pat[_i % _period] for _i in range(_n)):
+                    _cycle_period = _period
+                    _cycle_pos    = _n % _period
+                    _nxt          = _pat[_cycle_pos]
+                    _cycle_next        = _nxt[0]
+                    _cycle_next_score  = f"{_nxt[1]}-{_nxt[2]}"
+                    break
+        if not _cycle_period:
+            _alt = all(_seq[i] != _seq[i+1] for i in range(len(_seq)-1)) if len(_seq) >= 2 else False
+            _cycle_next = ("HOME" if _seq[-1] == "AWAY" else "AWAY") if _alt else dominant_out
+
+    # Annotate score_lines: show only current in-progress loop
+    if _cycle_period and len(score_lines) >= _cycle_period:
+        _pos_now = len(_full_seq) % _cycle_period
+        _cur_run = score_lines[-_cycle_period:] if _pos_now == 0 else score_lines[-_pos_now:]
+        scores_str = "  ·  ".join(_cur_run)
+    else:
+        scores_str = "  ·  ".join(score_lines[-3:])
+
+    # ── MAINTENANCE CHECK ─────────────────────────────────────────────────
+    _expected_dir = _cycle_next if _cycle_next else dominant_out
+    _sorted_v = sorted(
+        [q for q in verified if q["record"].get("outcome")],
+        key=lambda q: int(q["record"].get("round_id", 0) or 0), reverse=True
+    )
+    if len(_sorted_v) >= 2:
+        _r1 = _sorted_v[0]["record"].get("outcome")
+        _r2 = _sorted_v[1]["record"].get("outcome")
+        if not (_r1 == _expected_dir and _r2 == _expected_dir):
+            return {"matched": False, "repeat_count": repeat_count,
+                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {_expected_dir}"}
+
     # ── RECENCY CHECK: detect if pattern has cycled ──────────────────────────
     # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
     # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
@@ -7878,6 +7934,43 @@ def _form_snapshot_for_record(team: str, model: dict) -> dict:
     }
 
 
+
+def _save_score_history(bot_data: dict, league_id: int,
+                        home: str, away: str,
+                        odds_snapshot: dict,
+                        outcome: str, score_h: int, score_a: int,
+                        round_id: int):
+    """
+    Save a match result to score_history_7794 (England only).
+    Keyed by fixture+odds_fingerprint — same odds = same cycle track.
+    Records new scores and cycle repeats independently per fixture.
+    Called from both live learning and backfill so nothing is missed.
+    """
+    if league_id != 7794:
+        return
+    o1x2 = odds_snapshot.get("1x2", {})
+    if not o1x2:
+        return  # no 1x2 odds — cannot fingerprint
+    ofp    = f"{o1x2.get('1',0)}-{o1x2.get('X',0)}-{o1x2.get('2',0)}"
+    canon  = "|".join(sorted([home.strip().upper(), away.strip().upper()]))
+    sh_key = f"{canon}|{ofp}"
+    store  = bot_data.setdefault("score_history_7794", {})
+    hist   = store.setdefault(sh_key, [])
+    # Never add the same round twice
+    if any(r["round_id"] == round_id for r in hist):
+        return
+    seen_scores = {(r["score_h"], r["score_a"]) for r in hist}
+    hist.append({
+        "outcome":      outcome,
+        "score_h":      score_h,
+        "score_a":      score_a,
+        "round_id":     round_id,
+        "is_new_score": (score_h, score_a) not in seen_scores,
+        "is_repeat":    (score_h, score_a) in seen_scores,
+    })
+    hist.sort(key=lambda x: x["round_id"])
+
+
 def _learn_from_round(bot_data: dict, league_id: int,
                        predictions: list[dict], results: list[dict],
                        round_id: int = 0, season_id: str = "",
@@ -7923,29 +8016,15 @@ def _learn_from_round(bot_data: dict, league_id: int,
                 if res.get("ht_h") is not None:
                     entry["ht_h"] = res.get("ht_h")
                     entry["ht_a"] = res.get("ht_a")
-                # England only: build cross-round score history per fixture
-                # England only: score history keyed by fixture+odds fingerprint
-                # Same odds = same cycle track. Different odds = new track.
-                # Records both new scores AND repeats (cycle confirmations).
-                if league_id == 7794:
-                    _sh_store = bot_data.setdefault("score_history_7794", {})
-                    _snap = entry.get("odds_snapshot", {})
-                    _o1x2 = _snap.get("1x2", {})
-                    _ofp  = f"{_o1x2.get('1',0)}-{_o1x2.get('X',0)}-{_o1x2.get('2',0)}"
-                    _sh_key = f"{_canon}|{_ofp}"  # fixture+odds fingerprint
-                    _fh = _sh_store.setdefault(_sh_key, [])
-                    # Skip if this exact round already recorded
-                    if not any(r["round_id"] == (int(_rid_str) if _rid_str.isdigit() else 0) for r in _fh):
-                        _existing_scores = {(r["score_h"], r["score_a"]) for r in _fh}
-                        _fh.append({
-                            "outcome":      ft,
-                            "score_h":      ah,
-                            "score_a":      aa,
-                            "round_id":     int(_rid_str) if _rid_str.isdigit() else 0,
-                            "is_new_score": (ah, aa) not in _existing_scores,
-                            "is_repeat":    (ah, aa) in _existing_scores,
-                        })
-                        _fh.sort(key=lambda x: x["round_id"])
+                # Save to score history via helper (England only)
+                _save_score_history(
+                    bot_data, league_id,
+                    res.get("home", entry.get("home", "")),
+                    res.get("away", entry.get("away", "")),
+                    entry.get("odds_snapshot", {}),
+                    ft, ah, aa,
+                    int(_rid_str) if _rid_str.isdigit() else 0
+                )
     # Step 2+3+4: Scan ALL rounds — delete only bad/stale, keep valuable forever
     sorted_rids = sorted(
         _lid_os.keys(),
@@ -11456,11 +11535,10 @@ async def _data_collector_job(context):
                         evs_sc = _filter_league(evs_sc, lid)
                         scored = [e for e in evs_sc if _norm_event(e)["hs"] is not None]
                         if not scored:
-                            # No scores yet (round still pending) — mark done so we skip next tick
                             collected[bk] = 1
                             continue
 
-                        # Fetch odds snapshot for this past round (upcoming page)
+                        # Fetch odds snapshot (upcoming page)
                         evs_up  = await fetch_round_events(client, rid, PAGE_UPCOMING)
                         evs_up  = _filter_league(evs_up, lid)
                         odds_map = {
@@ -11468,63 +11546,76 @@ async def _data_collector_job(context):
                             for e in evs_up
                         }
 
-                        # Build predictions + results and learn immediately
+                        # Build predictions + results
                         preds   = []
                         results = []
                         for e in scored:
                             nm      = _norm_event(e)
                             fk      = _fixture_key(nm["home"], nm["away"])
                             ev_odds = odds_map.get(fk, {})
-                            p = predict_match(
-                                nm["home"], nm["away"], stats,
-                                ev_odds, league_model
-                            )
-                            preds.append({
-                                "home":           nm["home"],
-                                "away":           nm["away"],
-                                "tip":            p["tip"],
-                                "conf":           p.get("conf", 50.0),
-                                "btts_pred":      p.get("btts", 50.0) >= 50,
-                                "btts_prob":      p.get("btts", 50.0),
-                                "over25_pred":    p.get("over25", 50.0) >= 50,
-                                "over25_prob":    p.get("over25", 50.0),
-                                "_odds_snapshot": ev_odds,
-                            })
+                            p = predict_match(nm["home"], nm["away"], stats, ev_odds, league_model)
+                            preds.append({"home": nm["home"], "away": nm["away"], "tip": p["tip"],
+                                          "conf": p.get("conf", 50.0), "btts_pred": p.get("btts", 50.0) >= 50,
+                                          "btts_prob": p.get("btts", 50.0), "over25_pred": p.get("over25", 50.0) >= 50,
+                                          "over25_prob": p.get("over25", 50.0), "_odds_snapshot": ev_odds})
                             ht_h, ht_a = _extract_ht_score(e)
-                            results.append({
-                                "home":     nm["home"],
-                                "away":     nm["away"],
-                                "actual_h": nm["hs"],
-                                "actual_a": nm["as_"],
-                                "ht_h":     ht_h,
-                                "ht_a":     ht_a,
-                            })
+                            results.append({"home": nm["home"], "away": nm["away"],
+                                            "actual_h": nm["hs"], "actual_a": nm["as_"],
+                                            "ht_h": ht_h, "ht_a": ht_a})
+
+                        # ── Save odds + scores to odds_store + score_history ──
+                        # ALL 5 markets stored. Every fixture gets its own cycle track.
+                        _bf_os     = bot_data.setdefault("odds_store", {})
+                        _bf_lid_os = _bf_os.setdefault(str(lid), {})
+                        _bf_rid_os = _bf_lid_os.setdefault(str(rid), {})
+                        for _bfe, _bfr in zip(scored, results):
+                            try:
+                                _bfnm = _norm_event(_bfe)
+                                _bffk = _fixture_key(_bfnm["home"], _bfnm["away"])
+                                _bfeo = odds_map.get(_bffk, {})
+                                if not _bfeo or not _bfeo.get("1x2"):
+                                    continue
+                                _bfc  = "|".join(sorted([_bfnm["home"].strip().upper(), _bfnm["away"].strip().upper()]))
+                                _bfft = ("HOME" if _bfr["actual_h"] > _bfr["actual_a"]
+                                         else "AWAY" if _bfr["actual_a"] > _bfr["actual_h"] else "DRAW")
+                                if _bfc not in _bf_rid_os:
+                                    _bf_rid_os[_bfc] = {
+                                        "odds_snapshot": _bfeo,
+                                        "home":      _bfnm["home"],
+                                        "away":      _bfnm["away"],
+                                        "round_id":  str(rid),
+                                        "league_id": lid,
+                                        "season_id": str(r.get("_seasonId") or ""),
+                                        "saved_ts":  time.time(),
+                                        "outcome":   _bfft,
+                                        "score_h":   _bfr["actual_h"],
+                                        "score_a":   _bfr["actual_a"],
+                                        "correct":   None,
+                                    }
+                                # Score history via helper (England only)
+                                _save_score_history(
+                                    bot_data, lid,
+                                    _bfnm["home"], _bfnm["away"],
+                                    _bfeo, _bfft,
+                                    _bfr["actual_h"], _bfr["actual_a"],
+                                    int(rid) if rid.isdigit() else 0
+                                )
+                            except Exception as _bfe2:
+                                log.warning(f"BACKFILL save error [{name}]: {_bfe2}")
 
                         if preds and results:
-                            # Use this past round's own season_id from the API.
-                            # Do NOT fall back to _cur_season_id — past rounds may
-                            # belong to a previous season.
                             _past_season_id = str(r.get("_seasonId") or r.get("seasonId") or "")
-                            _learn_from_round(
-                                bot_data, lid, preds, results,
-                                round_id=int(rid) if rid.isdigit() else 0,
-                                season_id=_past_season_id
-                            )
-                            _learn_algo_signals(
-                                _get_model(bot_data, lid), preds, results,
-                                round_id_int=int(rid) if rid.isdigit() else 0
-                            )
-                            _ai_postmatch_analysis(
-                                _get_model(bot_data, lid), preds, results,
-                                standings=bot_data.get(f"standings_{lid}"),
-                                round_id=int(rid) if rid.isdigit() else 0,
-                            )
+                            _learn_from_round(bot_data, lid, preds, results,
+                                              round_id=int(rid) if rid.isdigit() else 0,
+                                              season_id=_past_season_id)
+                            _learn_algo_signals(_get_model(bot_data, lid), preds, results,
+                                                round_id_int=int(rid) if rid.isdigit() else 0)
+                            _ai_postmatch_analysis(_get_model(bot_data, lid), preds, results,
+                                                   standings=bot_data.get(f"standings_{lid}"),
+                                                   round_id=int(rid) if rid.isdigit() else 0)
                             collected[bk] = 1
                             backfilled += 1
-                            log.info(
-                                f"📚 COLLECTOR BACKFILL [{name}] rnd={rid} "
-                                f"learned {len(results)} matches (gap-fill)"
-                            )
+                            log.info(f"📚 COLLECTOR BACKFILL [{name}] rnd={rid} learned {len(results)} matches (gap-fill)")
 
                 except Exception as e:
                     log.warning(
