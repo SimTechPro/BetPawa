@@ -678,6 +678,264 @@ def _risk_control(bot_data: dict) -> dict:
     return bot_data["risk"]
 
 
+# ─── SELF-ADAPTING INTELLIGENCE LAYER ────────────────────────────────────────
+# Five interlocking engines that implement the AI's self-adaptation logic.
+# Derived from real performance data:  DC=77% ✅  BTTS=75% ✅  1X2=51% ⚖️  O/U=50% ❌
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_best_markets(bot_data: dict, min_acc: float = 0.60) -> list[str]:
+    """
+    SYSTEM 1 — Dynamic Market Selection.
+    Auto-select only markets whose real tracked accuracy >= min_acc.
+    Returns ordered list of market keys (best first).
+    Falls back to ["dc", "btts"] if not enough data yet.
+    """
+    weights = _ml_weights(bot_data)
+    ranked = []
+    for mkt, rec in weights.items():
+        t = max(rec.get("total", 2), 2)
+        c = rec.get("correct", 1)
+        acc = c / t
+        if t >= 20:   # only trust after 20 real samples
+            ranked.append((mkt, acc))
+    # Sort by accuracy descending
+    ranked.sort(key=lambda x: -x[1])
+    strong = [m for m, a in ranked if a >= min_acc]
+    # Always keep at minimum the two historically strongest markets
+    if not strong:
+        return ["dc", "btts"]
+    return strong
+
+
+def _compute_real_confidence(market_key: str, bot_data: dict,
+                              league_acc: float, raw_conf: float) -> float:
+    """
+    SYSTEM 2 — Real Confidence Engine.
+    Replaces inflated fake confidence with blended real accuracy:
+      60% = market accuracy for this pick type
+      40% = league accuracy (how well bot does in this league)
+    Only applied when enough data is available; otherwise raw_conf is returned.
+    """
+    weights = _ml_weights(bot_data)
+    rec = weights.get(market_key, {"correct": 1, "total": 2})
+    t   = max(rec.get("total", 2), 2)
+    if t < 20:
+        # Not enough data — return raw confidence unchanged
+        return raw_conf
+    mkt_acc = rec["correct"] / t
+    real_conf = (mkt_acc * 0.60 + league_acc * 0.40) * 100
+    # Blend: 70% real, 30% model — never discard model signal completely
+    blended = round(real_conf * 0.70 + raw_conf * 0.30, 1)
+    return max(45.0, min(97.0, blended))
+
+
+def _league_quality_ok(bot_data: dict, league_id: int,
+                        min_acc: float = 0.58) -> tuple[bool, float]:
+    """
+    SYSTEM 3 — League Quality Filter.
+    Returns (is_ok, league_1x2_accuracy).
+    Leagues below min_acc are flagged — their picks are shown with a warning,
+    but they are NOT hard-blocked (user still sees them; gate uses this info).
+    Accuracy = multi-round 1X2 rolling accuracy for this specific league.
+    """
+    model = bot_data.get(f"model_{league_id}", {})
+    if not model:
+        return True, 0.5   # unknown — allow through
+    cum = model.get("cumulative", {})
+    ot  = cum.get("outcome_total", 0)
+    oc  = cum.get("outcome_correct", 0)
+    if ot < 50:
+        return True, 0.5   # not enough data — allow through
+    acc = oc / ot
+    return acc >= min_acc, round(acc, 4)
+
+
+def _detect_trap_match(
+    home: str, away: str,
+    p: dict,
+    ev_odds: dict,
+    bot_data: dict,
+    league_id: int,
+    standings: dict | None,
+    league_model: dict,
+) -> tuple[bool, int, list[str]]:
+    """
+    SYSTEM 4 — Trap Match Detection Engine.
+    Detects 5 types of traps and returns (is_trap, trap_score, reasons).
+
+    Trap conditions checked:
+      1. Market conflict  — 1X2 favourite vs DC best pick disagree
+      2. Odds vs reality  — short odds (<1.60) but model confidence <60%
+      3. Recovery trap    — strong team lost last AND weak team won last
+                            (classic bettor trap: expect bounce-back → bookmaker punishes)
+      4. League dipping   — league trend is actively dropping
+      5. Fake confidence  — high model confidence but < 2 strong markets agree
+
+    trap_score >= 3 → is_trap = True
+    Trap matches are NOT hard-blocked — they get ⚠️ TRAP warning on card
+    and confidence is reduced, giving user context to decide.
+    """
+    reasons    = []
+    trap_score = 0
+
+    o1x2  = ev_odds.get("1x2", {})
+    dc    = ev_odds.get("dc", {})
+    conf  = p.get("conf", 50.0)
+    tip_g = p.get("tip", "").split()[0]
+
+    # ── Condition 1: Market conflict (1X2 vs DC disagree) ────────────────────
+    if o1x2 and dc:
+        try:
+            fav_1x2 = min(o1x2, key=lambda k: float(o1x2[k]))
+            fav_dc  = min(dc,   key=lambda k: float(dc[k]))
+            # 1X2 says HOME (key="1") but DC best is X2 (not covering home) = conflict
+            _1x2_dir = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(fav_1x2)
+            _dc_covers_1x2 = {
+                "1X": ("HOME", "DRAW"),
+                "X2": ("DRAW", "AWAY"),
+                "12": ("HOME", "AWAY"),
+            }.get(fav_dc, ())
+            if _1x2_dir and _1x2_dir not in _dc_covers_1x2:
+                trap_score += 1
+                reasons.append(f"market conflict: 1X2→{_1x2_dir} vs DC→{fav_dc}")
+        except (TypeError, ValueError):
+            pass
+
+    # ── Condition 2: Odds vs reality mismatch (short odds, low model conf) ───
+    try:
+        fav_odds_key = min(o1x2, key=lambda k: float(o1x2[k])) if o1x2 else None
+        fav_odds_val = float(o1x2.get(fav_odds_key, 9)) if fav_odds_key else 9.0
+        if fav_odds_val < 1.60 and conf < 60:
+            trap_score += 2   # heavy favourite but model isn't convinced
+            reasons.append(f"odds/model mismatch: fav={fav_odds_val} but conf={conf:.0f}%")
+    except (TypeError, ValueError):
+        pass
+
+    # ── Condition 3: Recovery trap ────────────────────────────────────────────
+    if standings:
+        tier_map  = _get_all_tiers(standings)
+        h_tier    = _find_tier(home, tier_map)
+        a_tier    = _find_tier(away, tier_map)
+        h_last    = _strategy_get_last_game(home, league_model)
+        a_last    = _strategy_get_last_game(away, league_model)
+        h_result  = (h_last or {}).get("result", "")
+        a_result  = (a_last or {}).get("result", "")
+        strong_lost = (
+            (h_tier == "STRONG" and h_result == "LOSS") or
+            (a_tier == "STRONG" and a_result == "LOSS")
+        )
+        weak_won    = (
+            (h_tier == "WEAK" and h_result == "WIN") or
+            (a_tier == "WEAK" and a_result == "WIN")
+        )
+        if strong_lost and weak_won:
+            trap_score += 2
+            reasons.append("recovery trap: strong team lost + weak team won last round")
+        elif strong_lost and not weak_won:
+            trap_score += 1
+            reasons.append("recovery risk: strong team lost last round")
+
+    # ── Condition 4: League dipping ────────────────────────────────────────────
+    model_for_trend = bot_data.get(f"model_{league_id}", {})
+    recent_10_acc  = model_for_trend.get("recent_10_acc", 0.5)
+    overall_acc    = model_for_trend.get("outcome_acc", 0.5)
+    if model_for_trend.get("recent_10_total", 0) >= 20:
+        if recent_10_acc < overall_acc - 0.04:
+            trap_score += 1
+            reasons.append(f"league dipping: recent={recent_10_acc:.0%} vs overall={overall_acc:.0%}")
+
+    # ── Condition 5: Fake confidence spike ────────────────────────────────────
+    # High confidence but very few strong markets agree
+    best_mkts  = _get_best_markets(bot_data)
+    avail_mkts = set()
+    if ev_odds.get("1x2"):   avail_mkts.add("1x2")
+    if ev_odds.get("btts"):  avail_mkts.add("btts")
+    if ev_odds.get("dc"):    avail_mkts.add("dc")
+    if ev_odds.get("ou"):    avail_mkts.add("ou")
+    if ev_odds.get("htft"):  avail_mkts.add("htft")
+    strong_avail = [m for m in best_mkts if m in avail_mkts]
+    if conf > 80 and len(strong_avail) < 2:
+        trap_score += 2
+        reasons.append(f"fake confidence: conf={conf:.0f}% but only {len(strong_avail)} strong markets present")
+
+    is_trap = trap_score >= 3
+    return is_trap, trap_score, reasons
+
+
+def _market_agreement_count(ev_odds: dict, pick: str, bot_data: dict) -> tuple[int, list[str]]:
+    """
+    SYSTEM 5 — Multi-Market Agreement Gate.
+    Count how many STRONG markets (≥60% accuracy) all point to the same direction.
+    Returns (agreement_count, list_of_agreeing_market_names).
+    Require ≥ 2 strong markets to agree before treating as a high-value pick.
+    """
+    best_mkts = _get_best_markets(bot_data, min_acc=0.60)
+    agreeing  = []
+
+    # 1X2
+    o1x2 = ev_odds.get("1x2", {})
+    if "1x2" in best_mkts and o1x2:
+        try:
+            fav = min(o1x2, key=lambda k: float(o1x2[k]))
+            _dir = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(fav)
+            if _dir == pick:
+                agreeing.append("1x2")
+        except (TypeError, ValueError):
+            pass
+
+    # DC
+    dc = ev_odds.get("dc", {})
+    if "dc" in best_mkts and dc:
+        try:
+            best_dc = min(dc, key=lambda k: float(dc[k]))
+            covers  = {"1X": ("HOME", "DRAW"), "X2": ("DRAW", "AWAY"), "12": ("HOME", "AWAY")}
+            if pick in covers.get(best_dc, ()):
+                agreeing.append("dc")
+        except (TypeError, ValueError):
+            pass
+
+    # BTTS — agrees with non-draw picks when BTTS Yes is cheap (both teams expected to score)
+    btts = ev_odds.get("btts", {})
+    if "btts" in best_mkts and btts:
+        try:
+            yes = float(btts.get("Yes", 99))
+            no  = float(btts.get("No", 99))
+            if yes < no and pick in ("HOME", "AWAY"):
+                # Both teams score → not a one-team walkover, agree if confident side
+                agreeing.append("btts")
+            elif no < yes and pick in ("HOME", "AWAY"):
+                # One team shuts out → clean sheet → still a directional win
+                agreeing.append("btts")
+        except (TypeError, ValueError):
+            pass
+
+    # HT/FT
+    htft = ev_odds.get("htft", {})
+    if "htft" in best_mkts and htft:
+        try:
+            best_h = min(htft.items(), key=lambda x: x[1])[0]
+            ft_char = best_h.split("/")[-1] if "/" in best_h else ""
+            _ft_dir = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(ft_char)
+            if _ft_dir == pick:
+                agreeing.append("htft")
+        except (TypeError, ValueError, StopIteration):
+            pass
+
+    # O/U — agrees with "decisive win" picks when low-scoring games expected (clear winner)
+    ou = ev_odds.get("ou", [])
+    if "ou" in best_mkts and ou:
+        try:
+            over_p, under_p = _ou25_from_odds(ou)
+            if over_p and under_p:
+                if under_p < over_p and pick in ("HOME", "AWAY"):
+                    # Likely low scoring (Under favoured) → clean result expected
+                    agreeing.append("ou")
+        except (TypeError, ValueError):
+            pass
+
+    return len(agreeing), agreeing
+
+
 
 def _ou25_from_odds(ou_list: list):
     """
@@ -10671,6 +10929,41 @@ async def _run_auto_post(bot, bot_data: dict):
                     if not _repeat_chk.get("matched"):
                         continue  # ❌ No odds repeat — skip this match
 
+                    # ── SYSTEM 3: League Quality Check ────────────────────────
+                    _league_ok, _league_acc = _league_quality_ok(bot_data, lid)
+                    _league_warn = not _league_ok   # warn on card but don't hard-block
+
+                    # ── SYSTEM 4: Trap Detection ──────────────────────────────
+                    _strat_standings = bot_data.get(f"standings_{lid}", {})
+                    _is_trap, _trap_score, _trap_reasons = _detect_trap_match(
+                        m["home"], m["away"], p, ev_odds,
+                        bot_data, lid, _strat_standings, league_model
+                    )
+                    # Trap reduces conf but does NOT hard-block — user sees warning
+                    if _is_trap:
+                        p_conf_adj = max(45.0, p.get("conf", 50.0) - _trap_score * 3.0)
+                    else:
+                        p_conf_adj = p.get("conf", 50.0)
+
+                    # ── SYSTEM 2: Real Confidence ─────────────────────────────
+                    # Determine dominant strong market for confidence anchor
+                    _best_mkts_now  = _get_best_markets(bot_data)
+                    _cycle_mkt_now  = _repeat_chk.get("cycle_tip_market", "1X2")
+                    _conf_market_key = "dc" if "dc" in _best_mkts_now else (
+                                        "btts" if "btts" in _best_mkts_now else "1x2")
+                    _real_conf = _compute_real_confidence(
+                        _conf_market_key, bot_data, _league_acc, p_conf_adj
+                    )
+
+                    # ── SYSTEM 5: Market Agreement Gate ──────────────────────
+                    _tip_for_agreement = _tip_g   # HOME or AWAY
+                    _agree_count, _agree_mkts = _market_agreement_count(
+                        ev_odds, _tip_for_agreement, bot_data
+                    )
+                    # Need ≥ 1 strong market agreeing (soft gate — not 2, avoids over-filtering
+                    # since cycle market already vetted via odds repeat)
+                    _market_gate_ok = (_agree_count >= 1) or (_cycle_mkt_now in ("BTTS", "DC", "O/U"))
+
                     # ── INFO: Strategy (view only, never blocks) ──────────────
                     _strat_standings = bot_data.get(f"standings_{lid}", {})
                     _g1_score = 0
@@ -11019,20 +11312,37 @@ async def _run_auto_post(bot, bot_data: dict):
                         continue  # ❌ Direction-confirm filter — skip this match
 
                     # ── Gate scores summary line ───────────────────────────────
+                    # Build market agreement display
+                    _agree_str = f"✅ {_agree_count} mkts agree ({', '.join(_agree_mkts[:3])})" if _agree_mkts else "🔵 building"
+                    # Build trap warning line
+                    _trap_line = ""
+                    if _is_trap:
+                        _trap_line = f"┆ ⚠️ TRAP RISK ({_trap_score}pt): {' | '.join(_trap_reasons[:2])}\n"
+                    elif _trap_score >= 1:
+                        _trap_line = f"┆ 🟡 Mild trap signal ({_trap_score}pt): {_trap_reasons[0] if _trap_reasons else ''}\n"
+                    # League quality warning
+                    _lq_line = ""
+                    if _league_warn:
+                        _lq_line = f"┆ 📉 League acc {_league_acc:.0%} (below 58% threshold)\n"
                     _gate_line = (
                         f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"┆ G1 S-W:   {_g1_label}\n"
                         f"┆ G2 Band:  {_g2_label}\n"
                         f"┆ G3 Hist:  {_g3_label}\n"
                         f"┆ G4 Form:  {_g4_label}\n"
+                        f"┆ G5 Mkts:  {_agree_str}\n"
                         f"┆ 🎯 Overall: *{_overall}%* — {_overall_label}\n"
-                        f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        + _trap_line
+                        + _lq_line
+                        + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
 
                     # ── Final card ────────────────────────────────────────────
+                    # Use real confidence instead of raw model confidence
+                    _display_conf = _real_conf
                     card = (
                         f"*{m['home']}  v  {m['away']}*\n"
-                        f"{p['icon']} *{p['tip']}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
+                        f"{p['icon']} *{p['tip']}{_fire}*  {_display_conf:.0f}%{_hist_tag}{_svw_tag}\n"
                         f"🏠{p['hw']:.0f}%  🤝{p['dw']:.0f}%  ✈️{p['aw']:.0f}%\n"
                         + market_lines
                         + _fc_line
@@ -12407,21 +12717,43 @@ async def _do_brainstat(message, c):
             t   = max(rec.get("total", 2), 2)
             c2  = rec.get("correct", 1)
             pct = c2 / t * 100
-            bar = "\u2588" * int(pct / 10) + "\u2591" * (10 - int(pct / 10))
-            return f"  `{k:<5}` {bar} {pct:.0f}% ({c2}/{t})"
+            bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+            flag = " ✅" if pct >= 60 else (" ⚖️" if pct >= 50 else " ❌")
+            return f"  `{k:<5}` {bar} {pct:.0f}% ({c2}/{t}){flag}"
         mm_lines = "\n".join(_wline(k) for k in ("1x2", "ou", "btts", "htft", "dc"))
-        s_icon = "\U0001f7e2" if _streak == 0 else ("\U0001f7e1" if _streak < 3 else ("\U0001f534" if _streak < 6 else "\u26d4"))
-        streak_note = (" \u2014 conf \u221210" if _streak >= 3 else "")
-        streak_note += (" \u2014 FORCED DRAW" if _streak >= 6 else "")
-        _sep26 = "\u2501" * 26
+
+        # Dynamic market selection — show what the bot would choose TODAY
+        _best_now = _get_best_markets(c.bot_data, min_acc=0.60)
+        _weak_now = [k for k in ("1x2", "ou", "btts", "htft", "dc")
+                     if k not in _best_now and _wts.get(k, {}).get("total", 0) >= 20]
+        _dyn_str  = f"  🎯 Auto-selected: `{'`, `'.join(_best_now) if _best_now else 'building...'}`\n"
+        if _weak_now:
+            _dyn_str += f"  ❌ Filtered out:  `{'`, `'.join(_weak_now)}`\n"
+
+        # League quality table
+        _lq_lines = []
+        for _lq_lid in LEAGUES:
+            _lq_ok, _lq_acc = _league_quality_ok(c.bot_data, _lq_lid)
+            if _lq_acc > 0.05:   # has data
+                _lq_icon = "✅" if _lq_ok else "⚠️"
+                _lq_name = LEAGUES[_lq_lid]["flag"] + " " + LEAGUES[_lq_lid]["name"]
+                _lq_lines.append(f"  {_lq_icon} {_lq_name}: {_lq_acc:.0%}")
+
+        s_icon = "🟢" if _streak == 0 else ("🟡" if _streak < 3 else ("🔴" if _streak < 6 else "⛔"))
+        streak_note = (" — conf −10" if _streak >= 3 else "")
+        streak_note += (" — FORCED DRAW" if _streak >= 6 else "")
+        _sep26 = "━" * 26
         mm_block = (
             _sep26 + "\n"
-            + "\U0001f4ca *Multi-Market Engine*\n"
-            + mm_lines + "\n"
+            "📊 *Multi-Market Engine*\n"
+            + mm_lines + "\n\n"
+            + _dyn_str
+            + "\n📍 *League Quality Filter* (min 58%)\n"
+            + ("\n".join(_lq_lines) if _lq_lines else "  building...") + "\n\n"
             + s_icon + " Loss streak: *" + str(_streak) + "*" + streak_note + "\n"
         )
     else:
-        mm_block = f"{'\u2501'*26}\n\U0001f4ca *Multi-Market Engine:* building\u2026\n"
+        mm_block = f"{'━'*26}\n📊 *Multi-Market Engine:* building…\n"
 
     await _send(message, header + "\n".join(league_lines) + "\n" + mm_block, parse_mode="Markdown")
 
@@ -12570,6 +12902,8 @@ async def _do_backup_inner(message, c):
         "pending_predictions": bd.get("pending_predictions", {}),
         "strategy_stats":      bd.get("strategy_stats", {}),
         "odds_repeat_stats":   bd.get("odds_repeat_stats", {}),
+        "ml_weights":          bd.get("ml_weights", {}),
+        "risk":                bd.get("risk", {}),
         "odds_store":          bd.get("odds_store", {}),
         "ml_weights":          bd.get("ml_weights", {}),   # multi-market self-learning
         "risk":                bd.get("risk", {}),          # loss-streak control
