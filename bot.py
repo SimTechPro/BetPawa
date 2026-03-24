@@ -1144,13 +1144,23 @@ def pro_card(
 
     level = get_level(conf, agree_count, risk, agree_total)
 
+    # Human-readable market label
+    _mkt_label = {
+        "dc":   "DC",
+        "btts": "BTTS",
+        "ou":   "O/U",
+        "o/u":  "O/U",
+        "htft": "HT/FT",
+        "1x2":  "1X2",
+    }.get(primary_market.lower(), primary_market.upper())
+
     text = (
         f"\n"
         f"🏠 *{home}* vs *{away}* ✈️\n"
         f"\n"
         f"{level}\n"
         f"\n"
-        f"🎯 Prediction : *{tip}*\n"
+        f"🎯 Prediction : *{_mkt_label} {tip}*\n"
         f"📊 Confidence : *{conf:.1f}%*\n"
         f"\n"
         f"📊 Agreement : *{agree_count}/{agree_total}*\n"
