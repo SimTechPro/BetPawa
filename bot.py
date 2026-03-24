@@ -965,6 +965,237 @@ def _ou25_from_odds(ou_list: list):
             continue
     return over, under
 
+# ─── PRO CARD HELPERS ─────────────────────────────────────────────────────────
+
+def get_primary_market(selected_markets: list, bot_data: dict) -> str:
+    """Pick the highest-accuracy market from the selected list."""
+    weights = _ml_weights(bot_data)
+    best_mkt  = "1x2"
+    best_acc  = 0.0
+    for m in selected_markets:
+        rec = weights.get(m, {"correct": 1, "total": 2})
+        t   = max(rec.get("total", 2), 2)
+        acc = rec.get("correct", 1) / t
+        if acc > best_acc:
+            best_acc = acc
+            best_mkt = m
+    return best_mkt
+
+
+def _ou_all_from_odds(ou_list: list) -> dict:
+    """
+    Extract ALL O/U lines from the odds list.
+    Returns {line_str: {"over": price, "under": price}}
+    e.g. {"1.5": {"over": 1.22, "under": 4.10}, "2.5": {...}, "3.5": {...}}
+    """
+    result: dict = {}
+    for entry in (ou_list or []):
+        try:
+            side  = str(entry[0]).upper().strip()
+            line  = str(entry[1]).rstrip("0").rstrip(".")
+            if line.endswith(".5") or line in ("1", "2", "3"):
+                # normalise "1" → "1.5" etc won't happen; just keep as-is
+                pass
+            price = float(entry[2]) if entry[2] is not None else None
+            if price is None or price <= 1.0:
+                continue
+            bucket = result.setdefault(line, {})
+            if side in ("O", "OVER"):
+                bucket["over"] = price
+            elif side in ("U", "UNDER"):
+                bucket["under"] = price
+        except (IndexError, TypeError, ValueError):
+            continue
+    return result
+
+
+def _best_ou_from_fp(fp_records: list, ev_odds: dict) -> tuple[str, str, float | None, float | None]:
+    """
+    Pick the single best O/U line dynamically using fp_db historical rates.
+
+    Strategy:
+      1. For each line (1.5, 2.5, 3.5) compute historical Over% from fp_db records.
+      2. Pick the line where the winning side (Over or Under) has the highest rate.
+      3. That becomes the prediction.
+
+    Returns (pick_label, line_str, over_price, under_price)
+    e.g. ("Over 1.5", "1.5", 1.22, 4.10)
+    """
+    ou_odds = _ou_all_from_odds(ev_odds.get("ou", []))
+
+    candidates: list[tuple[float, str, str, float | None, float | None]] = []
+    # (rate, pick_label, line_str, over_price, under_price)
+
+    line_to_key = {"1.5": "ou15_result", "2.5": "ou25_result", "3.5": "ou35_result"}
+
+    for line, result_key in line_to_key.items():
+        vals = [r.get(result_key) for r in fp_records if r.get(result_key) is not None]
+        if not vals:
+            continue
+        over_pct = sum(vals) / len(vals) * 100   # True = over, False = under
+        under_pct = 100 - over_pct
+
+        bucket = ou_odds.get(line, {})
+        over_p  = bucket.get("over")
+        under_p = bucket.get("under")
+
+        if over_pct >= 60:
+            candidates.append((over_pct, f"Over {line}", line, over_p, under_p))
+        if under_pct >= 60:
+            candidates.append((under_pct, f"Under {line}", line, over_p, under_p))
+
+    if candidates:
+        # Best = highest historical rate
+        candidates.sort(key=lambda x: -x[0])
+        rate, label, line, over_p, under_p = candidates[0]
+        return label, line, over_p, under_p
+
+    # No fp_db data yet → fall back to cheapest available line
+    for line in ("1.5", "2.5", "3.5"):
+        bucket = ou_odds.get(line, {})
+        if bucket.get("over"):
+            return f"Over {line}", line, bucket.get("over"), bucket.get("under")
+
+    return "Over 2.5", "2.5", None, None
+
+
+def get_final_pick(
+    primary_market: str,
+    p: dict,
+    ev_odds: dict,
+    fp_records: list | None = None,
+) -> tuple[str, str]:
+    """
+    Convert the raw prediction into the correct pick string for the
+    primary market — with full dynamic O/U line selection.
+    Returns (tip_string, odds_key_hint).
+    """
+    if fp_records is None:
+        fp_records = []
+
+    if primary_market == "dc":
+        dc = ev_odds.get("dc", {})
+        if dc:
+            try:
+                best_dc = min(dc, key=lambda k: float(dc[k]))
+                return best_dc, "dc"
+            except (TypeError, ValueError):
+                pass
+        tip_g = p.get("tip", "HOME WIN").split()[0]
+        return {"HOME": "1X", "AWAY": "X2", "DRAW": "12"}.get(tip_g, "1X"), "dc"
+
+    elif primary_market == "btts":
+        btts = ev_odds.get("btts", {})
+        if btts:
+            try:
+                yes = float(btts.get("Yes", 99))
+                no  = float(btts.get("No",  99))
+                return ("BTTS YES" if yes <= no else "BTTS NO"), "btts"
+            except (TypeError, ValueError):
+                pass
+        return "BTTS YES", "btts"
+
+    elif primary_market in ("ou", "o/u"):
+        label, _line, _op, _up = _best_ou_from_fp(fp_records, ev_odds)
+        return label, "ou"
+
+    elif primary_market == "htft":
+        htft = ev_odds.get("htft", {})
+        if htft:
+            try:
+                best_h = min(htft.items(), key=lambda x: float(x[1]))[0]
+                return best_h, "htft"
+            except (TypeError, ValueError, StopIteration):
+                pass
+
+    # Default: 1X2
+    tip_g = p.get("tip", "HOME WIN").split()[0]
+    label = {"HOME": "HOME", "AWAY": "AWAY", "DRAW": "DRAW"}.get(tip_g, tip_g)
+    return label, "1x2"
+
+
+def get_level(conf: float, agree_count: int, risk: str, best_markets_count: int) -> str:
+    """Return the tier label for this prediction."""
+    if conf >= 80 and agree_count >= 3 and risk == "LOW" and best_markets_count >= 2:
+        return "🟢 ELITE LOCK"
+    elif conf >= 70 and agree_count >= 2 and risk in ("LOW", "MEDIUM"):
+        return "🔵 ELITE"
+    elif conf >= 60:
+        return "🟡 STANDARD"
+    return "🔴 RISKY"
+
+
+def pro_card(
+    home: str, away: str,
+    tip: str, conf: float,
+    agree_count: int, agree_total: int,
+    risk: str,
+    ev_odds: dict,
+    primary_market: str,
+    fp_records: list | None = None,
+) -> str:
+    """
+    Clean professional prediction card.
+    Shows: match, tier, prediction, confidence, agreement, risk, relevant odds.
+    O/U odds are shown for the dynamically chosen line (1.5 / 2.5 / 3.5).
+    """
+    if fp_records is None:
+        fp_records = []
+
+    level = get_level(conf, agree_count, risk, agree_total)
+
+    text = (
+        f"\n"
+        f"🏠 *{home}* vs *{away}* ✈️\n"
+        f"\n"
+        f"{level}\n"
+        f"\n"
+        f"🎯 Prediction : *{tip}*\n"
+        f"📊 Confidence : *{conf:.1f}%*\n"
+        f"\n"
+        f"📊 Agreement : *{agree_count}/{agree_total}*\n"
+        f"⚠️ Risk : *{risk}*\n"
+        f"\n"
+    )
+
+    tip_up = tip.upper()
+
+    if tip_up in ("HOME", "AWAY", "DRAW"):
+        o = ev_odds.get("1x2", {})
+        if o:
+            text += (
+                f"📊 Odds\n"
+                f"1 : {o.get('1','-')}   X : {o.get('X','-')}   2 : {o.get('2','-')}\n"
+            )
+
+    elif tip_up in ("1X", "X2", "12"):
+        dc = ev_odds.get("dc", {})
+        if dc:
+            text += f"📊 Odds\n{tip} : {dc.get(tip, '-')}\n"
+
+    elif "BTTS" in tip_up:
+        b = ev_odds.get("btts", {})
+        if b:
+            text += f"📊 Odds\nYES : {b.get('Yes','-')}   NO : {b.get('No','-')}\n"
+
+    elif "OVER" in tip_up or "UNDER" in tip_up:
+        # Dynamic line: pick the same line that was chosen in get_final_pick
+        _label, line_str, over_p, under_p = _best_ou_from_fp(fp_records, ev_odds)
+        # Use the tip as the canonical label (may differ from _label only on fallback)
+        text += (
+            f"📊 Odds\n"
+            f"Over {line_str} : {over_p or '-'}   Under {line_str} : {under_p or '-'}\n"
+        )
+
+    elif "/" in tip:
+        h = ev_odds.get("htft", {})
+        if h:
+            text += f"📊 Odds\n{tip} : {h.get(tip, '-')}\n"
+
+    text += "\n━━━━━━━━━━━━━━━━━━"
+    return text
+
+
 def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
     """
     Unified multi-market prediction engine.
@@ -11337,22 +11568,51 @@ async def _run_auto_post(bot, bot_data: dict):
                         + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
 
-                    # ── Final card ────────────────────────────────────────────
-                    # Use real confidence instead of raw model confidence
-                    _display_conf = _real_conf
-                    card = (
-                        f"*{m['home']}  v  {m['away']}*\n"
-                        f"{p['icon']} *{p['tip']}{_fire}*  {_display_conf:.0f}%{_hist_tag}{_svw_tag}\n"
-                        f"🏠{p['hw']:.0f}%  🤝{p['dw']:.0f}%  ✈️{p['aw']:.0f}%\n"
-                        + market_lines
-                        + _fc_line
-                        + _mom_line
-                        + _strategy_line
-                        + _repeat_line
-                        + _gate_line
-                        + f"{result_str}\n"
+                    # ── Final card (Pro Card format) ──────────────────────────
+                    # 1. Pick the strongest market dynamically
+                    _primary_mkt = get_primary_market(_best_mkts_now or ["dc", "btts"], bot_data)
+                    # Pass fp_records so O/U picks the best line (1.5 / 2.5 / 3.5)
+                    _fp_db_card = league_model.get("fingerprint_db", {})
+                    _fk_card    = "|".join(sorted([m["home"], m["away"]]))
+                    _recs_card  = _fp_db_card.get(_fk_card, [])
+                    _dyn_tip, _dyn_odds_hint = get_final_pick(
+                        _primary_mkt, p, ev_odds, fp_records=_recs_card
                     )
-                    body += card + "─────────────────\n"
+
+                    # 2. Risk level from trap score
+                    if _trap_score >= 4:
+                        _risk_label = "HIGH"
+                    elif _trap_score >= 2:
+                        _risk_label = "MEDIUM"
+                    else:
+                        _risk_label = "LOW"
+
+                    # 3. Agreement totals
+                    _agree_total_card = max(len(_best_mkts_now), 1)
+
+                    # 4. Build the clean card
+                    _league_hdr_card = (
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⚽ *{LEAGUES[lid]['name'].upper()} • MATCHDAY {round_name}*\n"
+                        f"━━━━━━━━━━━━━━━━━━"
+                    )
+                    card = (
+                        _league_hdr_card
+                        + pro_card(
+                            home=m["home"],
+                            away=m["away"],
+                            tip=_dyn_tip,
+                            conf=_real_conf,
+                            agree_count=_agree_count,
+                            agree_total=_agree_total_card,
+                            risk=_risk_label,
+                            ev_odds=ev_odds,
+                            primary_market=_primary_mkt,
+                            fp_records=_recs_card,
+                        )
+                        + f"\n{result_str}\n"
+                    )
+                    body += card + "\n"
                     match_cards.append(card)
 
                 if not body:
@@ -11372,8 +11632,8 @@ async def _run_auto_post(bot, bot_data: dict):
                 flag = LEAGUES[lid]["flag"]
                 name = LEAGUES[lid]["name"]
 
-                # Build league header tag for each match card
-                _league_header = f"{flag} *{name}*  MD{round_name}\n"
+                # League header is now embedded inside each pro_card — keep empty for compat
+                _league_header = ""
 
                 sections.append({
                     "lid":        lid,
@@ -11381,8 +11641,7 @@ async def _run_auto_post(bot, bot_data: dict):
                     "match_cards": match_cards,   # list of per-match card strings
                     "league_header": _league_header,
                     "text": (                     # kept for change-detection
-                        _league_header
-                        + body + acc_line
+                        body + acc_line
                     ),
                 })
 
