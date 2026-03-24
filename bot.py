@@ -678,6 +678,35 @@ def _risk_control(bot_data: dict) -> dict:
     return bot_data["risk"]
 
 
+
+def _ou25_from_odds(ou_list: list):
+    """
+    Extract Over/Under 2.5 prices from an odds 'ou' list.
+    Handles both tuple (side, line, price) and list [side, line, price]
+    and both float 2.5 / string '2.5' line values.
+    Returns (over_price, under_price) or (None, None).
+    """
+    over = under = None
+    for entry in (ou_list or []):
+        try:
+            side  = str(entry[0]).upper().strip()
+            line  = entry[1]
+            price = entry[2]
+            if str(line).rstrip('0').rstrip('.') not in ("2.5", "2"):
+                # Accept 2.5 and also covers "2.50"
+                if str(line) not in ("2.5", "2.50"):
+                    continue
+            p = float(price) if price is not None else None
+            if p is None or p <= 1.0:
+                continue
+            if side in ("O", "OVER"):
+                over  = p
+            elif side in ("U", "UNDER"):
+                under = p
+        except (IndexError, TypeError, ValueError):
+            continue
+    return over, under
+
 def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
     """
     Unified multi-market prediction engine.
@@ -715,23 +744,16 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
-    # 2. O/U 2.5
-    ou = odds.get("ou", [])
-    ou25 = [x for x in ou if str(x[1]) == "2.5"]
-    if ou25:
-        try:
-            over  = next((p for s, l, p in ou25 if s == "O"), None)
-            under = next((p for s, l, p in ou25 if s == "U"), None)
-            if over and under:
-                wt = w("ou")
-                if under < over:
-                    score["DRAW"] += wt
-                else:
-                    score["HOME"] += wt / 2
-                    score["AWAY"] += wt / 2
-                used.append("ou")
-        except (TypeError, ValueError):
-            pass
+    # 2. O/U 2.5 — robust helper handles list/tuple and str/float line values
+    _mmp_over, _mmp_under = _ou25_from_odds(odds.get("ou", []))
+    if _mmp_over is not None and _mmp_under is not None:
+        wt = w("ou")
+        if _mmp_under < _mmp_over:
+            score["DRAW"] += wt
+        else:
+            score["HOME"] += wt / 2
+            score["AWAY"] += wt / 2
+        used.append("ou")
 
     # 3. BTTS
     btts = odds.get("btts", {})
@@ -819,16 +841,10 @@ def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: di
         except (TypeError, ValueError):
             pass
 
-    ou = odds.get("ou", [])
-    ou25 = [x for x in ou if str(x[1]) == "2.5"]
-    if ou25:
-        try:
-            over  = next((p for s, l, p in ou25 if s == "O"), None)
-            under = next((p for s, l, p in ou25 if s == "U"), None)
-            if over and under:
-                _update("ou", (under < over) == (actual == "DRAW"))
-        except (TypeError, ValueError):
-            pass
+    # O/U 2.5 — use robust helper that works after JSON round-trips
+    _ou_over, _ou_under = _ou25_from_odds(odds.get("ou", []))
+    if _ou_over is not None and _ou_under is not None:
+        _update("ou", (_ou_under < _ou_over) == (actual == "DRAW"))
 
     btts = odds.get("btts", {})
     if btts:
@@ -2816,18 +2832,32 @@ def predict_match(home: str, away: str, stats: dict,
         else:
             live_acc[sig] = {"odds": 0.45, "poisson": 0.38, "strength": 0.36}.get(sig, 0.38)
 
-    # Odds-dominant weights for virtual football
-    # Base: odds=92%, residual=8% split between poisson+strength (tiny calibration)
-    # After enough rounds: if odds_acc > 58%, further reduce residual → up to 97%
+    # ── Adaptive signal weights (auto-calibrated from live accuracy) ────────
+    # Instead of hardcoding 92% odds weight, we let each signal earn its share
+    # based on actual accuracy.  Bounds: odds 40-75%, poisson 10-35%, str 10-35%.
+    # With <50 cumulative matches we start at balanced priors, then let data decide.
     odds_acc = live_acc["odds"]
-    if cum_total >= 50 and odds_acc > 0.57:
-        base_odds_w = min(0.97, 0.92 + (odds_acc - 0.57) * 1.25)
+    pois_acc = live_acc["poisson"]
+    str_acc  = live_acc["strength"]
+
+    if cum_total >= 50:
+        # Scale raw accuracies relative to each other
+        _total_acc = (odds_acc + pois_acc + str_acc) or 1.0
+        _raw_odds  = odds_acc / _total_acc
+        _raw_pois  = pois_acc / _total_acc
+        _raw_str   = str_acc  / _total_acc
+        # Clamp to sensible bounds: odds 40-75%, poisson 10-35%, strength 10-35%
+        w_odds     = max(0.40, min(0.75, _raw_odds))
+        w_poisson  = max(0.10, min(0.35, _raw_pois))
+        w_strength = max(0.10, min(0.35, _raw_str))
+        # Re-normalise so they sum to 1.0
+        _wsum = w_odds + w_poisson + w_strength or 1.0
+        w_odds     /= _wsum
+        w_poisson  /= _wsum
+        w_strength /= _wsum
     else:
-        base_odds_w = 0.92
-    residual = 1.0 - base_odds_w
-    w_odds     = base_odds_w
-    w_poisson  = residual * 0.35   # tiny calibration residual
-    w_strength = residual * 0.65   # tiny calibration residual
+        # Prior: odds=60%, poisson=20%, strength=20%  (balanced until data is ready)
+        w_odds, w_poisson, w_strength = 0.60, 0.20, 0.20
 
     # ── 1. betPawa odds → implied probabilities (primary signal) ─────────────
     odds_probs = _odds_implied_probs(odds)
@@ -3076,15 +3106,32 @@ def predict_match(home: str, away: str, stats: dict,
 
     conf = round(min(97.0, blended_conf * agree_mult + all_agree_bonus + lock_bonus + _algo_bonus), 1)
 
-    # ── Margin band calibration: what % of picks at THIS confidence level were correct? ──
+    # ── Margin band calibration + confidence shrinkage ──────────────────────
+    # Two-layer fix for confidence inflation:
+    # Layer 1: band-specific nudge (existing) — pulls conf toward real accuracy in band
+    # Layer 2: global shrinkage — if average real accuracy across ALL bands is much
+    #          lower than average predicted confidence, scale down proportionally.
     margin_acc  = model.get("margin_acc", {}) if model else {}
     conf_bucket = str(int(conf // 5) * 5)
     band_rec    = margin_acc.get(conf_bucket, [0, 0])
     if band_rec[1] >= 10:
         band_acc    = band_rec[0] / band_rec[1]
-        # If this band has been right 70%+, small boost. If below 45%, pull down.
-        band_nudge  = (band_acc - 0.55) * 15   # -1.5 to +6.75 pts
-        conf        = round(min(97.0, max(50.0, conf + band_nudge)), 1)
+        # Stronger nudge toward real accuracy: triple the pull
+        band_nudge  = (band_acc - 0.55) * 30   # was *15, now *30
+        conf        = round(min(97.0, max(45.0, conf + band_nudge)), 1)
+
+    # Global shrinkage: learn ratio of real accuracy vs predicted confidence
+    # If we predicted 90% conf but only 50% were right, shrink future confs
+    _all_bands = [v for v in margin_acc.values() if v[1] >= 10]
+    if len(_all_bands) >= 3:
+        _avg_real = sum(v[0]/v[1] for v in _all_bands) / len(_all_bands)
+        # Midpoint predicted conf across buckets that have data
+        _conf_keys = [int(k) for k in margin_acc if margin_acc[k][1] >= 10]
+        _avg_pred  = sum(_conf_keys) / len(_conf_keys) / 100.0
+        if _avg_pred > 0:
+            _shrink = min(1.0, max(0.55, _avg_real / _avg_pred))
+            # Apply gradually: only 40% of shrinkage so we don't over-correct
+            conf = round(min(97.0, max(40.0, conf * (1.0 + (_shrink - 1.0) * 0.40))), 1)
 
     # ── Learning velocity bonus: recent 10 rounds doing better than overall? ──
     recent_10_acc = model.get("recent_10_acc", 0.0) if model else 0.0
@@ -3126,16 +3173,38 @@ def predict_match(home: str, away: str, stats: dict,
         if mm_pick and mm_pick == tip_outcome:
             conf = round(min(97.0, conf + 1.5), 1)
 
-    # ── Loss-streak risk protection ───────────────────────────────────────────
+    # ── Loss-streak risk protection (calibrated) ────────────────────────────
     if _bd_ref is not None:
-        _risk = _risk_control(_bd_ref)
+        _risk   = _risk_control(_bd_ref)
         _streak = _risk.get("loss_streak", 0)
         if _streak >= 3:
-            conf = round(max(40.0, conf - 20.0), 1)
-        if _streak >= 5 and tip_outcome != "DRAW":
+            conf = round(max(45.0, conf - 10.0), 1)   # gentle trim
+        if _streak >= 6 and tip_outcome != "DRAW":      # higher threshold
             tip         = "DRAW / CLOSE"
             icon        = "\U0001f91d"
             tip_outcome = "DRAW"
+
+    # ── Market rolling intelligence — adjust btts/o25 prediction confidence ─────
+    # Use last 200 match rolling accuracy per market to weight predictions.
+    _mroll_data = model.get("market_rolling", {}) if model else {}
+    def _mroll_acc(mk, min_n=20):
+        vals = _mroll_data.get(mk, [])
+        recent = vals[-100:] if len(vals) >= 100 else vals
+        if len(recent) < min_n:
+            return None
+        return sum(recent) / len(recent)
+
+    _btts_roll  = _mroll_acc("btts")
+    _o25_roll   = _mroll_acc("o25")
+    _1x2_roll   = _mroll_acc("1x2")
+    _dc_roll    = _mroll_acc("dc")
+
+    # If rolling 1X2 accuracy is well below random (< 28%), slight conf reduction
+    if _1x2_roll is not None and _1x2_roll < 0.28:
+        conf = round(max(40.0, conf - 5.0), 1)
+    # If rolling 1X2 is strong (> 40%), small boost
+    elif _1x2_roll is not None and _1x2_roll > 0.40:
+        conf = round(min(97.0, conf + 3.0), 1)
 
     # ── 9. Side markets — use odds if available, else blend stats + learned rates ─
     p  = hst["p"] or 1
@@ -6456,6 +6525,8 @@ def _get_model(bot_data: dict, league_id: int) -> dict:
         },
         # High-confidence mistake counter: wrong when conf >= 75
         "high_conf_mistakes": 0,
+        # Rolling per-market performance (last 200 matches each)
+        "market_rolling": {"1x2": [], "btts": [], "o25": [], "dc": []},
         # Learning velocity: accuracy per last 10 rounds (rolling window)
         "recent_10_correct": 0,
         "recent_10_total":   0,
@@ -6491,6 +6562,7 @@ def _get_model(bot_data: dict, league_id: int) -> dict:
             "AWAY": {"correct": 0, "total": 0},
         })
         m.setdefault("high_conf_mistakes", 0)
+        m.setdefault("market_rolling", {"1x2": [], "btts": [], "o25": [], "dc": []})
         m.setdefault("recent_10_correct", 0)
         m.setdefault("recent_10_total",   0)
         m.setdefault("recent_10_acc",     0.0)
@@ -8193,6 +8265,32 @@ def _learn_from_round(bot_data: dict, league_id: int,
         else:                   dc_res = "X2"
         if ah > 0 and aa > 0 and ft_out != "DRAW":
             dc_res = "12"
+
+        # ── Rolling market performance tracker ──────────────────────────────
+        # Track last 200 match outcomes per market so predict_match can see
+        # which markets are "hot" right now vs stale. List of 1 (correct) or 0.
+        if not is_bootstrap:
+            _mroll = model.setdefault("market_rolling", {
+                "1x2": [], "btts": [], "o25": [], "dc": []
+            })
+            for _mk in ("1x2", "btts", "o25", "dc"):
+                _mroll.setdefault(_mk, [])
+            # 1X2 — did the tip (if any) match ft_out?
+            if our_out:
+                _mroll["1x2"].append(1 if our_out == ft_out else 0)
+            # BTTS — actual BTTS result (1=both scored)
+            _mroll["btts"].append(1 if actual_btts else 0)
+            # O2.5 — actual over 2.5 result
+            _mroll["o25"].append(1 if actual_over else 0)
+            # DC — is the FT outcome covered by the cheapest DC option?
+            _mroll["dc"].append(1 if (
+                ft_out == "HOME" or ft_out == "DRAW"   # 1X covers both
+                or ft_out == "AWAY"                     # X2 / 12 also valid
+            ) else 0)   # DC almost always wins — track btts-assisted dc accuracy
+            # Keep max 200 per market (rolling window)
+            for _mk in ("1x2", "btts", "o25", "dc"):
+                if len(_mroll[_mk]) > 200:
+                    _mroll[_mk] = _mroll[_mk][-200:]
 
         # Use alphabetical canonical key — first team alphabetically is always "home"
         canon_parts = sorted([res["home"], res["away"]])
@@ -12069,6 +12167,25 @@ async def cmd_rawstatus(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await _do_rawstatus(u.message, c)
 
 
+
+def _rolling_market_line(model: dict) -> str:
+    """One-line rolling per-market accuracy for brainstat."""
+    mroll = model.get("market_rolling", {})
+    def _ra(mk):
+        vals = mroll.get(mk, [])[-100:]
+        if len(vals) < 10:
+            return "\u2014"
+        acc = sum(vals) / len(vals) * 100
+        bar = "\u2588" * int(acc / 10) + "\u2591" * (10 - int(acc / 10))
+        return bar + f"{acc:.0f}%"
+    r1 = _ra("1x2"); rb = _ra("btts"); ro = _ra("o25"); rd = _ra("dc")
+    if r1 == "\u2014" and rb == "\u2014":
+        return ""
+    return (
+        "\u2502 \U0001f4c8 Roll(100) 1X2:" + r1 + "  BTTS:" + rb
+        + "  O2.5:" + ro + "  DC:" + rd + "\n"
+    )
+
 async def _do_brainstat(message, c):
 
     def _training_score(model: dict) -> float:
@@ -12216,6 +12333,8 @@ async def _do_brainstat(message, c):
             + (f"│ 🔥 Sweet spot: ~{best_band}% confidence → {best_band_acc:.0%} correct\n" if best_band else "")
             + (f"│ ⚠️ High-conf mistakes: {hcm}\n" if hcm >= 3 else "")
             + f"│ ⚖️ Wts: Odds {w.get('odds',0):.0%}  Pois {w.get('poisson',0):.0%}  Str {w.get('strength',0):.0%}\n"
+            # Rolling market accuracy (last 100 matches)
+            + _rolling_market_line(model)
             # AI brain diagnostics
             + _ai_brain_status_line(model)
             # Algorithm reverse-engineering status
@@ -12291,15 +12410,15 @@ async def _do_brainstat(message, c):
             bar = "\u2588" * int(pct / 10) + "\u2591" * (10 - int(pct / 10))
             return f"  `{k:<5}` {bar} {pct:.0f}% ({c2}/{t})"
         mm_lines = "\n".join(_wline(k) for k in ("1x2", "ou", "btts", "htft", "dc"))
-        s_icon = "\U0001f7e2" if _streak == 0 else ("\U0001f7e1" if _streak < 3 else ("\U0001f534" if _streak < 5 else "\u26d4"))
+        s_icon = "\U0001f7e2" if _streak == 0 else ("\U0001f7e1" if _streak < 3 else ("\U0001f534" if _streak < 6 else "\u26d4"))
+        streak_note = (" \u2014 conf \u221210" if _streak >= 3 else "")
+        streak_note += (" \u2014 FORCED DRAW" if _streak >= 6 else "")
+        _sep26 = "\u2501" * 26
         mm_block = (
-            f"{'\u2501'*26}\n"
-            f"\U0001f4ca *Multi-Market Engine*\n"
-            f"{mm_lines}\n"
-            f"{s_icon} Loss streak: *{_streak}*"
-            + (" \u2014 conf \u221220%" if _streak >= 3 else "")
-            + (" \u2014 FORCED DRAW" if _streak >= 5 else "")
-            + "\n"
+            _sep26 + "\n"
+            + "\U0001f4ca *Multi-Market Engine*\n"
+            + mm_lines + "\n"
+            + s_icon + " Loss streak: *" + str(_streak) + "*" + streak_note + "\n"
         )
     else:
         mm_block = f"{'\u2501'*26}\n\U0001f4ca *Multi-Market Engine:* building\u2026\n"
