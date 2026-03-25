@@ -13344,8 +13344,6 @@ async def _do_backup_inner(message, c):
         "ml_weights":          bd.get("ml_weights", {}),
         "risk":                bd.get("risk", {}),
         "odds_store":          bd.get("odds_store", {}),
-        "ml_weights":          bd.get("ml_weights", {}),   # multi-market self-learning
-        "risk":                bd.get("risk", {}),          # loss-streak control
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -13357,6 +13355,8 @@ async def _do_backup_inner(message, c):
             "_match_log_built_v3":      bd.get("_match_log_built_v3",      False),
             "_clean_rebuild_v4":        bd.get("_clean_rebuild_v4",        False),
             "_ml_season_fixed_v5":      bd.get("_ml_season_fixed_v5",      False),
+            "_ml_season_fixed_v6":      bd.get("_ml_season_fixed_v6",      False),
+            "_ml_bootstrap_purge_v7":   bd.get("_ml_bootstrap_purge_v7",   False),
         },
     }
 
@@ -13980,6 +13980,25 @@ def _load_baked_data(bot_data: dict, baked: dict):
     if baked.get("risk"):
         bot_data["risk"] = baked["risk"]
         log.info(f"💾 Restored risk/loss_streak from baked data")
+
+    if baked.get("strategy_stats"):
+        bot_data["strategy_stats"] = baked["strategy_stats"]
+        log.info(f"💾 Restored strategy_stats from baked data")
+
+    if baked.get("odds_repeat_stats"):
+        bot_data["odds_repeat_stats"] = baked["odds_repeat_stats"]
+        log.info(f"💾 Restored odds_repeat_stats from baked data")
+
+    if baked.get("odds_store"):
+        bot_data["odds_store"] = baked["odds_store"]
+        log.info(f"💾 Restored odds_store from baked data")
+
+    if baked.get("pending_predictions"):
+        existing = bot_data.setdefault("pending_predictions", {})
+        for lid_str, rounds in baked["pending_predictions"].items():
+            existing.setdefault(lid_str, {}).update(rounds)
+        total_p = sum(len(r) for r in bot_data["pending_predictions"].values())
+        log.info(f"💾 Restored {total_p} pending prediction rounds from baked data")
 
     # Learned models — overwrite unless live pickle has strictly more rounds
     if baked.get("models"):
