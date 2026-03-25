@@ -4308,7 +4308,7 @@ def _evaluate_signal_trust(model: dict) -> dict:
     if tier_trapped:
         parts.append(f"⚠️ tier unreliable ({tier_acc:.0%}) → boosting odds")
     if not parts:
-        parts.append(f"✅ all signals healthy — odds={odds_acc:.0%if odds_acc else 'n/a'} fp={fp_acc:.0%if fp_acc else 'n/a'} tier={tier_acc:.0%if tier_acc else 'n/a'}")
+        parts.append(f"✅ all signals healthy — odds={f'{odds_acc:.0%}' if odds_acc else 'n/a'} fp={f'{fp_acc:.0%}' if fp_acc else 'n/a'} tier={f'{tier_acc:.0%}' if tier_acc else 'n/a'}")
     routing_reason = " | ".join(parts)
 
     state = {
