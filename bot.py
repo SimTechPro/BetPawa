@@ -2006,9 +2006,10 @@ async def fetch_completed_round(client, league_id: int):
                     sh, sa = _extract_score(sc)
                     if sh is not None and sa is not None and nm["home"] and nm["away"]:
                         fk = _fixture_key(nm["home"], nm["away"])
-                        prev_scores[fk]                          = (sh, sa)
-                        prev_scores[f"{nm['home']}|{nm['away']}"] = (sh, sa)
-                        prev_scores[f"{nm['away']}|{nm['home']}"] = (sa, sh)
+                        # Only store canonical home|away → (home_score, away_score).
+                        # Never store reversed key — it causes wrong score orientation
+                        # when the lookup falls through to the away|home variant.
+                        prev_scores[fk] = (sh, sa)
 
     log.info(f"✅ [{league_id}] fetch_completed_round {upcoming_id}: "
              f"{len(events)} events, with_odds={with_odds}/{len(events)}, "
@@ -11102,9 +11103,14 @@ async def _run_auto_post(bot, bot_data: dict):
                 # to show ✅/❌ results instead of ⏳ pending
                 if _prev_rid and _prev_scores:
                     _prev_sent_key = f"results_updated_{lid}_{_prev_rid}"
-                    if not bot_data.get(_prev_sent_key):
-                        bot_data[_prev_sent_key] = True
-                        # Store prev scores so send loop can update old messages
+                    _already_done  = bot_data.get(_prev_sent_key)
+                    # Check if sent_cards_ exist for this round (may be missing after redeploy)
+                    _cards_key_a   = f"sent_cards_{lid}_{_prev_rid}"
+                    _cards_key_b   = f"sent_cards_{str(lid)}_{str(_prev_rid)}"
+                    _stored_exists = bool(bot_data.get(_cards_key_a) or bot_data.get(_cards_key_b))
+                    # Re-queue if: never attempted OR cards were missing last time
+                    if not _already_done or not _stored_exists:
+                        # Guard is set ONLY after edit succeeds (inside result-edit block below)
                         bot_data.setdefault("pending_result_updates", {})
                         bot_data["pending_result_updates"][f"{lid}:{_prev_rid}"] = {
                             "lid":        lid,
@@ -11112,7 +11118,7 @@ async def _run_auto_post(bot, bot_data: dict):
                             "scores":     _prev_scores,
                         }
                         log.info(f"📊 Queued result update for lid={lid} prev_rid={_prev_rid} "
-                                 f"({len(_prev_scores)} scores)")
+                                 f"({len(_prev_scores)} scores) | cards={'FOUND' if _stored_exists else 'MISSING-will retry'}")
                 if not events or not round_id:
                     continue
 
@@ -11898,6 +11904,7 @@ async def _run_auto_post(bot, bot_data: dict):
                 continue
 
             _any_edited = False
+            _any_msg_ids_found = False
             for _ru_chat in _ru_targets:
                 _ru_chat_msgs = _ru_msg_ids.get(str(_ru_chat), {})
                 _mid_list = (
@@ -11905,6 +11912,10 @@ async def _run_auto_post(bot, bot_data: dict):
                     _ru_chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}") or
                     []
                 )
+                if not _mid_list:
+                    log.debug(f"result_update: no msg_ids for chat={_ru_chat} lid={_upd_lid} rid={_upd_rid} — cards present but IDs lost (redeploy?)")
+                    continue
+                _any_msg_ids_found = True
                 for idx, card_info in enumerate(_stored_cards):
                     if idx >= len(_mid_list):
                         break
@@ -11914,12 +11925,20 @@ async def _run_auto_post(bot, bot_data: dict):
                     _dyn_tip = card_info.get("dyn_tip", _tip)
                     _pmkt    = card_info.get("primary_mkt", "1x2")
                     fk = _fixture_key(_h, _a)
-                    score = (_upd_scores.get(fk) or
-                             _upd_scores.get(f"{_h}|{_a}") or
-                             _upd_scores.get(f"{_a}|{_h}"))
+                    # Try canonical home|away key first
+                    score = _upd_scores.get(fk) or _upd_scores.get(f"{_h}|{_a}")
+                    _score_reversed = False
+                    if not score:
+                        # Try reversed — but remember to swap scores back to card orientation
+                        score = _upd_scores.get(f"{_a}|{_h}")
+                        _score_reversed = True
                     if not score:
                         continue
                     sh, sa = score
+                    # If we matched via the reversed key, the stored tuple is (away_goals, home_goals)
+                    # relative to the card — swap back so sh=home_goals, sa=away_goals
+                    if _score_reversed:
+                        sh, sa = sa, sh
                     ft_out = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
                     _btts_actual = (sh > 0 and sa > 0)
                     _dc_covers = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
@@ -11961,17 +11980,23 @@ async def _run_auto_post(bot, bot_data: dict):
                                 _any_edited = True  # already updated — treat as done
 
             if _any_edited:
+                # Mark as done so we don't re-edit next tick
+                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
                 log.info(f"✅ Results updated for lid={_upd_lid} rid={_upd_rid}")
                 for _ci in _stored_cards:
                     _ci_h  = _ci.get("home","")
                     _ci_a  = _ci.get("away","")
                     _ci_pm = _ci.get("primary_mkt","1x2")
                     fk_ci  = _fixture_key(_ci_h, _ci_a)
-                    sc_ci  = (_upd_scores.get(fk_ci) or
-                               _upd_scores.get(f"{_ci_h}|{_ci_a}") or
-                               _upd_scores.get(f"{_ci_a}|{_ci_h}"))
+                    sc_ci  = _upd_scores.get(fk_ci) or _upd_scores.get(f"{_ci_h}|{_ci_a}")
+                    _ci_reversed = False
+                    if not sc_ci:
+                        sc_ci = _upd_scores.get(f"{_ci_a}|{_ci_h}")
+                        _ci_reversed = True
                     if sc_ci:
                         _sh_ci, _sa_ci = sc_ci
+                        if _ci_reversed:
+                            _sh_ci, _sa_ci = _sa_ci, _sh_ci  # re-orient to card home/away
                         _ft_ci = "HOME" if _sh_ci > _sa_ci else "AWAY" if _sa_ci > _sh_ci else "DRAW"
                         _os_snap = (bot_data.get("odds_store", {})
                                     .get(str(_upd_lid), {})
@@ -11980,6 +12005,12 @@ async def _run_auto_post(bot, bot_data: dict):
                                     .get("odds_snapshot", {}))
                         if _os_snap:
                             update_market_learning(bot_data, _ci_pm, _ft_ci, _os_snap)
+            # If we have stored cards but NO message IDs for any chat (lost on redeploy),
+            # we can't edit — mark done to stop infinite retrying and log clearly.
+            if not _any_edited and not _any_msg_ids_found and _stored_cards:
+                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
+                log.warning(f"⚠️ result_update: lid={_upd_lid} rid={_upd_rid} — cards exist but NO message IDs found "
+                            f"(message IDs lost on redeploy). Cannot edit. Marking done.")
             _processed_keys.append(_upd_key)
 
         for k in _processed_keys:
