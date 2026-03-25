@@ -736,7 +736,7 @@ def _get_best_markets(bot_data: dict, min_acc: float = 0.60) -> list[str]:
     ranked.sort(key=lambda x: -x[1])
     strong = [m for m, a in ranked if a >= min_acc]
     if not strong:
-        return ["dc", "btts"]
+        return ["1x2"]   # default — 1X2 is the baseline market; engine promotes others dynamically
     return strong
 
 
@@ -11658,7 +11658,7 @@ async def _run_auto_post(bot, bot_data: dict):
 
                     # ── Final card (Pro Card format) ──────────────────────────
                     # 1. Pick the strongest market dynamically
-                    _primary_mkt = get_primary_market(_best_mkts_now or ["dc", "btts"], bot_data)
+                    _primary_mkt = get_primary_market(_best_mkts_now or ["1x2"], bot_data)
                     # Pass fp_records so O/U picks the best line (1.5 / 2.5 / 3.5)
                     _fp_db_card = league_model.get("fingerprint_db", {})
                     _fk_card    = "|".join(sorted([m["home"], m["away"]]))
