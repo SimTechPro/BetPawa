@@ -11672,19 +11672,8 @@ async def _run_auto_post(bot, bot_data: dict):
                     # 3. Agreement totals
                     _agree_total_card = max(len(_best_mkts_now), 1)
 
-                    # 4. Build secondary market picks for the card
+                    # 4. No secondary markets — card shows only the single best pick
                     _extra_mkts_card = []
-                    for _sec_mkt in (_best_mkts_now or []):
-                        if _sec_mkt == _primary_mkt:
-                            continue  # already shown as primary
-                        try:
-                            _sec_tip, _ = get_final_pick(_sec_mkt, p, ev_odds, fp_records=_recs_card)
-                            if _sec_tip:
-                                _extra_mkts_card.append((_sec_mkt, _sec_tip))
-                        except Exception:
-                            pass
-                    # Cap at 2 secondary markets to keep card compact
-                    _extra_mkts_card = _extra_mkts_card[:2]
 
                     # 5. Build the clean card
                     _league_hdr_card = (
@@ -11871,11 +11860,158 @@ async def _run_auto_post(bot, bot_data: dict):
     brain_block = _brain_summary(bot_data)
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
 
+    # ── Update previously sent cards with results ──────────────────────────────
+    # Runs EVERY tick BEFORE any early-return so results always fire regardless of round state.
+    _pending_updates = bot_data.get("pending_result_updates", {})
+    if _pending_updates:
+        _ru_acc = _access(bot_data)
+        _ru_targets = set()
+        if ADMIN_ID: _ru_targets.add(str(ADMIN_ID))
+        if CHANNEL_ID: _ru_targets.add(str(CHANNEL_ID))
+        _ru_targets.update(str(x) for x in _ru_acc.get("allowed_channels", set()))
+        _ru_chats = bot_data.get("auto_chats", set())
+        for _rc in _ru_chats:
+            try:
+                _ruid = int(_rc)
+            except (ValueError, TypeError):
+                _ruid = 0
+            if _ruid < 0 or _is_authorized_user(_ruid, bot_data) or (ADMIN_ID and _ruid == ADMIN_ID):
+                _ru_targets.add(str(_rc))
+        _ru_msg_ids = bot_data.setdefault("auto_msg_ids", {})
+
+        _processed_keys = []
+        for _upd_key, _upd in list(_pending_updates.items()):
+            _upd_lid     = _upd.get("lid")
+            _upd_rid     = _upd.get("round_id")
+            _upd_scores  = _upd.get("scores", {})
+            if not _upd_scores:
+                _processed_keys.append(_upd_key)
+                continue
+
+            _lid_str_key = str(_upd_lid)
+            _rid_str_key = str(_upd_rid)
+
+            _stored_cards = (bot_data.get(f"sent_cards_{_lid_str_key}_{_rid_str_key}") or
+                             bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", []))
+            if not _stored_cards:
+                log.debug(f"result_update: no stored cards for lid={_upd_lid} rid={_upd_rid} — retrying")
+                continue
+
+            _any_edited = False
+            for _ru_chat in _ru_targets:
+                _ru_chat_msgs = _ru_msg_ids.get(str(_ru_chat), {})
+                _mid_list = (
+                    _ru_chat_msgs.get(f"{_lid_str_key}_prev_cards_{_rid_str_key}") or
+                    _ru_chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}") or
+                    []
+                )
+                for idx, card_info in enumerate(_stored_cards):
+                    if idx >= len(_mid_list):
+                        break
+                    _h = card_info.get("home", "")
+                    _a = card_info.get("away", "")
+                    _tip     = card_info.get("tip", "")
+                    _dyn_tip = card_info.get("dyn_tip", _tip)
+                    _pmkt    = card_info.get("primary_mkt", "1x2")
+                    fk = _fixture_key(_h, _a)
+                    score = (_upd_scores.get(fk) or
+                             _upd_scores.get(f"{_h}|{_a}") or
+                             _upd_scores.get(f"{_a}|{_h}"))
+                    if not score:
+                        continue
+                    sh, sa = score
+                    ft_out = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
+                    _btts_actual = (sh > 0 and sa > 0)
+                    _dc_covers = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
+                    if _dyn_tip in _dc_covers:
+                        ok = ft_out in _dc_covers[_dyn_tip]
+                    elif _pmkt == "btts" or _dyn_tip in ("BTTS YES", "BTTS NO", "BTTS"):
+                        ok = (_btts_actual == (_dyn_tip != "BTTS NO"))
+                    elif _pmkt == "ou" or "OVER" in str(_dyn_tip).upper() or "UNDER" in str(_dyn_tip).upper():
+                        _is_over = "OVER" in str(_dyn_tip).upper()
+                        try:
+                            _line = float(str(_dyn_tip).upper().replace("OVER","").replace("UNDER","").strip())
+                        except ValueError:
+                            _line = 2.5
+                        ok = ((sh + sa) > _line) == _is_over
+                    elif _pmkt == "htft" and "/" in str(_dyn_tip):
+                        _ft_char = _dyn_tip.split("/")[-1] if "/" in _dyn_tip else ""
+                        _ft_dir  = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(_ft_char)
+                        ok = (_ft_dir == ft_out) if _ft_dir else False
+                    else:
+                        tip_out = _dyn_tip.split()[0] if _dyn_tip else (_tip.split()[0] if _tip else "")
+                        ok = (tip_out == ft_out)
+                    result_edit_str = f"{'✅' if ok else '❌'} {sh}–{sa}"
+                    new_card = card_info.get("card_text", "").replace("⏳ pending", result_edit_str)
+                    if new_card and "⏳ pending" not in new_card:
+                        try:
+                            await bot.edit_message_text(
+                                chat_id=_ru_chat,
+                                message_id=_mid_list[idx],
+                                text=new_card,
+                                parse_mode="Markdown"
+                            )
+                            await asyncio.sleep(0.2)
+                            _any_edited = True
+                            log.info(f"✅ Result edit: lid={_upd_lid} rid={_upd_rid} {_h}v{_a} → {result_edit_str}")
+                        except Exception as exc:
+                            if "Message is not modified" not in str(exc):
+                                log.warning(f"result edit failed → {_ru_chat} lid={_upd_lid} {_h}v{_a}: {exc}")
+                            else:
+                                _any_edited = True  # already updated — treat as done
+
+            if _any_edited:
+                log.info(f"✅ Results updated for lid={_upd_lid} rid={_upd_rid}")
+                for _ci in _stored_cards:
+                    _ci_h  = _ci.get("home","")
+                    _ci_a  = _ci.get("away","")
+                    _ci_pm = _ci.get("primary_mkt","1x2")
+                    fk_ci  = _fixture_key(_ci_h, _ci_a)
+                    sc_ci  = (_upd_scores.get(fk_ci) or
+                               _upd_scores.get(f"{_ci_h}|{_ci_a}") or
+                               _upd_scores.get(f"{_ci_a}|{_ci_h}"))
+                    if sc_ci:
+                        _sh_ci, _sa_ci = sc_ci
+                        _ft_ci = "HOME" if _sh_ci > _sa_ci else "AWAY" if _sa_ci > _sh_ci else "DRAW"
+                        _os_snap = (bot_data.get("odds_store", {})
+                                    .get(str(_upd_lid), {})
+                                    .get(str(_upd_rid), {})
+                                    .get(fk_ci, {})
+                                    .get("odds_snapshot", {}))
+                        if _os_snap:
+                            update_market_learning(bot_data, _ci_pm, _ft_ci, _os_snap)
+            _processed_keys.append(_upd_key)
+
+        for k in _processed_keys:
+            _pending_updates.pop(k, None)
+
     # ── NEW ROUND — send one message per match card ───────────────────────────
     if round_key != prev_key:
         any_sent = False
         # Track which league+round combos were already sent this session
         _sent_map = bot_data.setdefault("auto_sent_per_league", {})
+
+        # Pre-build sent_cards_ metadata ONCE outside the per-chat loop so it
+        # persists even if a send fails for one chat, and is always ready for result edits.
+        for sec in sections:
+            _lid_str_pre  = str(sec["lid"])
+            _rid_str_pre  = str(sec["round_id"])
+            if _sent_map.get(_lid_str_pre) == _rid_str_pre:
+                continue
+            _cards_pre     = sec.get("match_cards", [])
+            _sec_preds_pre = sec.get("round_preds_ref", [])
+            bot_data[f"sent_cards_{_lid_str_pre}_{_rid_str_pre}"] = [
+                {
+                    "home":        pred.get("home", ""),
+                    "away":        pred.get("away", ""),
+                    "tip":         pred.get("tip", ""),
+                    "dyn_tip":     pred.get("dyn_tip", pred.get("tip", "")),
+                    "primary_mkt": pred.get("primary_mkt", "1x2"),
+                    "card_text":   _cards_pre[idx] if idx < len(_cards_pre) else "",
+                }
+                for idx, pred in enumerate(_sec_preds_pre)
+            ]
+
         for chat in send_targets:
             chat_msgs = msg_ids.setdefault(str(chat), {})
             try:
@@ -11897,24 +12033,7 @@ async def _run_auto_post(bot, bot_data: dict):
                         await asyncio.sleep(0.3)
                     chat_msgs[f"{sec['lid']}_cards"] = _mid_list
                     _sent_map[_lid_str] = _rid_str  # mark as sent
-
-                    # Store card info + message IDs for result update later
-                    # When previous round finishes, we edit these messages with ✅/❌
-                    # round_preds_ref is aligned 1:1 with match_cards (filtered only)
-                    _sec_preds = sec.get("round_preds_ref", [])
-                    bot_data[f"sent_cards_{_lid_str}_{_rid_str}"] = [
-                        {
-                            "home":        pred.get("home", ""),
-                            "away":        pred.get("away", ""),
-                            "tip":         pred.get("tip", ""),
-                            "dyn_tip":     pred.get("dyn_tip", pred.get("tip", "")),
-                            "primary_mkt": pred.get("primary_mkt", "1x2"),
-                            # card already contains header; _hdr is "" now
-                            "card_text":   _cards[i] if i < len(_cards) else "",
-                        }
-                        for i, pred in enumerate(_sec_preds)
-                    ]
-                    # Store THIS chat's message IDs under prev_cards key for result editing later
+                    # Store THIS chat's message IDs for result editing later
                     chat_msgs[f"{_lid_str}_prev_cards_{_rid_str}"] = _mid_list
 
                 any_sent = True
@@ -11962,136 +12081,7 @@ async def _run_auto_post(bot, bot_data: dict):
             log.info(f"✏️  Match cards updated with scores → {chat}")
         bot_data["auto_last_body"] = body_text
 
-    # ── Update previously sent cards with results ──────────────────────────────
-    # Runs EVERY tick so results always fire regardless of round state.
-    _pending_updates = bot_data.get("pending_result_updates", {})
-    if _pending_updates:
-        # Rebuild send_targets for result editing (same logic as below)
-        _ru_acc = _access(bot_data)
-        _ru_targets = set()
-        if ADMIN_ID: _ru_targets.add(str(ADMIN_ID))
-        if CHANNEL_ID: _ru_targets.add(str(CHANNEL_ID))
-        _ru_targets.update(str(x) for x in _ru_acc.get("allowed_channels", set()))
-        _ru_chats = bot_data.get("auto_chats", set())
-        for _rc in _ru_chats:
-            try:
-                _ruid = int(_rc)
-            except (ValueError, TypeError):
-                _ruid = 0
-            if _ruid < 0 or _is_authorized_user(_ruid, bot_data) or (ADMIN_ID and _ruid == ADMIN_ID):
-                _ru_targets.add(str(_rc))
-        _ru_msg_ids = bot_data.setdefault("auto_msg_ids", {})
 
-        _processed_keys = []
-        for _upd_key, _upd in list(_pending_updates.items()):
-            _upd_lid     = _upd.get("lid")
-            _upd_rid     = _upd.get("round_id")
-            _upd_scores  = _upd.get("scores", {})
-            if not _upd_scores:
-                _processed_keys.append(_upd_key)
-                continue
-
-            # Keys stored as both str and int — normalise
-            _lid_str_key = str(_upd_lid)
-            _rid_str_key = str(_upd_rid)
-
-            # Find stored cards for this league+round
-            _stored_cards = (bot_data.get(f"sent_cards_{_lid_str_key}_{_rid_str_key}") or
-                             bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", []))
-            if not _stored_cards:
-                # Not found yet — keep in queue, try again next tick
-                log.debug(f"result_update: no stored cards for lid={_upd_lid} rid={_upd_rid} — retrying")
-                continue
-
-            _any_edited = False
-            for _ru_chat in _ru_targets:
-                _ru_chat_msgs = _ru_msg_ids.get(str(_ru_chat), {})
-                # Try both int and str forms of lid/rid as keys
-                _mid_list = (
-                    _ru_chat_msgs.get(f"{_lid_str_key}_prev_cards_{_rid_str_key}") or
-                    _ru_chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}") or
-                    []
-                )
-                for idx, card_info in enumerate(_stored_cards):
-                    if idx >= len(_mid_list):
-                        break
-                    _h = card_info.get("home", "")
-                    _a = card_info.get("away", "")
-                    _tip     = card_info.get("tip", "")
-                    _dyn_tip = card_info.get("dyn_tip", _tip)
-                    _pmkt    = card_info.get("primary_mkt", "1x2")
-                    fk = _fixture_key(_h, _a)
-                    score = (_upd_scores.get(fk) or
-                             _upd_scores.get(f"{_h}|{_a}") or
-                             _upd_scores.get(f"{_a}|{_h}"))
-                    if not score:
-                        continue
-                    sh, sa = score
-                    ft_out = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
-                    _btts_actual = (sh > 0 and sa > 0)
-                    _dc_covers = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
-                    if _dyn_tip in _dc_covers:
-                        ok = ft_out in _dc_covers[_dyn_tip]
-                    elif _pmkt == "btts" or _dyn_tip in ("BTTS YES", "BTTS NO", "BTTS"):
-                        ok = (_btts_actual == (_dyn_tip != "BTTS NO"))
-                    elif _pmkt == "ou" or "OVER" in str(_dyn_tip).upper() or "UNDER" in str(_dyn_tip).upper():
-                        _is_over = "OVER" in str(_dyn_tip).upper()
-                        try:
-                            _line = float(str(_dyn_tip).upper().replace("OVER","").replace("UNDER","").strip())
-                        except ValueError:
-                            _line = 2.5
-                        ok = ((sh + sa) > _line) == _is_over
-                    elif _pmkt == "htft" and "/" in str(_dyn_tip):
-                        _ft_char = _dyn_tip.split("/")[-1] if "/" in _dyn_tip else ""
-                        _ft_dir  = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(_ft_char)
-                        ok = (_ft_dir == ft_out) if _ft_dir else False
-                    else:
-                        tip_out = _dyn_tip.split()[0] if _dyn_tip else (_tip.split()[0] if _tip else "")
-                        ok = (tip_out == ft_out)
-                    result_str = f"{'✅' if ok else '❌'} {sh}–{sa}"
-                    new_card = card_info.get("card_text", "").replace("⏳ pending", result_str)
-                    if new_card and new_card != card_info.get("card_text", ""):
-                        try:
-                            await bot.edit_message_text(
-                                chat_id=_ru_chat,
-                                message_id=_mid_list[idx],
-                                text=new_card,
-                                parse_mode="Markdown"
-                            )
-                            await asyncio.sleep(0.2)
-                            _any_edited = True
-                        except Exception as exc:
-                            if "Message is not modified" not in str(exc):
-                                log.warning(f"result edit failed → {_ru_chat} lid={_upd_lid}: {exc}")
-
-            if _any_edited:
-                log.info(f"✅ Results updated for lid={_upd_lid} rid={_upd_rid}")
-                # Also update market learning from the confirmed result
-                # This keeps ml_weights accurate even when prediction was from a prior session
-                for _ci in _stored_cards:
-                    _ci_h   = _ci.get("home","")
-                    _ci_a   = _ci.get("away","")
-                    _ci_dt  = _ci.get("dyn_tip","")
-                    _ci_pm  = _ci.get("primary_mkt","1x2")
-                    fk_ci   = _fixture_key(_ci_h, _ci_a)
-                    sc_ci   = (_upd_scores.get(fk_ci) or
-                                _upd_scores.get(f"{_ci_h}|{_ci_a}") or
-                                _upd_scores.get(f"{_ci_a}|{_ci_h}"))
-                    if sc_ci:
-                        _sh_ci, _sa_ci = sc_ci
-                        _ft_ci = "HOME" if _sh_ci > _sa_ci else "AWAY" if _sa_ci > _sh_ci else "DRAW"
-                        # Re-derive odds_snap from odds_store if available
-                        _os_snap = (bot_data.get("odds_store", {})
-                                    .get(str(_upd_lid), {})
-                                    .get(str(_upd_rid), {})
-                                    .get(fk_ci, {})
-                                    .get("odds_snapshot", {}))
-                        if _os_snap:
-                            update_market_learning(bot_data, _ci_pm, _ft_ci, _os_snap)
-            _processed_keys.append(_upd_key)
-
-        for k in _processed_keys:
-            _pending_updates.pop(k, None)
 
 
 async def _standings_job(context):
