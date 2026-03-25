@@ -8765,6 +8765,16 @@ def _learn_from_round(bot_data: dict, league_id: int,
         if ah > 0 and aa > 0 and ft_out != "DRAW":
             dc_res = "12"
 
+        # Use alphabetical canonical key — first team alphabetically is always "home"
+        canon_parts = sorted([res["home"], res["away"]])
+        fk          = "|".join(canon_parts)
+        canon_home  = canon_parts[0]   # alphabetically first = canonical home
+        is_flipped  = (res["home"] != canon_home)  # actual home was the "away" team
+
+        pred    = pred_map.get(fk) or pred_map.get(_fixture_key(res["home"], res["away"]), {})
+        # our_out MUST be defined here — before any block that references it
+        our_out = pred.get("tip", "").split()[0] if pred.get("tip") else None
+
         # ── Rolling market performance tracker ──────────────────────────────
         # Track last 200 match outcomes per market so predict_match can see
         # which markets are "hot" right now vs stale. List of 1 (correct) or 0.
@@ -8790,14 +8800,6 @@ def _learn_from_round(bot_data: dict, league_id: int,
             for _mk in ("1x2", "btts", "o25", "dc"):
                 if len(_mroll[_mk]) > 200:
                     _mroll[_mk] = _mroll[_mk][-200:]
-
-        # Use alphabetical canonical key — first team alphabetically is always "home"
-        canon_parts = sorted([res["home"], res["away"]])
-        fk          = "|".join(canon_parts)
-        canon_home  = canon_parts[0]   # alphabetically first = canonical home
-        is_flipped  = (res["home"] != canon_home)  # actual home was the "away" team
-
-        pred = pred_map.get(fk) or pred_map.get(_fixture_key(res["home"], res["away"]), {})
 
         # Saved odds snapshot
         odds_snap = pred.get("_odds_snapshot", {})
@@ -8995,7 +8997,6 @@ def _learn_from_round(bot_data: dict, league_id: int,
         _update_pattern_memory(model, res["home"], res["away"], ah, aa)
 
         # ── Cumulative stats ───────────────────────────────────────────────────
-        our_out = pred.get("tip", "").split()[0] if pred.get("tip") else None
         if our_out == ft_out:
             outcome_correct += 1
             cum["outcome_correct"] += 1
@@ -9012,8 +9013,8 @@ def _learn_from_round(bot_data: dict, league_id: int,
             _trap_imp_h = pred.get("prob_H", imp_h if "imp_h" in dir() else 0.45)
             _update_odds_trap(model, _trap_imp_h, our_out, ft_out)
 
-        if actual_btts  and pred.get("btts_pred", False) == actual_btts:  btts_correct  += 1
-        if actual_over  and pred.get("over25_pred", False) == actual_over: over25_correct += 1
+        if pred.get("btts_pred") is not None and pred.get("btts_pred") == actual_btts:  btts_correct  += 1
+        if pred.get("over25_pred") is not None and pred.get("over25_pred") == actual_over: over25_correct += 1
         if actual_btts:  cum["btts_count"]  += 1
         if actual_over:  cum["over25_count"] += 1
 
@@ -9128,8 +9129,10 @@ def _learn_from_round(bot_data: dict, league_id: int,
                     sa[sig_name]["correct"] += 1
 
         # ── Multi-market self-learning weight update ──────────────────────────
-        if not is_bootstrap and our_out and odds_snap:
-            update_market_learning(bot_data, our_out, ft_out, odds_snap)
+        # Use odds_snap if available; also accept any non-empty odds source
+        _mml_odds = odds_snap if (odds_snap and odds_snap.get("1x2")) else {}
+        if not is_bootstrap and our_out and _mml_odds:
+            update_market_learning(bot_data, our_out, ft_out, _mml_odds)
 
         # ── Loss-streak risk control tracker ─────────────────────────────────
         if not is_bootstrap and our_out:
@@ -11346,7 +11349,33 @@ async def _run_auto_post(bot, bot_data: dict):
 
                     if hs is not None and as_ is not None:
                         bp_t = "HOME" if hs > as_ else "AWAY" if hs < as_ else "DRAW"
-                        ok   = (our_t == bp_t)
+                        _btts_actual = (hs > 0 and as_ > 0)
+                        _over25_actual = (hs + as_) > 2
+                        # Market-aware outcome check
+                        _dc_covers = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
+                        if _dyn_tip in _dc_covers:
+                            ok = bp_t in _dc_covers[_dyn_tip]
+                        elif _primary_mkt == "btts" or _dyn_tip in ("BTTS YES","BTTS NO"):
+                            ok = (_btts_actual == (_dyn_tip != "BTTS NO"))
+                        elif _primary_mkt == "ou" or "OVER" in str(_dyn_tip).upper() or "UNDER" in str(_dyn_tip).upper():
+                            _is_over = "OVER" in str(_dyn_tip).upper()
+                            try:
+                                _line = float(str(_dyn_tip).upper().replace("OVER","").replace("UNDER","").strip())
+                            except ValueError:
+                                _line = 2.5
+                            ok = ((hs + as_) > _line) == _is_over
+                        elif _primary_mkt == "htft" and "/" in str(_dyn_tip):
+                            _ht_h2, _ht_a2 = _extract_ht_score(raw)
+                            if _ht_h2 is not None and _ht_a2 is not None:
+                                _s2 = lambda gh, ga: "1" if gh > ga else ("2" if gh < ga else "X")
+                                _actual_htft = f"{_s2(_ht_h2,_ht_a2)}/{_s2(hs,as_)}"
+                                ok = (_dyn_tip == _actual_htft)
+                            else:
+                                _ft_char = _dyn_tip.split("/")[-1] if "/" in _dyn_tip else ""
+                                _ft_dir  = {"1":"HOME","X":"DRAW","2":"AWAY"}.get(_ft_char)
+                                ok = (_ft_dir == bp_t) if _ft_dir else False
+                        else:
+                            ok = (our_t == bp_t)
                         if ok: agreed += 1
                         result_str = f"{'✅' if ok else '❌'} {hs}–{as_}"
                     else:
@@ -11626,9 +11655,11 @@ async def _run_auto_post(bot, bot_data: dict):
                     body += card + "\n"
                     match_cards.append(card)
                     display_preds.append({
-                        "home": m["home"],
-                        "away": m["away"],
-                        "tip":  p["tip"],
+                        "home":         m["home"],
+                        "away":         m["away"],
+                        "tip":          p["tip"],          # raw model tip (HOME/AWAY/DRAW)
+                        "dyn_tip":      _dyn_tip,          # displayed tip (1X / BTTS YES / Over 2.5 / etc)
+                        "primary_mkt":  _primary_mkt,      # market key: dc / btts / ou / htft / 1x2
                     })
 
                 if not body:
@@ -11816,10 +11847,12 @@ async def _run_auto_post(bot, bot_data: dict):
                     _sec_preds = sec.get("round_preds_ref", [])
                     bot_data[f"sent_cards_{_lid_str}_{_rid_str}"] = [
                         {
-                            "home":      pred.get("home", ""),
-                            "away":      pred.get("away", ""),
-                            "tip":       pred.get("tip", ""),
-                            "card_text": _hdr + _cards[i] if i < len(_cards) else "",
+                            "home":        pred.get("home", ""),
+                            "away":        pred.get("away", ""),
+                            "tip":         pred.get("tip", ""),          # raw model tip
+                            "dyn_tip":     pred.get("dyn_tip", pred.get("tip", "")),   # displayed tip
+                            "primary_mkt": pred.get("primary_mkt", "1x2"),             # market used
+                            "card_text":   _hdr + _cards[i] if i < len(_cards) else "",
                         }
                         for i, pred in enumerate(_sec_preds)
                     ]
@@ -11898,7 +11931,9 @@ async def _run_auto_post(bot, bot_data: dict):
                         break
                     _h = card_info.get("home", "")
                     _a = card_info.get("away", "")
-                    _tip = card_info.get("tip", "")
+                    _tip     = card_info.get("tip", "")           # raw model tip
+                    _dyn_tip = card_info.get("dyn_tip", _tip)     # displayed tip (1X / BTTS YES / Over 2.5 / etc)
+                    _pmkt    = card_info.get("primary_mkt", "1x2")
                     # Look up score
                     fk = _fixture_key(_h, _a)
                     score = (_upd_scores.get(fk) or
@@ -11908,8 +11943,28 @@ async def _run_auto_post(bot, bot_data: dict):
                         continue
                     sh, sa = score
                     ft_out = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
-                    tip_out = _tip.split()[0] if _tip else ""
-                    ok = (tip_out == ft_out)
+                    _btts_actual  = (sh > 0 and sa > 0)
+                    # Full market-aware outcome check
+                    _dc_covers = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
+                    if _dyn_tip in _dc_covers:
+                        ok = ft_out in _dc_covers[_dyn_tip]
+                    elif _pmkt == "btts" or _dyn_tip in ("BTTS YES", "BTTS NO", "BTTS"):
+                        ok = (_btts_actual == (_dyn_tip != "BTTS NO"))
+                    elif _pmkt == "ou" or "OVER" in str(_dyn_tip).upper() or "UNDER" in str(_dyn_tip).upper():
+                        _is_over = "OVER" in str(_dyn_tip).upper()
+                        try:
+                            _line = float(str(_dyn_tip).upper().replace("OVER","").replace("UNDER","").strip())
+                        except ValueError:
+                            _line = 2.5
+                        ok = ((sh + sa) > _line) == _is_over
+                    elif _pmkt == "htft" and "/" in str(_dyn_tip):
+                        # HT/FT: we don't have HT score here, check FT char only
+                        _ft_char = _dyn_tip.split("/")[-1] if "/" in _dyn_tip else ""
+                        _ft_dir  = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(_ft_char)
+                        ok = (_ft_dir == ft_out) if _ft_dir else False
+                    else:
+                        tip_out = _dyn_tip.split()[0] if _dyn_tip else (_tip.split()[0] if _tip else "")
+                        ok = (tip_out == ft_out)
                     result_str = f"{'✅' if ok else '❌'} {sh}–{sa}"
                     # Rebuild card with result replacing ⏳ pending
                     new_card = card_info.get("card_text", "").replace(
