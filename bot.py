@@ -663,7 +663,107 @@ def _ml_weights(bot_data: dict) -> dict:
         w.setdefault(k, {"correct": 1, "total": 2})
         w[k].setdefault("correct", 1)
         w[k].setdefault("total",   2)
+    # Ensure rolling history lists exist (for momentum engine)
+    _mh = bot_data.setdefault("market_history", {})
+    for k in ("1x2", "ou", "btts", "htft", "dc"):
+        _mh.setdefault(k, [])
     return w
+
+
+# ─── ADAPTIVE MARKET INTELLIGENCE ENGINE ─────────────────────────────────────
+
+def _get_market_form(bot_data: dict, market: str, window: int = 50) -> float:
+    """
+    Short/long-term market form: fraction of recent results that were correct.
+    Returns 0.5 (neutral) when insufficient data.
+    """
+    hist = bot_data.get("market_history", {}).get(market, [])
+    recent = hist[-window:] if hist else []
+    if len(recent) < 5:
+        return 0.5
+    return sum(recent) / len(recent)
+
+
+def _market_momentum(bot_data: dict, market: str) -> float:
+    """
+    Momentum = short-term form (last 50) minus long-term form (last 300).
+    +0.10 → HOT  |  -0.10 → COLD  |  ~0 → stable
+    """
+    short = _get_market_form(bot_data, market, 50)
+    long_  = _get_market_form(bot_data, market, 300)
+    return round(short - long_, 4)
+
+
+def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
+    """
+    Compute momentum-adjusted weights for all markets.
+    Hot markets (momentum > +0.08) get boosted; cold ones (< -0.08) are trimmed.
+    Returns a normalised dict summing to 1.0.
+    """
+    base = _ml_weights(bot_data)
+    adjusted: dict[str, float] = {}
+    for mkt, rec in base.items():
+        t   = max(rec.get("total", 2), 2)
+        c   = rec.get("correct", 1)
+        acc = c / t
+        mom = _market_momentum(bot_data, mkt)
+        weight = acc  # base weight = accuracy
+        if mom > 0.08:
+            weight *= 1.30   # 🔥 HOT — boost
+        elif mom > 0.04:
+            weight *= 1.12   # warming — mild boost
+        elif mom < -0.08:
+            weight *= 0.65   # ❄️ COLD — suppress
+        elif mom < -0.04:
+            weight *= 0.85   # cooling — mild suppress
+        adjusted[mkt] = max(0.01, weight)
+    total = sum(adjusted.values()) or 1.0
+    return {k: round(v / total, 4) for k, v in adjusted.items()}
+
+
+def _boost_conf_by_market_form(conf: float, market: str, bot_data: dict) -> float:
+    """
+    Adjust confidence based on how hot/cold this market is right now.
+    Strong form (+0.65) → +8 pts.  Weak form (<0.45) → -10 pts.
+    """
+    form = _get_market_form(bot_data, market, 50)
+    if form > 0.65:
+        conf += 8.0
+    elif form > 0.55:
+        conf += 3.0
+    elif form < 0.45:
+        conf -= 10.0
+    elif form < 0.52:
+        conf -= 4.0
+    return max(40.0, min(97.0, conf))
+
+
+def _weighted_market_agreement(signals: dict, bot_data: dict) -> float:
+    """
+    Weighted agreement score using dynamic momentum-adjusted weights.
+    Returns 0.0–1.0.  signals = {market_key: bool (agrees or not)}.
+    """
+    dyn = _dynamic_market_weights(bot_data)
+    score = total_w = 0.0
+    for mkt, agrees in signals.items():
+        w = dyn.get(mkt, 0.1)
+        total_w += w
+        if agrees:
+            score += w
+    return (score / total_w) if total_w > 0 else 0.0
+
+
+def _update_market_history(bot_data: dict, market: str, correct: bool) -> None:
+    """
+    Append a result to the rolling per-market history list (max 500 entries).
+    Called by update_market_learning after every result.
+    """
+    _mh = bot_data.setdefault("market_history", {})
+    _mh.setdefault(market, [])
+    _mh[market].append(1 if correct else 0)
+    # Keep only last 500 — small and reactive
+    if len(_mh[market]) > 500:
+        _mh[market] = _mh[market][-500:]
 
 
 def _risk_control(bot_data: dict) -> dict:
@@ -683,58 +783,56 @@ def _risk_control(bot_data: dict) -> dict:
 # Derived from real performance data:  DC=77% ✅  BTTS=75% ✅  1X2=51% ⚖️  O/U=50% ❌
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_best_markets(bot_data: dict, min_acc: float = 0.60) -> list[str]:
+def _get_best_markets(bot_data: dict, min_acc: float = 0.58) -> list[str]:
     """
-    SYSTEM 1 — Dynamic Market Selection.
-    Auto-select markets whose real tracked accuracy >= min_acc.
-    Seeds from cumulative league data when ml_weights has few samples,
-    so DC and BTTS are used from the start based on historical accuracy.
-    Returns ordered list of market keys (best first).
+    SYSTEM 1 — Dynamic Market Selection with Momentum.
+    Uses momentum-adjusted weights (not raw accuracy) to rank markets.
+    A market that is historically good BUT trending cold gets demoted.
+    A market that is rising above its average gets promoted.
+    Falls back to ["dc", "btts"] when insufficient data.
     """
-    weights = _ml_weights(bot_data)
-    ranked = []
-    for mkt, rec in weights.items():
-        t = max(rec.get("total", 2), 2)
-        c = rec.get("correct", 1)
-        acc = c / t
-        if t >= 5:   # trust after 5 real samples
-            ranked.append((mkt, acc))
+    weights    = _ml_weights(bot_data)
+    dyn_w      = _dynamic_market_weights(bot_data)
+    ranked     = []
 
-    # Seed from cumulative league model data when ml_weights is still fresh.
-    # Averages BTTS/O2.5 accuracy across all active leagues to bootstrap selection.
-    _wts_total = sum(max(rec.get("total",2),2) for rec in weights.values())
-    if _wts_total < 35:   # ml_weights not yet established
+    for mkt, rec in weights.items():
+        t   = max(rec.get("total", 2), 2)
+        c   = rec.get("correct", 1)
+        acc = c / t
+        mom = _market_momentum(bot_data, mkt)
+        # Effective accuracy = cumulative accuracy boosted/penalised by momentum
+        eff_acc = acc + mom * 0.5   # momentum shifts effective acc
+        if t >= 5:
+            ranked.append((mkt, eff_acc, dyn_w.get(mkt, acc)))
+
+    # Seed from cumulative league data when ml_weights is still fresh
+    _wts_total = sum(max(rec.get("total", 2), 2) for rec in weights.values())
+    if _wts_total < 35:
         _btts_accs, _o25_accs, _dc_accs = [], [], []
         for _lid_key in (7794, 7795, 7796, 9183, 9184, 13773, 13774):
-            _m = bot_data.get(f"model_{_lid_key}", {})
+            _m   = bot_data.get(f"model_{_lid_key}", {})
             _cum = _m.get("cumulative", {})
             _bt  = _cum.get("btts_total", 0)
             _bc  = _cum.get("btts_correct", 0)
             _ot  = _cum.get("over25_total", 0)
             _oc  = _cum.get("over25_correct", 0)
             _mt  = _cum.get("matches_total", 0)
-            if _bt  >= 50: _btts_accs.append(_bc / _bt)
-            if _ot  >= 50: _o25_accs.append(_oc / _ot)
-            # DC wins roughly = home_wins + draws (1X covers both)
             _hw  = _cum.get("home_wins", 0)
             _dw  = _cum.get("draws", 0)
-            _aw  = _cum.get("away_wins", 0)
-            if _mt >= 50: _dc_accs.append((_hw + _dw) / _mt)  # 1X covers ~70%
-        if _btts_accs:
-            _avg_btts = sum(_btts_accs) / len(_btts_accs)
-            if _avg_btts >= min_acc and "btts" not in [m for m,_ in ranked]:
-                ranked.append(("btts", _avg_btts))
-        if _o25_accs:
-            _avg_o25 = sum(_o25_accs) / len(_o25_accs)
-            if _avg_o25 >= min_acc and "ou" not in [m for m,_ in ranked]:
-                ranked.append(("ou", _avg_o25))
-        if _dc_accs:
-            _avg_dc = sum(_dc_accs) / len(_dc_accs)
-            if _avg_dc >= min_acc and "dc" not in [m for m,_ in ranked]:
-                ranked.append(("dc", _avg_dc))
+            if _bt >= 50: _btts_accs.append(_bc / _bt)
+            if _ot >= 50: _o25_accs.append(_oc / _ot)
+            if _mt >= 50: _dc_accs.append((_hw + _dw) / _mt)
+        _known = {m for m, _, _ in ranked}
+        if _btts_accs and "btts" not in _known:
+            ranked.append(("btts", sum(_btts_accs)/len(_btts_accs), 0.25))
+        if _o25_accs and "ou" not in _known:
+            ranked.append(("ou",   sum(_o25_accs)/len(_o25_accs),   0.15))
+        if _dc_accs and "dc" not in _known:
+            ranked.append(("dc",   sum(_dc_accs)/len(_dc_accs),     0.25))
 
-    ranked.sort(key=lambda x: -x[1])
-    strong = [m for m, a in ranked if a >= min_acc]
+    # Sort: primary = dynamic weight (momentum-adjusted), secondary = eff_acc
+    ranked.sort(key=lambda x: (-x[2], -x[1]))
+    strong = [m for m, eff, _ in ranked if eff >= min_acc]
     if not strong:
         return ["dc", "btts"]
     return strong
@@ -743,22 +841,25 @@ def _get_best_markets(bot_data: dict, min_acc: float = 0.60) -> list[str]:
 def _compute_real_confidence(market_key: str, bot_data: dict,
                               league_acc: float, raw_conf: float) -> float:
     """
-    SYSTEM 2 — Real Confidence Engine.
-    Replaces inflated fake confidence with blended real accuracy:
-      60% = market accuracy for this pick type
-      40% = league accuracy (how well bot does in this league)
-    Only applied when enough data is available; otherwise raw_conf is returned.
+    SYSTEM 2 — Real Confidence Engine with Momentum Boost.
+    Blends market accuracy, league accuracy, and market form/momentum:
+      50% = market accuracy (cumulative)
+      30% = league accuracy
+      20% = short-term market form (momentum signal)
+    Then applies momentum-based +/- adjustment on top.
     """
     weights = _ml_weights(bot_data)
     rec = weights.get(market_key, {"correct": 1, "total": 2})
     t   = max(rec.get("total", 2), 2)
     if t < 5:
-        # Not enough data — return raw confidence unchanged
         return raw_conf
-    mkt_acc = rec["correct"] / t
-    real_conf = (mkt_acc * 0.60 + league_acc * 0.40) * 100
+    mkt_acc  = rec["correct"] / t
+    form     = _get_market_form(bot_data, market_key, 50)
+    real_conf = (mkt_acc * 0.50 + league_acc * 0.30 + form * 0.20) * 100
     # Blend: 70% real, 30% model — never discard model signal completely
     blended = round(real_conf * 0.70 + raw_conf * 0.30, 1)
+    # Apply momentum boost/penalty on top
+    blended = _boost_conf_by_market_form(blended, market_key, bot_data)
     return max(45.0, min(97.0, blended))
 
 
@@ -897,13 +998,13 @@ def _detect_trap_match(
 
 def _market_agreement_count(ev_odds: dict, pick: str, bot_data: dict) -> tuple[int, list[str]]:
     """
-    SYSTEM 5 — Multi-Market Agreement Gate.
-    Count how many STRONG markets (≥60% accuracy) all point to the same direction.
-    Returns (agreement_count, list_of_agreeing_market_names).
-    Require ≥ 2 strong markets to agree before treating as a high-value pick.
+    SYSTEM 5 — Weighted Multi-Market Agreement Gate.
+    Uses dynamic momentum weights instead of binary counting.
+    Returns (weighted_agreement_score_as_int, list_of_agreeing_market_names).
+    A weighted score >= 0.55 indicates strong multi-market consensus.
     """
-    best_mkts = _get_best_markets(bot_data, min_acc=0.60)
-    agreeing  = []
+    best_mkts = _get_best_markets(bot_data, min_acc=0.55)
+    agreeing: list[str] = {}   # market → agrees (bool)
 
     # 1X2
     o1x2 = ev_odds.get("1x2", {})
@@ -911,8 +1012,7 @@ def _market_agreement_count(ev_odds: dict, pick: str, bot_data: dict) -> tuple[i
         try:
             fav = min(o1x2, key=lambda k: float(o1x2[k]))
             _dir = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(fav)
-            if _dir == pick:
-                agreeing.append("1x2")
+            agreeing["1x2"] = (_dir == pick)
         except (TypeError, ValueError):
             pass
 
@@ -921,24 +1021,20 @@ def _market_agreement_count(ev_odds: dict, pick: str, bot_data: dict) -> tuple[i
     if "dc" in best_mkts and dc:
         try:
             best_dc = min(dc, key=lambda k: float(dc[k]))
-            covers  = {"1X": ("HOME", "DRAW"), "X2": ("DRAW", "AWAY"), "12": ("HOME", "AWAY")}
-            if pick in covers.get(best_dc, ()):
-                agreeing.append("dc")
+            covers  = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
+            agreeing["dc"] = (pick in covers.get(best_dc, ()))
         except (TypeError, ValueError):
             pass
 
-    # BTTS — agrees with non-draw picks when BTTS Yes is cheap (both teams expected to score)
+    # BTTS
     btts = ev_odds.get("btts", {})
     if "btts" in best_mkts and btts:
         try:
             yes = float(btts.get("Yes", 99))
             no  = float(btts.get("No", 99))
-            if yes < no and pick in ("HOME", "AWAY"):
-                # Both teams score → not a one-team walkover, agree if confident side
-                agreeing.append("btts")
-            elif no < yes and pick in ("HOME", "AWAY"):
-                # One team shuts out → clean sheet → still a directional win
-                agreeing.append("btts")
+            # BTTS Yes → both teams score → directional pick still valid
+            # BTTS No  → clean sheet likely → stronger directional pick
+            agreeing["btts"] = pick in ("HOME", "AWAY")
         except (TypeError, ValueError):
             pass
 
@@ -949,24 +1045,26 @@ def _market_agreement_count(ev_odds: dict, pick: str, bot_data: dict) -> tuple[i
             best_h = min(htft.items(), key=lambda x: x[1])[0]
             ft_char = best_h.split("/")[-1] if "/" in best_h else ""
             _ft_dir = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(ft_char)
-            if _ft_dir == pick:
-                agreeing.append("htft")
+            agreeing["htft"] = (_ft_dir == pick)
         except (TypeError, ValueError, StopIteration):
             pass
 
-    # O/U — agrees with "decisive win" picks when low-scoring games expected (clear winner)
+    # O/U
     ou = ev_odds.get("ou", [])
     if "ou" in best_mkts and ou:
         try:
             over_p, under_p = _ou25_from_odds(ou)
             if over_p and under_p:
-                if under_p < over_p and pick in ("HOME", "AWAY"):
-                    # Likely low scoring (Under favoured) → clean result expected
-                    agreeing.append("ou")
+                agreeing["ou"] = (under_p < over_p and pick in ("HOME", "AWAY"))
         except (TypeError, ValueError):
             pass
 
-    return len(agreeing), agreeing
+    # Build weighted agreement score
+    agree_list = [m for m, ag in agreeing.items() if ag]
+    wscore = _weighted_market_agreement(agreeing, bot_data)
+    # Return int count for backward compat, plus agreeing list
+    agree_count = max(len(agree_list), int(wscore * 3))
+    return agree_count, agree_list
 
 
 
@@ -1253,13 +1351,11 @@ def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
     """
     if bot_data is None:
         bot_data = {}
-    weights = _ml_weights(bot_data)
+    # Use momentum-adjusted dynamic weights instead of raw accuracy
+    _dyn_w = _dynamic_market_weights(bot_data)
 
     def w(key: str) -> float:
-        rec = weights.get(key, {"correct": 1, "total": 2})
-        t   = max(rec.get("total", 2), 2)
-        c   = rec.get("correct", 1)
-        return (c / t) * 3.0
+        return _dyn_w.get(key, 0.1) * 3.0
 
     score: dict[str, float] = {"HOME": 0.0, "DRAW": 0.0, "AWAY": 0.0}
     used: list[str] = []
@@ -1414,6 +1510,49 @@ def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: di
                 _update("dc", actual in ("AWAY", "DRAW"))
             elif best == "12":
                 _update("dc", actual in ("HOME", "AWAY"))
+        except (TypeError, ValueError, StopIteration):
+            pass
+
+    # ── Also update rolling history for momentum engine ─────────────────────
+    # Re-evaluate each market's binary outcome now that actual is known
+    _hist_o1x2 = odds.get("1x2", {})
+    if _hist_o1x2:
+        try:
+            _hfav = min(_hist_o1x2, key=lambda k: _hist_o1x2[k])
+            _hmapped = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(_hfav)
+            if _hmapped:
+                _update_market_history(bot_data, "1x2", _hmapped == actual)
+        except (TypeError, ValueError):
+            pass
+    _hist_ou_o, _hist_ou_u = _ou25_from_odds(odds.get("ou", []))
+    if _hist_ou_o is not None and _hist_ou_u is not None:
+        _update_market_history(bot_data, "ou", (_hist_ou_u < _hist_ou_o) == (actual == "DRAW"))
+    _hist_btts = odds.get("btts", {})
+    if _hist_btts:
+        try:
+            _hy = _hist_btts.get("Yes"); _hn = _hist_btts.get("No")
+            if _hy and _hn:
+                _update_market_history(bot_data, "btts", (float(_hy) < float(_hn)) == (actual != "DRAW"))
+        except (TypeError, ValueError):
+            pass
+    _hist_htft = odds.get("htft", {})
+    if _hist_htft:
+        try:
+            _hbest  = min(_hist_htft.items(), key=lambda x: x[1])[0]
+            _hftc   = _hbest.split("/")[-1] if "/" in _hbest else ""
+            _hftmap = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(_hftc)
+            if _hftmap:
+                _update_market_history(bot_data, "htft", _hftmap == actual)
+        except (TypeError, ValueError, StopIteration):
+            pass
+    _hist_dc = odds.get("dc", {})
+    if _hist_dc:
+        try:
+            _hdc = min(_hist_dc.items(), key=lambda x: x[1])[0]
+            _hdc_ok = ((_hdc == "1X" and actual in ("HOME","DRAW")) or
+                       (_hdc == "X2" and actual in ("AWAY","DRAW")) or
+                       (_hdc == "12" and actual in ("HOME","AWAY")))
+            _update_market_history(bot_data, "dc", _hdc_ok)
         except (TypeError, ValueError, StopIteration):
             pass
 
@@ -11340,20 +11479,32 @@ async def _run_auto_post(bot, bot_data: dict):
                 if _prev_rid and _prev_scores:
                     _prev_sent_key = f"results_updated_{lid}_{_prev_rid}"
                     _already_done  = bot_data.get(_prev_sent_key)
-                    # Check if sent_cards_ exist for this round (may be missing after redeploy)
-                    _cards_key_a   = f"sent_cards_{lid}_{_prev_rid}"
-                    _cards_key_b   = f"sent_cards_{str(lid)}_{str(_prev_rid)}"
-                    _stored_exists = bool(bot_data.get(_cards_key_a) or bot_data.get(_cards_key_b))
-                    # Re-queue if: never attempted OR cards were missing last time
+                    # The sent_cards are keyed by the PREDICTED (upcoming) round_id,
+                    # NOT by prev_rid. Find the right key by checking auto_sent_per_league
+                    # and scanning all sent_cards_ keys for this league.
+                    _card_rid_for_update = ""
+                    # 1. Check auto_sent_per_league — the last sent round for this league
+                    _asm = bot_data.get("auto_sent_per_league", {})
+                    _asm_rid = _asm.get(str(lid), "")
+                    if _asm_rid and bot_data.get(f"sent_cards_{lid}_{_asm_rid}"):
+                        _card_rid_for_update = _asm_rid
+                    # 2. Scan all sent_cards_ keys for this league as fallback
+                    if not _card_rid_for_update:
+                        for _sk in bot_data:
+                            if _sk.startswith(f"sent_cards_{lid}_") and bot_data[_sk]:
+                                _card_rid_for_update = _sk.replace(f"sent_cards_{lid}_", "")
+                                break
+                    _stored_exists = bool(_card_rid_for_update)
                     if not _already_done or not _stored_exists:
-                        # Guard is set ONLY after edit succeeds (inside result-edit block below)
                         bot_data.setdefault("pending_result_updates", {})
                         bot_data["pending_result_updates"][f"{lid}:{_prev_rid}"] = {
                             "lid":        lid,
                             "round_id":   _prev_rid,
+                            "card_rid":   _card_rid_for_update,   # ← round whose cards to edit
                             "scores":     _prev_scores,
                         }
-                        log.info(f"📊 Queued result update for lid={lid} prev_rid={_prev_rid} "
+                        log.info(f"📊 Queued result update for lid={lid} "
+                                 f"prev_rid={_prev_rid} card_rid={_card_rid_for_update} "
                                  f"({len(_prev_scores)} scores) | cards={'FOUND' if _stored_exists else 'MISSING-will retry'}")
                 if not events or not round_id:
                     continue
@@ -11483,6 +11634,10 @@ async def _run_auto_post(bot, bot_data: dict):
                     _real_conf = _compute_real_confidence(
                         _conf_market_key, bot_data, _league_acc, p_conf_adj
                     )
+                    # Additional momentum boost applied to the primary market of this card
+                    _primary_mkt_early = "dc" if "dc" in _best_mkts_now else (
+                                          "btts" if "btts" in _best_mkts_now else "1x2")
+                    _real_conf = _boost_conf_by_market_form(_real_conf, _primary_mkt_early, bot_data)
 
                     # ── SYSTEM 5: Market Agreement Gate ──────────────────────
                     _tip_for_agreement = _tip_g   # HOME or AWAY
@@ -12130,13 +12285,29 @@ async def _run_auto_post(bot, bot_data: dict):
                 _processed_keys.append(_upd_key)
                 continue
 
-            _lid_str_key = str(_upd_lid)
-            _rid_str_key = str(_upd_rid)
+            _lid_str_key  = str(_upd_lid)
+            _rid_str_key  = str(_upd_rid)
+            # card_rid is the round whose cards were actually sent (may differ from prev_rid)
+            _card_rid_key = str(_upd.get("card_rid", "") or _rid_str_key)
 
-            _stored_cards = (bot_data.get(f"sent_cards_{_lid_str_key}_{_rid_str_key}") or
-                             bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", []))
+            # Try card_rid first, then prev_rid, then scan all keys for this league
+            _stored_cards = (
+                bot_data.get(f"sent_cards_{_lid_str_key}_{_card_rid_key}") or
+                bot_data.get(f"sent_cards_{_lid_str_key}_{_rid_str_key}") or
+                bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", [])
+            )
+            # Last resort: scan all sent_cards_ for this league
             if not _stored_cards:
-                log.debug(f"result_update: no stored cards for lid={_upd_lid} rid={_upd_rid} — retrying")
+                for _sk2 in list(bot_data.keys()):
+                    if _sk2.startswith(f"sent_cards_{_upd_lid}_") and bot_data[_sk2]:
+                        _stored_cards  = bot_data[_sk2]
+                        _card_rid_key  = _sk2.replace(f"sent_cards_{_upd_lid}_", "")
+                        log.info(f"result_update: found cards via scan {_sk2}")
+                        break
+            if not _stored_cards:
+                log.info(f"result_update: no stored cards for lid={_upd_lid} "
+                         f"prev_rid={_upd_rid} card_rid={_card_rid_key} — retrying next tick. "
+                         f"Available: {[k for k in bot_data if k.startswith('sent_cards_')]}")
                 continue
 
             _any_edited = False
@@ -12144,12 +12315,16 @@ async def _run_auto_post(bot, bot_data: dict):
             for _ru_chat in _ru_targets:
                 _ru_chat_msgs = _ru_msg_ids.get(str(_ru_chat), {})
                 _mid_list = (
+                    _ru_chat_msgs.get(f"{_lid_str_key}_prev_cards_{_card_rid_key}") or
                     _ru_chat_msgs.get(f"{_lid_str_key}_prev_cards_{_rid_str_key}") or
                     _ru_chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}") or
+                    _ru_chat_msgs.get(f"{_lid_str_key}_cards") or
                     []
                 )
                 if not _mid_list:
-                    log.debug(f"result_update: no msg_ids for chat={_ru_chat} lid={_upd_lid} rid={_upd_rid} — cards present but IDs lost (redeploy?)")
+                    log.info(f"result_update: no msg_ids for chat={_ru_chat} lid={_upd_lid} "
+                             f"card_rid={_card_rid_key} prev_rid={_upd_rid} — "
+                             f"available keys: {list(_ru_chat_msgs.keys())[:8]}")
                     continue
                 _any_msg_ids_found = True
                 for idx, card_info in enumerate(_stored_cards):
@@ -12299,6 +12474,8 @@ async def _run_auto_post(bot, bot_data: dict):
                         _mid_list.append(sent.message_id)
                         await asyncio.sleep(0.3)
                     chat_msgs[f"{sec['lid']}_cards"] = _mid_list
+                    # Also store under the precise round key for result update lookup
+                    chat_msgs[f"{_lid_str}_prev_cards_{_rid_str}"] = _mid_list
                     _sent_map[_lid_str] = _rid_str  # mark as sent
                     # Store THIS chat's message IDs for result editing later
                     chat_msgs[f"{_lid_str}_prev_cards_{_rid_str}"] = _mid_list
@@ -13411,14 +13588,21 @@ async def _do_brainstat(message, c):
     _risk  = c.bot_data.get("risk", {})
     _streak = _risk.get("loss_streak", 0)
     if _wts:
+        _dyn_w_display = _dynamic_market_weights(c.bot_data)
         def _wline(k):
-            rec = _wts.get(k, {"correct": 1, "total": 2})
-            t   = max(rec.get("total", 2), 2)
-            c2  = rec.get("correct", 1)
-            pct = c2 / t * 100
-            bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+            rec  = _wts.get(k, {"correct": 1, "total": 2})
+            t    = max(rec.get("total", 2), 2)
+            c2   = rec.get("correct", 1)
+            pct  = c2 / t * 100
+            bar  = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
             flag = " ✅" if pct >= 60 else (" ⚖️" if pct >= 50 else " ❌")
-            return f"  `{k:<5}` {bar} {pct:.0f}% ({c2}/{t}){flag}"
+            mom  = _market_momentum(c.bot_data, k)
+            form = _get_market_form(c.bot_data, k, 50)
+            mom_icon = " 🔥" if mom > 0.08 else (" 📈" if mom > 0.03 else
+                        (" ❄️" if mom < -0.08 else (" 📉" if mom < -0.03 else "")))
+            dyn_pct = _dyn_w_display.get(k, 0) * 100
+            return (f"  `{k:<5}` {bar} {pct:.0f}%({c2}/{t}){flag}{mom_icon}"
+                    f"  form={form:.0%}  dynW={dyn_pct:.0f}%")
         mm_lines = "\n".join(_wline(k) for k in ("1x2", "ou", "btts", "htft", "dc"))
 
         # Dynamic market selection — show what the bot would choose TODAY
