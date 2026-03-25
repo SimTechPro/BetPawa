@@ -736,7 +736,7 @@ def _get_best_markets(bot_data: dict, min_acc: float = 0.60) -> list[str]:
     ranked.sort(key=lambda x: -x[1])
     strong = [m for m, a in ranked if a >= min_acc]
     if not strong:
-        return ["1x2"]   # default — 1X2 is the baseline market; engine promotes others dynamically
+        return ["dc", "btts"]
     return strong
 
 
@@ -3370,32 +3370,38 @@ def predict_match(home: str, away: str, stats: dict,
         else:
             live_acc[sig] = {"odds": 0.45, "poisson": 0.38, "strength": 0.36}.get(sig, 0.38)
 
-    # ── Adaptive signal weights (auto-calibrated from live accuracy) ────────
-    # Instead of hardcoding 92% odds weight, we let each signal earn its share
-    # based on actual accuracy.  Bounds: odds 40-75%, poisson 10-35%, str 10-35%.
-    # With <50 cumulative matches we start at balanced priors, then let data decide.
+    # ── Adaptive signal weights — driven by live Dynamic Signal Trust Router ──
+    # _evaluate_signal_trust reads current trap state, per-signal accuracy,
+    # and returns weights that reflect what is ACTUALLY working right now.
+    # This replaces the static accuracy-proportional clamp that always kept
+    # odds dominant even when it was consistently wrong.
+    _trust = _evaluate_signal_trust(model) if model else {}
+    _t_odds = _trust.get("trust_odds", 0.60)
+
     odds_acc = live_acc["odds"]
     pois_acc = live_acc["poisson"]
     str_acc  = live_acc["strength"]
 
     if cum_total >= 50:
-        # Scale raw accuracies relative to each other
-        _total_acc = (odds_acc + pois_acc + str_acc) or 1.0
-        _raw_odds  = odds_acc / _total_acc
-        _raw_pois  = pois_acc / _total_acc
-        _raw_str   = str_acc  / _total_acc
-        # Clamp to sensible bounds: odds 40-75%, poisson 10-35%, strength 10-35%
-        w_odds     = max(0.40, min(0.75, _raw_odds))
-        w_poisson  = max(0.10, min(0.35, _raw_pois))
-        w_strength = max(0.10, min(0.35, _raw_str))
-        # Re-normalise so they sum to 1.0
+        # Scale poisson/strength relative to each other within the non-odds budget
+        _non_odds_budget = 1.0 - _t_odds
+        _pois_str_total  = (pois_acc + str_acc) or 1.0
+        _raw_pois = pois_acc / _pois_str_total
+        _raw_str  = str_acc  / _pois_str_total
+        w_odds     = max(0.30, min(0.82, _t_odds))
+        w_poisson  = max(0.08, min(0.40, _raw_pois * _non_odds_budget))
+        w_strength = max(0.08, min(0.40, _raw_str  * _non_odds_budget))
         _wsum = w_odds + w_poisson + w_strength or 1.0
         w_odds     /= _wsum
         w_poisson  /= _wsum
         w_strength /= _wsum
     else:
-        # Prior: odds=60%, poisson=20%, strength=20%  (balanced until data is ready)
-        w_odds, w_poisson, w_strength = 0.60, 0.20, 0.20
+        # Prior: use trust router even early — but cap at 60% odds until data is ready
+        w_odds     = min(0.60, _t_odds)
+        w_poisson  = 0.20
+        w_strength = 0.20
+        _wsum = w_odds + w_poisson + w_strength or 1.0
+        w_odds /= _wsum; w_poisson /= _wsum; w_strength /= _wsum
 
     # ── 1. betPawa odds → implied probabilities (primary signal) ─────────────
     odds_probs = _odds_implied_probs(odds)
@@ -3542,6 +3548,64 @@ def predict_match(home: str, away: str, stats: dict,
             hw += _trap_a * 0.5; dw += _trap_a * 0.5
         _t = hw + dw + aw or 1.0
         hw /= _t; dw /= _t; aw /= _t
+
+    # ── 6d. AI Brain signal injection (trust-router driven) ──────────────────
+    # Uses live signal_trust_state to decide HOW MUCH to inject fp/tier signals.
+    # When odds is trapped → fp/tier inject more aggressively.
+    # When fp/tier is trapped → they inject less (trust router already reduced their weight).
+    if model:
+        _ts   = _trust  # already computed above from _evaluate_signal_trust
+        _t_fp   = _ts.get("trust_fp",   0.12)
+        _t_tier = _ts.get("trust_tier", 0.10)
+        _odds_trapped = _ts.get("odds_trapped", False)
+
+        # ── Fingerprint injection ─────────────────────────────────────────────
+        _fp_db_inj = model.get("fingerprint_db", {})
+        _fk_inj    = "|".join(sorted([home.strip().upper(), away.strip().upper()]))
+        _recs_inj  = _fp_db_inj.get(_fk_inj, [])
+        if len(_recs_inj) >= 5:
+            _outcomes_inj = [r.get("outcome") for r in _recs_inj if r.get("outcome")]
+            if len(_outcomes_inj) >= 5:
+                fp_hw = _outcomes_inj.count("HOME") / len(_outcomes_inj)
+                fp_dw = _outcomes_inj.count("DRAW") / len(_outcomes_inj)
+                fp_aw = _outcomes_inj.count("AWAY") / len(_outcomes_inj)
+                # When odds is trapped, inject up to 35% from fp history
+                # When healthy, inject proportional to trust weight (12–35%)
+                fp_inject = min(0.35, _t_fp * (1.5 if _odds_trapped else 1.0))
+                hw = hw * (1 - fp_inject) + fp_hw * fp_inject
+                dw = dw * (1 - fp_inject) + fp_dw * fp_inject
+                aw = aw * (1 - fp_inject) + fp_aw * fp_inject
+                _t = hw + dw + aw or 1.0
+                hw /= _t; dw /= _t; aw /= _t
+
+        # ── Tier injection ────────────────────────────────────────────────────
+        _standings_inj = (model.get("_standings_cache") or
+                          model.get("_cached_standings") or {})
+        if _standings_inj and _t_tier >= 0.05:
+            _tier_map_inj = _get_all_tiers(_standings_inj)
+            _h_tier_inj   = _find_tier(home, _tier_map_inj)
+            _a_tier_inj   = _find_tier(away, _tier_map_inj)
+            _tier_acc_inj = model.get("ai_brain", {}).get("tier_acc", {})
+            _sw_pair_inj  = f"{_h_tier_inj}_vs_{_a_tier_inj}"
+            _sw_rec_inj   = _tier_acc_inj.get(_sw_pair_inj, {})
+            _sw_t_inj     = _sw_rec_inj.get("total", 0)
+            _sw_c_inj     = _sw_rec_inj.get("correct", 0)
+            _sw_acc_inj   = (_sw_c_inj / _sw_t_inj) if _sw_t_inj >= 10 else 0.0
+
+            tier_inject = 0.0
+            if _h_tier_inj == "STRONG" and _a_tier_inj in ("WEAK", "MODERATE") and _sw_acc_inj >= 0.52:
+                tier_inject = min(0.25, _t_tier * (1.5 if _odds_trapped else 1.0) * (_sw_acc_inj - 0.42) * 3)
+                hw = hw * (1 - tier_inject) + 1.0 * tier_inject
+                dw = dw * (1 - tier_inject)
+                aw = aw * (1 - tier_inject)
+            elif _a_tier_inj == "STRONG" and _h_tier_inj in ("WEAK", "MODERATE") and _sw_acc_inj >= 0.52:
+                tier_inject = min(0.25, _t_tier * (1.5 if _odds_trapped else 1.0) * (_sw_acc_inj - 0.42) * 3)
+                aw = aw * (1 - tier_inject) + 1.0 * tier_inject
+                hw = hw * (1 - tier_inject)
+                dw = dw * (1 - tier_inject)
+            if tier_inject > 0:
+                _t = hw + dw + aw or 1.0
+                hw /= _t; dw /= _t; aw /= _t
 
     hw_pct = round(hw * 100, 1)
     dw_pct = round(dw * 100, 1)
@@ -3967,6 +4031,166 @@ def _update_odds_trap(model: dict, imp_h: float, tip_out: str, actual: str) -> N
     out_data["total"] += 1
     if tip_out == actual:
         out_data["correct"] += 1
+
+
+def _evaluate_signal_trust(model: dict) -> dict:
+    """
+    Dynamic Signal Trust Router.
+
+    Evaluates every signal's current accuracy against a minimum trust threshold.
+    Returns a trust state dict that tells predict_match which signals to rely on
+    right now — and how much — based on what has actually been working lately.
+
+    Trust is evaluated per-signal using recent performance (last 10 rounds window
+    takes priority; falls back to cumulative if insufficient recent data).
+
+    State dict fields:
+      trust_odds       float 0–1   current trust weight for odds
+      trust_fp         float 0–1   current trust weight for fingerprint
+      trust_tier       float 0–1   current trust weight for tier
+      trust_form       float 0–1   current trust weight for form
+      odds_trapped     bool        odds signal is currently in a confirmed trap
+      fp_trapped       bool        fingerprint signal is currently unreliable
+      dominant         str         which signal is most trusted right now
+      dominant_acc     float       accuracy of dominant signal
+      routing_reason   str         human-readable explanation of current routing
+
+    This state is stored in model["signal_trust_state"] so brainstat can display it,
+    backup can save it, and the bot can restore exactly where it was after a restart.
+    """
+    if not model:
+        return {"dominant": "odds", "trust_odds": 0.60, "trust_fp": 0.12,
+                "trust_tier": 0.10, "trust_form": 0.06,
+                "odds_trapped": False, "fp_trapped": False,
+                "dominant_acc": 0.45, "routing_reason": "no data yet"}
+
+    sa     = model.get("signal_acc", {})
+    ai_br  = model.get("ai_brain", {})
+    ai_sa  = ai_br.get("signal_acc", {})
+    w_cur  = model.get("weights", {})
+
+    MIN_SAMPLES = 10   # minimum samples before trusting a signal's accuracy
+
+    def _sig_acc(name: str) -> tuple[float, int]:
+        """Returns (accuracy, sample_count) for a signal, preferring recent data."""
+        # Recent 10-round window from signal_acc
+        rec = sa.get(name, {})
+        t   = rec.get("total", 0)
+        c   = rec.get("correct", 0)
+        # AI brain signal_acc (separate tracker)
+        ai_rec = ai_sa.get(name, {})
+        ai_t   = ai_rec.get("total", 0)
+        ai_c   = ai_rec.get("correct", 0)
+        # Use whichever has more data
+        if t >= MIN_SAMPLES:
+            return c / t, t
+        if ai_t >= MIN_SAMPLES:
+            return ai_c / ai_t, ai_t
+        return None, 0
+
+    odds_acc,  odds_n  = _sig_acc("odds")
+    fp_acc,    fp_n    = _sig_acc("fingerprint")
+    tier_acc,  tier_n  = _sig_acc("tier")
+    form_acc,  form_n  = _sig_acc("form")
+
+    # ── Odds trap status: check if odds is currently trapped ─────────────────
+    # Trapped = majority of active trap bands have >55% failure rate
+    trap_data    = model.get("odds_trap", {})
+    trap_bands   = 0
+    active_bands = 0
+    for band, band_data in trap_data.items():
+        for out, od in band_data.items():
+            t = od.get("total", 0)
+            if t >= MIN_SAMPLES:
+                active_bands += 1
+                failure = 1.0 - od.get("correct", 0) / t
+                if failure > 0.55:
+                    trap_bands += 1
+    odds_trapped = (active_bands >= 3 and trap_bands / active_bands >= 0.50)
+
+    # ── Fingerprint trap: fp is unreliable if acc < 38% with enough data ─────
+    fp_trapped = (fp_acc is not None and fp_n >= 20 and fp_acc < 0.38)
+
+    # ── Tier trap: tier signal unreliable ─────────────────────────────────────
+    tier_trapped = (tier_acc is not None and tier_n >= 20 and tier_acc < 0.42)
+
+    # ── Compute trust weights ─────────────────────────────────────────────────
+    # Base: current AI brain weights
+    t_odds  = w_cur.get("odds",        0.60)
+    t_fp    = w_cur.get("fingerprint", 0.12)
+    t_tier  = w_cur.get("tier",        0.10)
+    t_form  = w_cur.get("form",        0.06)
+
+    # Adjust for traps and performance
+    if odds_trapped:
+        # Odds is in a trap — redistribute its weight to fp/tier/form
+        redistributed = t_odds * 0.50   # give up 50% of odds weight
+        t_odds  -= redistributed
+        # Give more to whichever non-odds signal is performing best
+        candidates = []
+        if fp_acc   and not fp_trapped:   candidates.append(("fp",   fp_acc,   t_fp))
+        if tier_acc and not tier_trapped: candidates.append(("tier", tier_acc, t_tier))
+        if form_acc:                       candidates.append(("form", form_acc, t_form))
+        if candidates:
+            candidates.sort(key=lambda x: -x[1])  # best acc first
+            # Distribute proportionally to accuracy
+            total_alt_acc = sum(x[1] for x in candidates) or 1.0
+            for cname, cacc, _ in candidates:
+                share = (cacc / total_alt_acc) * redistributed
+                if cname == "fp":   t_fp   += share
+                elif cname == "tier": t_tier += share
+                elif cname == "form": t_form += share
+
+    if fp_trapped:
+        # FP is unreliable — give its weight back to odds
+        t_odds += t_fp * 0.70
+        t_fp    = t_fp * 0.30
+
+    if tier_trapped:
+        t_odds += t_tier * 0.60
+        t_tier  = t_tier * 0.40
+
+    # Normalise
+    _total = t_odds + t_fp + t_tier + t_form or 1.0
+    t_odds /= _total; t_fp /= _total; t_tier /= _total; t_form /= _total
+
+    # ── Determine dominant signal ──────────────────────────────────────────────
+    sig_map = {"odds": (t_odds, odds_acc), "fingerprint": (t_fp, fp_acc),
+               "tier": (t_tier, tier_acc), "form": (t_form, form_acc)}
+    dominant     = max(sig_map, key=lambda k: sig_map[k][0])
+    dominant_acc = sig_map[dominant][1] or 0.45
+
+    # ── Routing reason ────────────────────────────────────────────────────────
+    parts = []
+    if odds_trapped:
+        parts.append(f"⚠️ odds trapped ({trap_bands}/{active_bands} bands failing) → boosting fp/tier/form")
+    if fp_trapped:
+        parts.append(f"⚠️ fp unreliable ({fp_acc:.0%}) → boosting odds")
+    if tier_trapped:
+        parts.append(f"⚠️ tier unreliable ({tier_acc:.0%}) → boosting odds")
+    if not parts:
+        parts.append(f"✅ all signals healthy — odds={odds_acc:.0%if odds_acc else 'n/a'} fp={fp_acc:.0%if fp_acc else 'n/a'} tier={tier_acc:.0%if tier_acc else 'n/a'}")
+    routing_reason = " | ".join(parts)
+
+    state = {
+        "trust_odds":      round(t_odds,  4),
+        "trust_fp":        round(t_fp,    4),
+        "trust_tier":      round(t_tier,  4),
+        "trust_form":      round(t_form,  4),
+        "odds_trapped":    odds_trapped,
+        "fp_trapped":      fp_trapped,
+        "tier_trapped":    tier_trapped,
+        "dominant":        dominant,
+        "dominant_acc":    round(dominant_acc, 4),
+        "routing_reason":  routing_reason,
+        "evaluated_at":    model.get("rounds_learned", 0),
+    }
+
+    # Persist in model so brainstat/backup/restore can see it
+    model["signal_trust_state"] = state
+    return state
+
+
 
 
 def _odds_fp_key(odds: dict) -> tuple:
@@ -9730,6 +9954,18 @@ async def _learning_job(context):
                         standings=bot_data.get(f"standings_{league_id}"),
                         round_id=int(round_id) if round_id else 0,
                     )
+                    # ── Re-evaluate dynamic signal trust after every round ────
+                    # This re-reads trap state, per-signal accuracy, and updates
+                    # model["signal_trust_state"] so predict_match uses fresh routing.
+                    _trust_state = _evaluate_signal_trust(_get_model(bot_data, league_id))
+                    log.info(
+                        f"🔀 Signal trust updated [{league_id}] R#{round_id}: "
+                        f"dominant={_trust_state.get('dominant')} "
+                        f"odds={_trust_state.get('trust_odds',0):.0%} "
+                        f"fp={_trust_state.get('trust_fp',0):.0%} "
+                        f"tier={_trust_state.get('trust_tier',0):.0%} "
+                        f"trapped={'odds' if _trust_state.get('odds_trapped') else 'none'}"
+                    )
 
                     # Remove from pending after learning
                     del rounds[round_id]
@@ -11658,7 +11894,7 @@ async def _run_auto_post(bot, bot_data: dict):
 
                     # ── Final card (Pro Card format) ──────────────────────────
                     # 1. Pick the strongest market dynamically
-                    _primary_mkt = get_primary_market(_best_mkts_now or ["1x2"], bot_data)
+                    _primary_mkt = get_primary_market(_best_mkts_now or ["dc", "btts"], bot_data)
                     # Pass fp_records so O/U picks the best line (1.5 / 2.5 / 3.5)
                     _fp_db_card = league_model.get("fingerprint_db", {})
                     _fk_card    = "|".join(sorted([m["home"], m["away"]]))
@@ -12440,6 +12676,8 @@ async def _data_collector_job(context):
                                 standings=bot_data.get(f"standings_{lid}"),
                                 round_id=int(rid) if rid.isdigit() else 0,
                             )
+                            # Re-evaluate signal trust after backfill learning
+                            _evaluate_signal_trust(_get_model(bot_data, lid))
                             collected[bk] = 1
                             backfilled += 1
                             log.info(
@@ -13066,6 +13304,27 @@ async def _do_brainstat(message, c):
         calib_lbl = ("🔵 calibrated" if abs(calib) <= 2
                      else ("🔺 overconfident" if calib > 0 else "🔻 underconfident"))
 
+        # Signal trust state — dynamic router status
+        _sts = model.get("signal_trust_state", {})
+        if _sts:
+            _dom     = _sts.get("dominant", "odds").upper()
+            _dom_acc = _sts.get("dominant_acc", 0)
+            _o_trap  = "⚠️ TRAPPED" if _sts.get("odds_trapped") else "✅ ok"
+            _f_trap  = "⚠️ weak"    if _sts.get("fp_trapped")   else "✅ ok"
+            _t_trap  = "⚠️ weak"    if _sts.get("tier_trapped")  else "✅ ok"
+            _reason  = _sts.get("routing_reason", "")
+            _trust_line = (
+                f"│ 🔀 *Signal Router* → dominant: *{_dom}* ({_dom_acc:.0%})\n"
+                f"│    odds:{_o_trap}  fp:{_f_trap}  tier:{_t_trap}\n"
+                f"│    trust: odds={_sts.get('trust_odds',0):.0%} "
+                f"fp={_sts.get('trust_fp',0):.0%} "
+                f"tier={_sts.get('trust_tier',0):.0%} "
+                f"form={_sts.get('trust_form',0):.0%}\n"
+                + (f"│    ↳ {_reason[:80]}\n" if _reason else "")
+            )
+        else:
+            _trust_line = "│ 🔀 *Signal Router:* building...\n"
+
         league_lines.append(
             f"┌ {linfo['flag']} *{linfo['name']}*  {_status_icon(ts)} *{ts*100:.0f}%*\n"
             f"│ {_bar(ts)} → 100%\n"
@@ -13082,6 +13341,7 @@ async def _do_brainstat(message, c):
             + (f"│ 🔥 Sweet spot: ~{best_band}% confidence → {best_band_acc:.0%} correct\n" if best_band else "")
             + (f"│ ⚠️ High-conf mistakes: {hcm}\n" if hcm >= 3 else "")
             + f"│ ⚖️ Wts: Odds {w.get('odds',0):.0%}  Pois {w.get('poisson',0):.0%}  Str {w.get('strength',0):.0%}\n"
+            + _trust_line
             # Rolling market accuracy (last 100 matches)
             + _rolling_market_line(model)
             # AI brain diagnostics
@@ -13182,6 +13442,23 @@ async def _do_brainstat(message, c):
         streak_note = (" — conf −10" if _streak >= 3 else "")
         streak_note += (" — FORCED DRAW" if _streak >= 6 else "")
         _sep26 = "━" * 26
+        # ── Signal routing summary per league ────────────────────────────────
+        _router_lines = []
+        for _rl_lid, _rl_info in LEAGUES.items():
+            _rl_m   = c.bot_data.get(f"model_{_rl_lid}", {})
+            _rl_sts = _rl_m.get("signal_trust_state", {})
+            if not _rl_sts:
+                continue
+            _rl_dom  = _rl_sts.get("dominant", "odds").upper()
+            _rl_dacc = _rl_sts.get("dominant_acc", 0)
+            _rl_ot   = "⚠️" if _rl_sts.get("odds_trapped") else "✅"
+            _rl_ft   = "⚠️" if _rl_sts.get("fp_trapped")   else "✅"
+            _router_lines.append(
+                f"  {_rl_info['flag']} {_rl_info['name']}: "
+                f"→ *{_rl_dom}* ({_rl_dacc:.0%})  "
+                f"odds:{_rl_ot} fp:{_rl_ft}"
+            )
+
         mm_block = (
             _sep26 + "\n"
             "📊 *Multi-Market Engine*\n"
@@ -13190,6 +13467,8 @@ async def _do_brainstat(message, c):
             + "\n📍 *League Quality Filter* (min 58%)\n"
             + ("\n".join(_lq_lines) if _lq_lines else "  building...") + "\n\n"
             + s_icon + " Loss streak: *" + str(_streak) + "*" + streak_note + "\n"
+            + ("\n🔀 *Signal Router — per league*\n" + "\n".join(_router_lines) + "\n"
+               if _router_lines else "")
         )
     else:
         mm_block = f"{'━'*26}\n📊 *Multi-Market Engine:* building…\n"
@@ -13645,6 +13924,21 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     pend   = data.get("pending_predictions", {})
     pend_rounds = sum(len(v) for v in pend.values())
     pend_preds  = sum(len(p) for v in pend.values() for p in v.values())
+
+    # ── Re-evaluate signal trust for all leagues after restore ────────────────
+    # This ensures routing is fresh even if the backup predates signal_trust_state,
+    # or if conditions changed since the backup was taken.
+    _trust_restored = 0
+    for _tr_lid in LEAGUES:
+        _tr_m = bot_data.get(f"model_{_tr_lid}")
+        if isinstance(_tr_m, dict) and _tr_m.get("rounds_learned", 0) > 0:
+            try:
+                _evaluate_signal_trust(_tr_m)
+                _trust_restored += 1
+            except Exception as _te:
+                log.debug(f"signal trust re-eval error lid={_tr_lid}: {_te}")
+    if _trust_restored:
+        log.info(f"🔀 Signal trust re-evaluated for {_trust_restored} leagues after restore")
 
     league_lines = []
     for lid_str, m in models.items():
@@ -14212,6 +14506,16 @@ def _load_baked_data(bot_data: dict, baked: dict):
                 f"ai_evals={ai_r_eval}"
             )
         log.info(f"💾 Restored {restored_models} league models from baked data")
+
+    # ── Re-evaluate signal trust for all restored leagues ─────────────────────
+    # Ensures routing state is immediately available even if backup predates it.
+    for _ld_lid in LEAGUES:
+        _ld_m = bot_data.get(f"model_{_ld_lid}")
+        if isinstance(_ld_m, dict) and _ld_m.get("rounds_learned", 0) > 0:
+            try:
+                _evaluate_signal_trust(_ld_m)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
