@@ -738,6 +738,231 @@ def _boost_conf_by_market_form(conf: float, market: str, bot_data: dict) -> floa
     return max(40.0, min(97.0, conf))
 
 
+# ─── MARKET SYNERGY ENGINE ────────────────────────────────────────────────────
+# Adjusts per-market scores so complementary markets reinforce each other
+# and conflicting ones don't double-count. Runs AFTER base scoring.
+
+def _apply_market_synergy(
+    scores: dict,            # {"dc": float, "btts": float, "ou": float, "1x2": float, "htft": float}
+    bot_data: dict,
+    odds: dict,
+    league_model: dict,
+    odds_repeating: bool = False,
+) -> dict:
+    """
+    Market Synergy Engine — boosts/penalises scores based on inter-market logic.
+
+    Rules (applied in order, non-destructive):
+      1. BTTS+O/U synergy: both high → reinforce each other
+      2. DC safety: strong DC → damps risky markets (1X2, HTFT)
+      3. Strong favourite: strong 1X2 → confirms DC
+      4. Odds trap: odds repeating → DC/BTTS up, 1X2/HTFT down
+      5. League accuracy adaptation: weak league → safer markets
+      6. Goal environment: avg_goals adjusts O/U score
+      7. R10 learning boost: recent signal accuracy biases weights
+
+    Returns adjusted scores dict.
+    """
+    s = dict(scores)   # work on a copy
+
+    # ── 1. BTTS + O/U synergy ─────────────────────────────────────────────────
+    if s.get("btts", 0) > 60 and s.get("ou", 0) > 55:
+        s["ou"]   = min(100, s["ou"]   + 10)
+        s["btts"] = min(100, s["btts"] + 6)
+
+    # ── 2. DC safety anchor ───────────────────────────────────────────────────
+    if s.get("dc", 0) > 70:
+        s["1x2"]  = max(0, s.get("1x2",  50) - 10)
+        s["htft"] = max(0, s.get("htft", 50) - 10)
+
+    # ── 3. Strong favourite → confirms DC ────────────────────────────────────
+    if s.get("1x2", 0) > 65:
+        s["dc"] = min(100, s.get("dc", 50) + 5)
+
+    # ── 4. Odds trap (repeating odds) → safer markets ────────────────────────
+    if odds_repeating:
+        s["dc"]   = min(100, s.get("dc",   50) + 10)
+        s["btts"] = min(100, s.get("btts", 50) + 5)
+        s["1x2"]  = max(0,   s.get("1x2",  50) - 15)
+        s["htft"] = max(0,   s.get("htft", 50) - 10)
+
+    # ── 5. League accuracy adaptation ────────────────────────────────────────
+    cum    = league_model.get("cumulative", {})
+    ot     = cum.get("outcome_total", 0)
+    oc     = cum.get("outcome_correct", 0)
+    l_acc  = (oc / ot) if ot >= 50 else 0.50
+    if l_acc < 0.50:
+        s["dc"]   = min(100, s.get("dc",   50) + 10)
+        s["btts"] = min(100, s.get("btts", 50) + 5)
+        s["1x2"]  = max(0,   s.get("1x2",  50) - 10)
+
+    # ── 6. Goal environment → O/U adjustment ─────────────────────────────────
+    avg_g = league_model.get("avg_goals", 2.5)
+    if avg_g < 2.2:
+        s["ou"] = max(0, s.get("ou", 50) - 15)
+    elif avg_g > 3.2:
+        s["ou"] = min(100, s.get("ou", 50) + 12)
+
+    # ── 7. R10 signal accuracy bias ──────────────────────────────────────────
+    sig_acc = league_model.get("signal_acc", {})
+    odds_r10  = _r10_acc(sig_acc, "odds")
+    fp_r10    = _r10_acc(sig_acc, "fingerprint")
+    form_r10  = _r10_acc(sig_acc, "form")
+    if odds_r10 is not None:
+        if odds_r10 > 0.60:
+            s["1x2"] = min(100, s.get("1x2", 50) + 5)
+            s["dc"]  = min(100, s.get("dc",  50) + 3)
+        elif odds_r10 < 0.30:
+            s["1x2"] = max(0, s.get("1x2", 50) - 5)
+    if fp_r10 is not None and fp_r10 > 0.60:
+        s["btts"] = min(100, s.get("btts", 50) + 5)
+    if form_r10 is not None and form_r10 < 0.30:
+        # form is unreliable — don't use it to boost anything
+        s["1x2"] = max(0, s.get("1x2", 50) - 3)
+
+    return s
+
+
+def _r10_acc(sig_acc: dict, signal: str) -> float | None:
+    """Extract recent-10 accuracy for a signal from signal_acc dict."""
+    rec = sig_acc.get(signal, {})
+    recent = rec.get("recent", [])
+    if len(recent) >= 5:
+        return sum(recent[-10:]) / min(len(recent), 10)
+    return None
+
+
+# ─── ODDS MEMORY ENGINE ───────────────────────────────────────────────────────
+# Remembers outcomes per (rounded) odds band per market.
+# Self-learning: updates after every result, influences next prediction.
+
+def _odds_memory_key(dc_price: float) -> str:
+    """Normalise a DC odds price to a 0.05-bucket key."""
+    try:
+        return str(round(round(float(dc_price) / 0.05) * 0.05, 2))
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _odds_memory_boost(bot_data: dict, market: str, price: float) -> float:
+    """
+    Return confidence boost/penalty based on historical outcome at this
+    exact odds level for this market.
+    +8 if historically profitable (>65%), -6 if trap zone (<40%).
+    """
+    key = _odds_memory_key(price)
+    mem = bot_data.get("odds_memory", {}).get(market, {}).get(key, {})
+    total = mem.get("wins", 0) + mem.get("loss", 0)
+    if total < 10:
+        return 0.0
+    acc = mem.get("wins", 0) / total
+    if acc > 0.65:
+        return 8.0
+    elif acc < 0.40:
+        return -6.0
+    return 0.0
+
+
+def _odds_memory_update(bot_data: dict, market: str, price: float, won: bool) -> None:
+    """Update odds memory after a result is known."""
+    key  = _odds_memory_key(price)
+    mem  = bot_data.setdefault("odds_memory", {})
+    mkm  = mem.setdefault(market, {})
+    band = mkm.setdefault(key, {"wins": 0, "loss": 0})
+    if won:
+        band["wins"] += 1
+    else:
+        band["loss"] += 1
+    # Keep band size bounded (trim oldest by keeping last 200 per market)
+    # Since we only store totals (not a list), no trimming needed — it's cumulative.
+
+
+# ─── POSITION / SKIP PATTERN BOOST ───────────────────────────────────────────
+# Uses league standings position and team form to detect recovery/trap zones.
+
+def _position_pattern_boost(home: str, away: str,
+                              standings: dict,
+                              league_model: dict) -> float:
+    """
+    Position cycle boost based on table position and recent form.
+
+    TOP TABLE (1–5) losing streak → recovery zone → +6 to DC/BTTS
+    BOTTOM TABLE (15–20) losing streak → trap zone → -5 (avoid 1X2)
+    4+ consecutive losses → reversal due → +7
+    4+ consecutive wins   → reversal due → -6
+
+    Returns a net boost value applied to confidence (not per-market here —
+    caller applies to the winning market's score).
+    """
+    if not standings:
+        return 0.0
+
+    def _find_row(name: str) -> dict | None:
+        if name in standings: return standings[name]
+        nl = name.lower()
+        for k, v in standings.items():
+            if k.lower() == nl: return v
+        return None
+
+    def _get_form(name: str) -> list:
+        m = league_model.get("match_log", [])
+        results = []
+        for entry in reversed(m):
+            if entry.get("home") == name:
+                gh, ga = entry.get("score_h"), entry.get("score_a")
+                if gh is not None and ga is not None:
+                    results.append("W" if gh > ga else ("D" if gh == ga else "L"))
+            elif entry.get("away") == name:
+                gh, ga = entry.get("score_h"), entry.get("score_a")
+                if gh is not None and ga is not None:
+                    results.append("W" if ga > gh else ("D" if ga == gh else "L"))
+            if len(results) >= 5:
+                break
+        return results
+
+    h_row = _find_row(home)
+    a_row = _find_row(away)
+    if not h_row or not a_row:
+        return 0.0
+
+    n_teams = len(standings)
+    h_pos = h_row.get("pos", 10)
+    a_pos = a_row.get("pos", 10)
+
+    h_form = _get_form(home)
+    a_form = _get_form(away)
+
+    boost = 0.0
+
+    # Top table logic (positions 1–5)
+    if h_pos <= 5:
+        losses = h_form.count("L")
+        if losses >= 3:
+            boost += 6.0   # likely recovery
+
+    if a_pos <= 5:
+        losses = a_form.count("L")
+        if losses >= 3:
+            boost += 4.0   # visitor recovery likely
+
+    # Bottom table logic (positions 15–20)
+    if h_pos >= max(15, n_teams - 5):
+        losses = h_form.count("L")
+        if losses >= 3:
+            boost -= 5.0   # trap — strong home losing is suspicious
+
+    # Skip-4 (consecutive loss streak)
+    for form in (h_form, a_form):
+        if len(form) >= 4 and form[:4].count("L") >= 4:
+            boost += 7.0   # reversal very likely
+        elif len(form) >= 4 and form[:4].count("W") >= 4:
+            boost -= 6.0   # hot streak ending
+
+    return max(-12.0, min(12.0, boost))
+
+
+
+
 def _weighted_market_agreement(signals: dict, bot_data: dict) -> float:
     """
     Weighted agreement score using dynamic momentum-adjusted weights.
@@ -1267,8 +1492,9 @@ def pro_card(
     extra_markets: list | None = None,
 ) -> str:
     """
-    Professional prediction card showing ALL strong markets, not just primary.
-    extra_markets: list of (market_key, tip_str) tuples for secondary markets.
+    Clean professional prediction card.
+    Shows primary prediction + ONE secondary market (if available).
+    extra_markets: list of (market_key, tip_str) — only first entry shown as secondary.
     """
     if fp_records is None:
         fp_records = []
@@ -1286,60 +1512,82 @@ def pro_card(
         "1x2":  "1X2",
     }.get(primary_market.lower(), primary_market.upper())
 
+    def _odds_for_pick(mkt_key: str, mkt_tip: str) -> str:
+        """Return the single odds value for the chosen pick side only."""
+        tip_up = mkt_tip.upper()
+        try:
+            if tip_up in ("1X", "X2", "12"):
+                dc = ev_odds.get("dc", {})
+                if dc:
+                    val = dc.get(mkt_tip)
+                    if val: return str(val)
+            elif "BTTS YES" in tip_up:
+                b = ev_odds.get("btts", {})
+                if b and b.get("Yes"): return str(b["Yes"])
+            elif "BTTS NO" in tip_up:
+                b = ev_odds.get("btts", {})
+                if b and b.get("No"): return str(b["No"])
+            elif tip_up in ("HOME", "AWAY", "DRAW"):
+                o = ev_odds.get("1x2", {})
+                if o:
+                    k = {"HOME": "1", "DRAW": "X", "AWAY": "2"}[tip_up]
+                    val = o.get(k)
+                    if val: return str(val)
+            elif "OVER" in tip_up or "UNDER" in tip_up:
+                _lbl, _line, over_p, under_p = _best_ou_from_fp(fp_records, ev_odds)
+                val = over_p if "OVER" in tip_up else under_p
+                if val: return str(val)
+            elif "/" in mkt_tip:
+                h = ev_odds.get("htft", {})
+                if h:
+                    val = h.get(mkt_tip)
+                    if val: return str(val)
+        except (TypeError, ValueError, KeyError):
+            pass
+        return ""
+
+    # Determine signal summary (max 3 lines, clean words)
+    _signals = []
+    _mkt_form = 0.5
+    try:
+        from collections import Counter as _Counter
+        _mh = {}
+        for _mk in ("dc", "btts", "ou"):
+            _f = _get_market_form_global(ev_odds, _mk)  # placeholder, use bot_data if available
+    except Exception:
+        pass
+
+    _primary_odds = _odds_for_pick(primary_market, tip)
+    _primary_odds_str = f" — {_primary_odds}" if _primary_odds else ""
+
     text = (
         f"\n"
         f"🏠 *{home}* vs *{away}* ✈️\n"
         f"\n"
         f"{level}\n"
         f"\n"
-        f"🎯 Prediction : *{_mkt_label} {tip}*\n"
+        f"🎯 Prediction : *{_mkt_label} {tip}*{_primary_odds_str}\n"
         f"📊 Confidence : *{conf:.1f}%*\n"
-        f"📊 Agreement : *{agree_count}/{agree_total}*\n"
         f"⚠️ Risk : *{risk}*\n"
-        f"\n"
     )
 
-    def _odds_line_for(mkt_key: str, mkt_tip: str) -> str:
-        """Return a single odds line for a market+tip."""
-        tip_up = mkt_tip.upper()
-        if tip_up in ("HOME", "AWAY", "DRAW"):
-            o = ev_odds.get("1x2", {})
-            if o:
-                return f"  1X2 — 1:{o.get('1','-')} X:{o.get('X','-')} 2:{o.get('2','-')}\n"
-        elif tip_up in ("1X", "X2", "12"):
-            dc = ev_odds.get("dc", {})
-            if dc:
-                return f"  DC {mkt_tip} — {dc.get(mkt_tip, '-')}\n"
-        elif "BTTS" in tip_up:
-            b = ev_odds.get("btts", {})
-            if b:
-                return f"  BTTS — Yes:{b.get('Yes','-')} No:{b.get('No','-')}\n"
-        elif "OVER" in tip_up or "UNDER" in tip_up:
-            _lbl, line_str, over_p, under_p = _best_ou_from_fp(fp_records, ev_odds)
-            return f"  {mkt_tip} — Ov:{over_p or '-'} Un:{under_p or '-'}\n"
-        elif "/" in mkt_tip:
-            h = ev_odds.get("htft", {})
-            if h:
-                return f"  HT/FT {mkt_tip} — {h.get(mkt_tip, '-')}\n"
-        return ""
-
-    # Primary market odds
-    primary_odds = _odds_line_for(primary_market, tip)
-    if primary_odds:
-        text += f"📊 Odds{primary_odds}"
-
-    # Secondary markets (BTTS, O/U, etc.) that also passed filters
+    # ONE secondary only — clean and readable
     if extra_markets:
-        text += "📌 Also\n"
-        for _emkt, _etip in extra_markets:
-            _emkt_label = {
-                "dc":"DC","btts":"BTTS","ou":"O/U","htft":"HT/FT","1x2":"1X2"
-            }.get(_emkt.lower(), _emkt.upper())
-            _eodds = _odds_line_for(_emkt, _etip)
-            text += f"  *{_emkt_label} {_etip}*{_eodds if _eodds else chr(10)}"
+        _sec_mkt, _sec_tip = extra_markets[0]
+        _sec_label = {
+            "dc":"DC","btts":"BTTS","ou":"O/U","htft":"HT/FT","1x2":"1X2"
+        }.get(_sec_mkt.lower(), _sec_mkt.upper())
+        _sec_odds = _odds_for_pick(_sec_mkt, _sec_tip)
+        _sec_odds_str = f" — {_sec_odds}" if _sec_odds else ""
+        text += f"🔁 Secondary  : *{_sec_label} {_sec_tip}*{_sec_odds_str}\n"
 
     text += "\n━━━━━━━━━━━━━━━━━━"
     return text
+
+
+def _get_market_form_global(ev_odds: dict, market: str) -> str:
+    """Placeholder — returns empty string. Real form comes from bot_data."""
+    return ""
 
 
 def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
@@ -1560,6 +1808,30 @@ def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: di
         f"📊 market_learning updated — predicted={predicted} actual={actual} | "
         + " ".join(f"{k}={v['correct']}/{v['total']}" for k, v in weights.items())
     )
+
+    # ── Odds memory update: track win/loss per exact odds band per market ──────
+    # This feeds _odds_memory_boost() for future predictions.
+    _om_dc = odds.get("dc", {})
+    if _om_dc:
+        try:
+            _om_best = min(_om_dc.items(), key=lambda x: float(x[1]))[0]
+            _om_price = float(_om_dc[_om_best])
+            _om_won = ((_om_best == "1X" and actual in ("HOME","DRAW")) or
+                       (_om_best == "X2" and actual in ("AWAY","DRAW")) or
+                       (_om_best == "12" and actual in ("HOME","AWAY")))
+            _odds_memory_update(bot_data, "dc", _om_price, _om_won)
+        except (TypeError, ValueError, StopIteration):
+            pass
+    _om_btts = odds.get("btts", {})
+    if _om_btts:
+        try:
+            _om_yes = float(_om_btts.get("Yes", 99))
+            _om_no  = float(_om_btts.get("No",  99))
+            _om_price_b = min(_om_yes, _om_no)
+            _om_btts_won = ((_om_yes < _om_no) == (actual != "DRAW"))
+            _odds_memory_update(bot_data, "btts", _om_price_b, _om_btts_won)
+        except (TypeError, ValueError):
+            pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -12050,15 +12322,91 @@ async def _run_auto_post(bot, bot_data: dict):
                     )
 
                     # ── Final card (Pro Card format) ──────────────────────────
-                    # 1. Pick the strongest market dynamically
-                    _primary_mkt = get_primary_market(_best_mkts_now or ["1x2"], bot_data)
-                    # Pass fp_records so O/U picks the best line (1.5 / 2.5 / 3.5)
+                    # ── DYNAMIC RANKED MARKET SELECTION ──────────────────────
+                    # Build per-market scores using: accuracy + form + synergy
+                    # Then rank them: highest = primary, second = secondary (shown on card)
+
                     _fp_db_card = league_model.get("fingerprint_db", {})
                     _fk_card    = "|".join(sorted([m["home"], m["away"]]))
                     _recs_card  = _fp_db_card.get(_fk_card, [])
+
+                    # Base scores from ml_weights accuracy × 100
+                    _wts_raw  = _ml_weights(bot_data)
+                    _dyn_w    = _dynamic_market_weights(bot_data)
+                    _mkt_scores: dict[str, float] = {}
+                    for _mk in ("dc", "btts", "ou", "1x2", "htft"):
+                        _rec  = _wts_raw.get(_mk, {"correct": 1, "total": 2})
+                        _t    = max(_rec.get("total", 2), 2)
+                        _acc  = _rec.get("correct", 1) / _t * 100
+                        _form = _get_market_form(bot_data, _mk, 50) * 100
+                        # Only include markets that actually passed the MME filter
+                        if _mk in _best_mkts_now:
+                            _mkt_scores[_mk] = _acc * 0.60 + _form * 0.40
+                        else:
+                            # Non-selected markets still get a lower base score
+                            # so they can appear as secondary if strong enough
+                            _mkt_scores[_mk] = (_acc * 0.60 + _form * 0.40) * 0.70
+
+                    # Apply market synergy adjustments
+                    _odds_repeating_flag = bool(_repeat_chk.get("matched"))
+                    _mkt_scores = _apply_market_synergy(
+                        _mkt_scores, bot_data, ev_odds,
+                        league_model, odds_repeating=_odds_repeating_flag
+                    )
+
+                    # Apply position pattern boost to primary candidates
+                    _pos_boost = _position_pattern_boost(
+                        m["home"], m["away"],
+                        bot_data.get(f"standings_{lid}", {}),
+                        league_model
+                    )
+                    # Position boost strengthens the leading market
+                    _top_mkt_tmp = max(_mkt_scores, key=_mkt_scores.get)
+                    _mkt_scores[_top_mkt_tmp] = _mkt_scores[_top_mkt_tmp] + _pos_boost
+
+                    # Apply odds memory boost to dc and btts
+                    for _om_mkt in ("dc", "btts"):
+                        _om_odds = ev_odds.get(_om_mkt, {})
+                        if _om_odds:
+                            try:
+                                _om_best_k = min(_om_odds, key=lambda k: float(_om_odds[k]))
+                                _om_price  = float(_om_odds[_om_best_k])
+                                _om_boost  = _odds_memory_boost(bot_data, _om_mkt, _om_price)
+                                _mkt_scores[_om_mkt] = _mkt_scores.get(_om_mkt, 50) + _om_boost
+                            except (TypeError, ValueError):
+                                pass
+
+                    # Rank markets by score — primary = highest, secondary = second
+                    _ranked_mkts = sorted(
+                        [(mk, sc) for mk, sc in _mkt_scores.items() if sc > 0],
+                        key=lambda x: -x[1]
+                    )
+
+                    # Primary = top ranked market
+                    _primary_mkt = _ranked_mkts[0][0] if _ranked_mkts else "1x2"
+
+                    # Secondary = second ranked, only if score difference < 25pts
+                    # and market is different enough (not same family)
+                    _secondary_mkt = None
+                    if len(_ranked_mkts) >= 2:
+                        _sec_candidate = _ranked_mkts[1][0]
+                        _score_gap     = _ranked_mkts[0][1] - _ranked_mkts[1][1]
+                        # Don't show secondary if gap too large (primary dominates)
+                        # and ensure it's actually in passing markets or close to it
+                        if _score_gap < 25 and _ranked_mkts[1][1] > 40:
+                            _secondary_mkt = _sec_candidate
+
+                    # Get pick strings for primary and secondary
                     _dyn_tip, _dyn_odds_hint = get_final_pick(
                         _primary_mkt, p, ev_odds, fp_records=_recs_card
                     )
+
+                    _extra_mkts_card = []
+                    if _secondary_mkt:
+                        _sec_tip, _ = get_final_pick(
+                            _secondary_mkt, p, ev_odds, fp_records=_recs_card
+                        )
+                        _extra_mkts_card = [(_secondary_mkt, _sec_tip)]
 
                     # 2. Risk level from trap score
                     if _trap_score >= 4:
@@ -12070,9 +12418,6 @@ async def _run_auto_post(bot, bot_data: dict):
 
                     # 3. Agreement totals
                     _agree_total_card = max(len(_best_mkts_now), 1)
-
-                    # 4. No secondary markets — card shows only the single best pick
-                    _extra_mkts_card = []
 
                     # 5. Build the clean card
                     _league_hdr_card = (
@@ -13645,6 +13990,18 @@ async def _do_brainstat(message, c):
                 f"odds:{_rl_ot} fp:{_rl_ft}"
             )
 
+        # ── Odds memory summary ───────────────────────────────────────────────
+        _om_data = c.bot_data.get("odds_memory", {})
+        _om_lines = []
+        for _om_mkt in ("dc", "btts"):
+            _om_mkt_data = _om_data.get(_om_mkt, {})
+            _om_total = sum(v.get("wins",0)+v.get("loss",0) for v in _om_mkt_data.values())
+            _om_wins  = sum(v.get("wins",0) for v in _om_mkt_data.values())
+            if _om_total >= 10:
+                _om_acc = _om_wins / _om_total
+                _om_icon = "✅" if _om_acc > 0.65 else ("⚠️" if _om_acc < 0.45 else "🟡")
+                _om_lines.append(f"  {_om_icon} {_om_mkt.upper()}: {_om_acc:.0%} ({_om_wins}/{_om_total}) across {len(_om_mkt_data)} price bands")
+
         mm_block = (
             _sep26 + "\n"
             "📊 *Multi-Market Engine*\n"
@@ -13655,6 +14012,8 @@ async def _do_brainstat(message, c):
             + s_icon + " Loss streak: *" + str(_streak) + "*" + streak_note + "\n"
             + ("\n🔀 *Signal Router — per league*\n" + "\n".join(_router_lines) + "\n"
                if _router_lines else "")
+            + ("\n🧠 *Odds Memory*\n" + "\n".join(_om_lines) + "\n"
+               if _om_lines else "")
         )
     else:
         mm_block = f"{'━'*26}\n📊 *Multi-Market Engine:* building…\n"
@@ -13809,6 +14168,7 @@ async def _do_backup_inner(message, c):
         "ml_weights":          bd.get("ml_weights", {}),
         "risk":                bd.get("risk", {}),
         "odds_store":          bd.get("odds_store", {}),
+        "odds_memory":         bd.get("odds_memory", {}),
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -14094,6 +14454,10 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     if "odds_store" in data and data["odds_store"]:
         bot_data["odds_store"] = data["odds_store"]
         log.info(f"✅ Restored odds_store from backup")
+
+    if "odds_memory" in data and data["odds_memory"]:
+        bot_data["odds_memory"] = data["odds_memory"]
+        log.info(f"✅ Restored odds_memory from backup")
 
     if "ml_weights" in data and data["ml_weights"]:
         bot_data["ml_weights"] = data["ml_weights"]
@@ -14472,6 +14836,10 @@ def _load_baked_data(bot_data: dict, baked: dict):
     if baked.get("odds_store"):
         bot_data["odds_store"] = baked["odds_store"]
         log.info(f"💾 Restored odds_store from baked data")
+
+    if baked.get("odds_memory"):
+        bot_data["odds_memory"] = baked["odds_memory"]
+        log.info(f"💾 Restored odds_memory from baked data")
 
     if baked.get("pending_predictions"):
         existing = bot_data.setdefault("pending_predictions", {})
