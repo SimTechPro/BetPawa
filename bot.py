@@ -789,7 +789,7 @@ def _get_best_markets(bot_data: dict, min_acc: float = 0.58) -> list[str]:
     Uses momentum-adjusted weights (not raw accuracy) to rank markets.
     A market that is historically good BUT trending cold gets demoted.
     A market that is rising above its average gets promoted.
-    Falls back to ["dc", "btts"] when insufficient data.
+    Falls back to ["1x2"] when insufficient data.
     """
     weights    = _ml_weights(bot_data)
     dyn_w      = _dynamic_market_weights(bot_data)
@@ -834,7 +834,7 @@ def _get_best_markets(bot_data: dict, min_acc: float = 0.58) -> list[str]:
     ranked.sort(key=lambda x: (-x[2], -x[1]))
     strong = [m for m, eff, _ in ranked if eff >= min_acc]
     if not strong:
-        return ["dc", "btts"]
+        return ["1x2"]
     return strong
 
 
@@ -11629,14 +11629,16 @@ async def _run_auto_post(bot, bot_data: dict):
                     # Determine dominant strong market for confidence anchor
                     _best_mkts_now  = _get_best_markets(bot_data)
                     _cycle_mkt_now  = _repeat_chk.get("cycle_tip_market", "1X2")
-                    _conf_market_key = "dc" if "dc" in _best_mkts_now else (
-                                        "btts" if "btts" in _best_mkts_now else "1x2")
+                    _conf_market_key = "1x2" if "1x2" in _best_mkts_now else (
+                                        "dc" if "dc" in _best_mkts_now else (
+                                        "btts" if "btts" in _best_mkts_now else "1x2"))
                     _real_conf = _compute_real_confidence(
                         _conf_market_key, bot_data, _league_acc, p_conf_adj
                     )
                     # Additional momentum boost applied to the primary market of this card
-                    _primary_mkt_early = "dc" if "dc" in _best_mkts_now else (
-                                          "btts" if "btts" in _best_mkts_now else "1x2")
+                    _primary_mkt_early = "1x2" if "1x2" in _best_mkts_now else (
+                                          "dc" if "dc" in _best_mkts_now else (
+                                          "btts" if "btts" in _best_mkts_now else "1x2"))
                     _real_conf = _boost_conf_by_market_form(_real_conf, _primary_mkt_early, bot_data)
 
                     # ── SYSTEM 5: Market Agreement Gate ──────────────────────
@@ -12049,7 +12051,7 @@ async def _run_auto_post(bot, bot_data: dict):
 
                     # ── Final card (Pro Card format) ──────────────────────────
                     # 1. Pick the strongest market dynamically
-                    _primary_mkt = get_primary_market(_best_mkts_now or ["dc", "btts"], bot_data)
+                    _primary_mkt = get_primary_market(_best_mkts_now or ["1x2"], bot_data)
                     # Pass fp_records so O/U picks the best line (1.5 / 2.5 / 3.5)
                     _fp_db_card = league_model.get("fingerprint_db", {})
                     _fk_card    = "|".join(sorted([m["home"], m["away"]]))
