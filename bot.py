@@ -738,231 +738,6 @@ def _boost_conf_by_market_form(conf: float, market: str, bot_data: dict) -> floa
     return max(40.0, min(97.0, conf))
 
 
-# ─── MARKET SYNERGY ENGINE ────────────────────────────────────────────────────
-# Adjusts per-market scores so complementary markets reinforce each other
-# and conflicting ones don't double-count. Runs AFTER base scoring.
-
-def _apply_market_synergy(
-    scores: dict,            # {"dc": float, "btts": float, "ou": float, "1x2": float, "htft": float}
-    bot_data: dict,
-    odds: dict,
-    league_model: dict,
-    odds_repeating: bool = False,
-) -> dict:
-    """
-    Market Synergy Engine — boosts/penalises scores based on inter-market logic.
-
-    Rules (applied in order, non-destructive):
-      1. BTTS+O/U synergy: both high → reinforce each other
-      2. DC safety: strong DC → damps risky markets (1X2, HTFT)
-      3. Strong favourite: strong 1X2 → confirms DC
-      4. Odds trap: odds repeating → DC/BTTS up, 1X2/HTFT down
-      5. League accuracy adaptation: weak league → safer markets
-      6. Goal environment: avg_goals adjusts O/U score
-      7. R10 learning boost: recent signal accuracy biases weights
-
-    Returns adjusted scores dict.
-    """
-    s = dict(scores)   # work on a copy
-
-    # ── 1. BTTS + O/U synergy ─────────────────────────────────────────────────
-    if s.get("btts", 0) > 60 and s.get("ou", 0) > 55:
-        s["ou"]   = min(100, s["ou"]   + 10)
-        s["btts"] = min(100, s["btts"] + 6)
-
-    # ── 2. DC safety anchor ───────────────────────────────────────────────────
-    if s.get("dc", 0) > 70:
-        s["1x2"]  = max(0, s.get("1x2",  50) - 10)
-        s["htft"] = max(0, s.get("htft", 50) - 10)
-
-    # ── 3. Strong favourite → confirms DC ────────────────────────────────────
-    if s.get("1x2", 0) > 65:
-        s["dc"] = min(100, s.get("dc", 50) + 5)
-
-    # ── 4. Odds trap (repeating odds) → safer markets ────────────────────────
-    if odds_repeating:
-        s["dc"]   = min(100, s.get("dc",   50) + 10)
-        s["btts"] = min(100, s.get("btts", 50) + 5)
-        s["1x2"]  = max(0,   s.get("1x2",  50) - 15)
-        s["htft"] = max(0,   s.get("htft", 50) - 10)
-
-    # ── 5. League accuracy adaptation ────────────────────────────────────────
-    cum    = league_model.get("cumulative", {})
-    ot     = cum.get("outcome_total", 0)
-    oc     = cum.get("outcome_correct", 0)
-    l_acc  = (oc / ot) if ot >= 50 else 0.50
-    if l_acc < 0.50:
-        s["dc"]   = min(100, s.get("dc",   50) + 10)
-        s["btts"] = min(100, s.get("btts", 50) + 5)
-        s["1x2"]  = max(0,   s.get("1x2",  50) - 10)
-
-    # ── 6. Goal environment → O/U adjustment ─────────────────────────────────
-    avg_g = league_model.get("avg_goals", 2.5)
-    if avg_g < 2.2:
-        s["ou"] = max(0, s.get("ou", 50) - 15)
-    elif avg_g > 3.2:
-        s["ou"] = min(100, s.get("ou", 50) + 12)
-
-    # ── 7. R10 signal accuracy bias ──────────────────────────────────────────
-    sig_acc = league_model.get("signal_acc", {})
-    odds_r10  = _r10_acc(sig_acc, "odds")
-    fp_r10    = _r10_acc(sig_acc, "fingerprint")
-    form_r10  = _r10_acc(sig_acc, "form")
-    if odds_r10 is not None:
-        if odds_r10 > 0.60:
-            s["1x2"] = min(100, s.get("1x2", 50) + 5)
-            s["dc"]  = min(100, s.get("dc",  50) + 3)
-        elif odds_r10 < 0.30:
-            s["1x2"] = max(0, s.get("1x2", 50) - 5)
-    if fp_r10 is not None and fp_r10 > 0.60:
-        s["btts"] = min(100, s.get("btts", 50) + 5)
-    if form_r10 is not None and form_r10 < 0.30:
-        # form is unreliable — don't use it to boost anything
-        s["1x2"] = max(0, s.get("1x2", 50) - 3)
-
-    return s
-
-
-def _r10_acc(sig_acc: dict, signal: str) -> float | None:
-    """Extract recent-10 accuracy for a signal from signal_acc dict."""
-    rec = sig_acc.get(signal, {})
-    recent = rec.get("recent", [])
-    if len(recent) >= 5:
-        return sum(recent[-10:]) / min(len(recent), 10)
-    return None
-
-
-# ─── ODDS MEMORY ENGINE ───────────────────────────────────────────────────────
-# Remembers outcomes per (rounded) odds band per market.
-# Self-learning: updates after every result, influences next prediction.
-
-def _odds_memory_key(dc_price: float) -> str:
-    """Normalise a DC odds price to a 0.05-bucket key."""
-    try:
-        return str(round(round(float(dc_price) / 0.05) * 0.05, 2))
-    except (TypeError, ValueError):
-        return "unknown"
-
-
-def _odds_memory_boost(bot_data: dict, market: str, price: float) -> float:
-    """
-    Return confidence boost/penalty based on historical outcome at this
-    exact odds level for this market.
-    +8 if historically profitable (>65%), -6 if trap zone (<40%).
-    """
-    key = _odds_memory_key(price)
-    mem = bot_data.get("odds_memory", {}).get(market, {}).get(key, {})
-    total = mem.get("wins", 0) + mem.get("loss", 0)
-    if total < 10:
-        return 0.0
-    acc = mem.get("wins", 0) / total
-    if acc > 0.65:
-        return 8.0
-    elif acc < 0.40:
-        return -6.0
-    return 0.0
-
-
-def _odds_memory_update(bot_data: dict, market: str, price: float, won: bool) -> None:
-    """Update odds memory after a result is known."""
-    key  = _odds_memory_key(price)
-    mem  = bot_data.setdefault("odds_memory", {})
-    mkm  = mem.setdefault(market, {})
-    band = mkm.setdefault(key, {"wins": 0, "loss": 0})
-    if won:
-        band["wins"] += 1
-    else:
-        band["loss"] += 1
-    # Keep band size bounded (trim oldest by keeping last 200 per market)
-    # Since we only store totals (not a list), no trimming needed — it's cumulative.
-
-
-# ─── POSITION / SKIP PATTERN BOOST ───────────────────────────────────────────
-# Uses league standings position and team form to detect recovery/trap zones.
-
-def _position_pattern_boost(home: str, away: str,
-                              standings: dict,
-                              league_model: dict) -> float:
-    """
-    Position cycle boost based on table position and recent form.
-
-    TOP TABLE (1–5) losing streak → recovery zone → +6 to DC/BTTS
-    BOTTOM TABLE (15–20) losing streak → trap zone → -5 (avoid 1X2)
-    4+ consecutive losses → reversal due → +7
-    4+ consecutive wins   → reversal due → -6
-
-    Returns a net boost value applied to confidence (not per-market here —
-    caller applies to the winning market's score).
-    """
-    if not standings:
-        return 0.0
-
-    def _find_row(name: str) -> dict | None:
-        if name in standings: return standings[name]
-        nl = name.lower()
-        for k, v in standings.items():
-            if k.lower() == nl: return v
-        return None
-
-    def _get_form(name: str) -> list:
-        m = league_model.get("match_log", [])
-        results = []
-        for entry in reversed(m):
-            if entry.get("home") == name:
-                gh, ga = entry.get("score_h"), entry.get("score_a")
-                if gh is not None and ga is not None:
-                    results.append("W" if gh > ga else ("D" if gh == ga else "L"))
-            elif entry.get("away") == name:
-                gh, ga = entry.get("score_h"), entry.get("score_a")
-                if gh is not None and ga is not None:
-                    results.append("W" if ga > gh else ("D" if ga == gh else "L"))
-            if len(results) >= 5:
-                break
-        return results
-
-    h_row = _find_row(home)
-    a_row = _find_row(away)
-    if not h_row or not a_row:
-        return 0.0
-
-    n_teams = len(standings)
-    h_pos = h_row.get("pos", 10)
-    a_pos = a_row.get("pos", 10)
-
-    h_form = _get_form(home)
-    a_form = _get_form(away)
-
-    boost = 0.0
-
-    # Top table logic (positions 1–5)
-    if h_pos <= 5:
-        losses = h_form.count("L")
-        if losses >= 3:
-            boost += 6.0   # likely recovery
-
-    if a_pos <= 5:
-        losses = a_form.count("L")
-        if losses >= 3:
-            boost += 4.0   # visitor recovery likely
-
-    # Bottom table logic (positions 15–20)
-    if h_pos >= max(15, n_teams - 5):
-        losses = h_form.count("L")
-        if losses >= 3:
-            boost -= 5.0   # trap — strong home losing is suspicious
-
-    # Skip-4 (consecutive loss streak)
-    for form in (h_form, a_form):
-        if len(form) >= 4 and form[:4].count("L") >= 4:
-            boost += 7.0   # reversal very likely
-        elif len(form) >= 4 and form[:4].count("W") >= 4:
-            boost -= 6.0   # hot streak ending
-
-    return max(-12.0, min(12.0, boost))
-
-
-
-
 def _weighted_market_agreement(signals: dict, bot_data: dict) -> float:
     """
     Weighted agreement score using dynamic momentum-adjusted weights.
@@ -1422,13 +1197,13 @@ def get_final_pick(
     fp_records: list | None = None,
 ) -> tuple[str, str]:
     """
-    Convert the raw prediction into the correct pick string for the
-    primary market — with full dynamic O/U line selection.
-    Returns (tip_string, odds_key_hint).
+    Each market derives its pick from its OWN signal — never from another market's tip.
+    Returns (pick_string, market_key).
     """
     if fp_records is None:
         fp_records = []
 
+    # ── DC: cheapest DC cover from DC odds directly ───────────────────────────
     if primary_market == "dc":
         dc = ev_odds.get("dc", {})
         if dc:
@@ -1437,24 +1212,44 @@ def get_final_pick(
                 return best_dc, "dc"
             except (TypeError, ValueError):
                 pass
-        tip_g = p.get("tip", "HOME WIN").split()[0]
-        return {"HOME": "1X", "AWAY": "X2", "DRAW": "12"}.get(tip_g, "1X"), "dc"
+        # No odds: use fixture history to pick safest DC cover
+        if fp_records:
+            _outcomes = [r.get("outcome") for r in fp_records if r.get("outcome")]
+            if _outcomes:
+                from collections import Counter as _C
+                _cnt = _C(_outcomes)
+                _h = _cnt.get("HOME", 0); _d = _cnt.get("DRAW", 0); _a = _cnt.get("AWAY", 0)
+                _pairs = {"1X": _h + _d, "X2": _d + _a, "12": _h + _a}
+                return max(_pairs, key=_pairs.get), "dc"
+        return "1X", "dc"
 
+    # ── BTTS: fp_db historical rate first, then model, then odds ─────────────
     elif primary_market == "btts":
-        btts = ev_odds.get("btts", {})
-        if btts:
+        btts_vals = [r.get("btts_result") for r in fp_records
+                     if r.get("btts_result") is not None]
+        if len(btts_vals) >= 5:
+            btts_rate = sum(btts_vals) / len(btts_vals)
+            if btts_rate >= 0.55:   return "YES", "btts"
+            elif btts_rate <= 0.45: return "NO",  "btts"
+        btts_prob = p.get("btts", 50.0)
+        if btts_prob >= 55:   return "YES", "btts"
+        elif btts_prob <= 45: return "NO",  "btts"
+        btts_odds = ev_odds.get("btts", {})
+        if btts_odds:
             try:
-                yes = float(btts.get("Yes", 99))
-                no  = float(btts.get("No",  99))
-                return ("BTTS YES" if yes <= no else "BTTS NO"), "btts"
+                yes_p = float(btts_odds.get("Yes", 99))
+                no_p  = float(btts_odds.get("No",  99))
+                return ("YES" if yes_p <= no_p else "NO"), "btts"
             except (TypeError, ValueError):
                 pass
-        return "BTTS YES", "btts"
+        return "YES", "btts"
 
+    # ── O/U: fp_db rates + Poisson xG ────────────────────────────────────────
     elif primary_market in ("ou", "o/u"):
         label, _line, _op, _up = _best_ou_from_fp(fp_records, ev_odds)
         return label, "ou"
 
+    # ── HTFT: cheapest HTFT option ───────────────────────────────────────────
     elif primary_market == "htft":
         htft = ev_odds.get("htft", {})
         if htft:
@@ -1463,11 +1258,22 @@ def get_final_pick(
                 return best_h, "htft"
             except (TypeError, ValueError, StopIteration):
                 pass
+        return "1/1", "htft"
 
-    # Default: 1X2
+    # ── 1X2: from 1X2 implied probabilities ──────────────────────────────────
+    o1x2 = ev_odds.get("1x2", {})
+    if o1x2:
+        try:
+            h = 1.0 / float(o1x2.get("1", 99))
+            d = 1.0 / float(o1x2.get("X", 99))
+            a = 1.0 / float(o1x2.get("2", 99))
+            t = h + d + a or 1.0
+            probs = {"HOME": h/t, "DRAW": d/t, "AWAY": a/t}
+            return max(probs, key=probs.get), "1x2"
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
     tip_g = p.get("tip", "HOME WIN").split()[0]
-    label = {"HOME": "HOME", "AWAY": "AWAY", "DRAW": "DRAW"}.get(tip_g, tip_g)
-    return label, "1x2"
+    return {"HOME": "HOME", "AWAY": "AWAY", "DRAW": "DRAW"}.get(tip_g, "HOME"), "1x2"
 
 
 def get_level(conf: float, agree_count: int, risk: str, best_markets_count: int) -> str:
@@ -1492,9 +1298,8 @@ def pro_card(
     extra_markets: list | None = None,
 ) -> str:
     """
-    Clean professional prediction card.
-    Shows primary prediction + ONE secondary market (if available).
-    extra_markets: list of (market_key, tip_str) — only first entry shown as secondary.
+    Clean card: primary prediction + ONE secondary.
+    tip is the pick string only (YES / 1X / Over 2.5) — market label added separately.
     """
     if fp_records is None:
         fp_records = []
@@ -1502,62 +1307,40 @@ def pro_card(
         extra_markets = []
 
     level = get_level(conf, agree_count, risk, agree_total)
-
     _mkt_label = {
-        "dc":   "DC",
-        "btts": "BTTS",
-        "ou":   "O/U",
-        "o/u":  "O/U",
-        "htft": "HT/FT",
-        "1x2":  "1X2",
+        "dc":"DC","btts":"BTTS","ou":"O/U","o/u":"O/U","htft":"HT/FT","1x2":"1X2",
     }.get(primary_market.lower(), primary_market.upper())
 
-    def _odds_for_pick(mkt_key: str, mkt_tip: str) -> str:
-        """Return the single odds value for the chosen pick side only."""
-        tip_up = mkt_tip.upper()
+    def _pick_odds(mkt_key: str, pick: str) -> str:
         try:
-            if tip_up in ("1X", "X2", "12"):
-                dc = ev_odds.get("dc", {})
-                if dc:
-                    val = dc.get(mkt_tip)
-                    if val: return str(val)
-            elif "BTTS YES" in tip_up:
+            pu = pick.upper().strip()
+            if mkt_key == "dc":
+                val = ev_odds.get("dc", {}).get(pu)
+                return str(val) if val else ""
+            elif mkt_key == "btts":
                 b = ev_odds.get("btts", {})
-                if b and b.get("Yes"): return str(b["Yes"])
-            elif "BTTS NO" in tip_up:
-                b = ev_odds.get("btts", {})
-                if b and b.get("No"): return str(b["No"])
-            elif tip_up in ("HOME", "AWAY", "DRAW"):
-                o = ev_odds.get("1x2", {})
-                if o:
-                    k = {"HOME": "1", "DRAW": "X", "AWAY": "2"}[tip_up]
-                    val = o.get(k)
-                    if val: return str(val)
-            elif "OVER" in tip_up or "UNDER" in tip_up:
-                _lbl, _line, over_p, under_p = _best_ou_from_fp(fp_records, ev_odds)
-                val = over_p if "OVER" in tip_up else under_p
-                if val: return str(val)
-            elif "/" in mkt_tip:
-                h = ev_odds.get("htft", {})
-                if h:
-                    val = h.get(mkt_tip)
-                    if val: return str(val)
-        except (TypeError, ValueError, KeyError):
+                val = b.get("Yes") if pu == "YES" else b.get("No")
+                return str(val) if val else ""
+            elif mkt_key == "1x2":
+                k = {"HOME":"1","DRAW":"X","AWAY":"2"}.get(pu)
+                val = ev_odds.get("1x2", {}).get(k) if k else None
+                return str(val) if val else ""
+            elif mkt_key in ("ou","o/u"):
+                parts = pu.split()
+                if len(parts) == 2:
+                    side, line = parts[0], parts[1]
+                    ou_map = _ou_all_from_odds(ev_odds.get("ou", []))
+                    bucket = ou_map.get(line, {})
+                    val = bucket.get("over") if side == "OVER" else bucket.get("under")
+                    return str(val) if val else ""
+            elif mkt_key == "htft":
+                val = ev_odds.get("htft", {}).get(pu)
+                return str(val) if val else ""
+        except Exception:
             pass
         return ""
 
-    # Determine signal summary (max 3 lines, clean words)
-    _signals = []
-    _mkt_form = 0.5
-    try:
-        from collections import Counter as _Counter
-        _mh = {}
-        for _mk in ("dc", "btts", "ou"):
-            _f = _get_market_form_global(ev_odds, _mk)  # placeholder, use bot_data if available
-    except Exception:
-        pass
-
-    _primary_odds = _odds_for_pick(primary_market, tip)
+    _primary_odds = _pick_odds(primary_market, tip)
     _primary_odds_str = f" — {_primary_odds}" if _primary_odds else ""
 
     text = (
@@ -1571,23 +1354,17 @@ def pro_card(
         f"⚠️ Risk : *{risk}*\n"
     )
 
-    # ONE secondary only — clean and readable
     if extra_markets:
         _sec_mkt, _sec_tip = extra_markets[0]
         _sec_label = {
-            "dc":"DC","btts":"BTTS","ou":"O/U","htft":"HT/FT","1x2":"1X2"
+            "dc":"DC","btts":"BTTS","ou":"O/U","htft":"HT/FT","1x2":"1X2",
         }.get(_sec_mkt.lower(), _sec_mkt.upper())
-        _sec_odds = _odds_for_pick(_sec_mkt, _sec_tip)
+        _sec_odds     = _pick_odds(_sec_mkt, _sec_tip)
         _sec_odds_str = f" — {_sec_odds}" if _sec_odds else ""
         text += f"🔁 Secondary  : *{_sec_label} {_sec_tip}*{_sec_odds_str}\n"
 
     text += "\n━━━━━━━━━━━━━━━━━━"
     return text
-
-
-def _get_market_form_global(ev_odds: dict, market: str) -> str:
-    """Placeholder — returns empty string. Real form comes from bot_data."""
-    return ""
 
 
 def multi_market_predict(odds: dict, bot_data: dict | None = None) -> dict:
@@ -1808,30 +1585,6 @@ def update_market_learning(bot_data: dict, predicted: str, actual: str, odds: di
         f"📊 market_learning updated — predicted={predicted} actual={actual} | "
         + " ".join(f"{k}={v['correct']}/{v['total']}" for k, v in weights.items())
     )
-
-    # ── Odds memory update: track win/loss per exact odds band per market ──────
-    # This feeds _odds_memory_boost() for future predictions.
-    _om_dc = odds.get("dc", {})
-    if _om_dc:
-        try:
-            _om_best = min(_om_dc.items(), key=lambda x: float(x[1]))[0]
-            _om_price = float(_om_dc[_om_best])
-            _om_won = ((_om_best == "1X" and actual in ("HOME","DRAW")) or
-                       (_om_best == "X2" and actual in ("AWAY","DRAW")) or
-                       (_om_best == "12" and actual in ("HOME","AWAY")))
-            _odds_memory_update(bot_data, "dc", _om_price, _om_won)
-        except (TypeError, ValueError, StopIteration):
-            pass
-    _om_btts = odds.get("btts", {})
-    if _om_btts:
-        try:
-            _om_yes = float(_om_btts.get("Yes", 99))
-            _om_no  = float(_om_btts.get("No",  99))
-            _om_price_b = min(_om_yes, _om_no)
-            _om_btts_won = ((_om_yes < _om_no) == (actual != "DRAW"))
-            _odds_memory_update(bot_data, "btts", _om_price_b, _om_btts_won)
-        except (TypeError, ValueError):
-            pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4186,16 +3939,14 @@ def predict_match(home: str, away: str, stats: dict,
         if mm_pick and mm_pick == tip_outcome:
             conf = round(min(97.0, conf + 1.5), 1)
 
-    # ── Loss-streak risk protection (calibrated) ────────────────────────────
+    # ── Loss-streak risk protection ─────────────────────────────────────────
+    # Confidence reduction only — never override a market-specific pick direction.
+    # DC/BTTS resolve independently of HOME/DRAW/AWAY, so forcing DRAW breaks them.
     if _bd_ref is not None:
         _risk   = _risk_control(_bd_ref)
         _streak = _risk.get("loss_streak", 0)
         if _streak >= 3:
-            conf = round(max(45.0, conf - 10.0), 1)   # gentle trim
-        if _streak >= 6 and tip_outcome != "DRAW":      # higher threshold
-            tip         = "DRAW / CLOSE"
-            icon        = "\U0001f91d"
-            tip_outcome = "DRAW"
+            conf = round(max(45.0, conf - 10.0), 1)
 
     # ── Market rolling intelligence — adjust btts/o25 prediction confidence ─────
     # Use last 200 match rolling accuracy per market to weight predictions.
@@ -12068,8 +11819,9 @@ async def _run_auto_post(bot, bot_data: dict):
                         _dc_covers = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
                         if _dyn_tip in _dc_covers:
                             ok = bp_t in _dc_covers[_dyn_tip]
-                        elif _primary_mkt == "btts" or _dyn_tip in ("BTTS YES","BTTS NO"):
-                            ok = (_btts_actual == (_dyn_tip != "BTTS NO"))
+                        elif _primary_mkt == "btts" or _dyn_tip in ("YES","NO","BTTS YES","BTTS NO"):
+                            _is_yes = _dyn_tip in ("YES", "BTTS YES")
+                            ok = (_btts_actual == _is_yes)
                         elif _primary_mkt == "ou" or "OVER" in str(_dyn_tip).upper() or "UNDER" in str(_dyn_tip).upper():
                             _is_over = "OVER" in str(_dyn_tip).upper()
                             try:
@@ -12321,86 +12073,59 @@ async def _run_auto_post(bot, bot_data: dict):
                         + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
 
-                    # ── Final card (Pro Card format) ──────────────────────────
-                    # ── DYNAMIC RANKED MARKET SELECTION ──────────────────────
-                    # Build per-market scores using: accuracy + form + synergy
-                    # Then rank them: highest = primary, second = secondary (shown on card)
-
+                    # ── MARKET COMPETITION ENGINE ─────────────────────────────
                     _fp_db_card = league_model.get("fingerprint_db", {})
                     _fk_card    = "|".join(sorted([m["home"], m["away"]]))
                     _recs_card  = _fp_db_card.get(_fk_card, [])
+                    _wts        = _ml_weights(bot_data)
+                    _mh         = bot_data.get("market_history", {})
 
-                    # Base scores from ml_weights accuracy × 100
-                    _wts_raw  = _ml_weights(bot_data)
-                    _dyn_w    = _dynamic_market_weights(bot_data)
-                    _mkt_scores: dict[str, float] = {}
-                    for _mk in ("dc", "btts", "ou", "1x2", "htft"):
-                        _rec  = _wts_raw.get(_mk, {"correct": 1, "total": 2})
-                        _t    = max(_rec.get("total", 2), 2)
-                        _acc  = _rec.get("correct", 1) / _t * 100
-                        _form = _get_market_form(bot_data, _mk, 50) * 100
-                        # Only include markets that actually passed the MME filter
-                        if _mk in _best_mkts_now:
-                            _mkt_scores[_mk] = _acc * 0.60 + _form * 0.40
-                        else:
-                            # Non-selected markets still get a lower base score
-                            # so they can appear as secondary if strong enough
-                            _mkt_scores[_mk] = (_acc * 0.60 + _form * 0.40) * 0.70
+                    def _mkt_score(key: str) -> float:
+                        rec    = _wts.get(key, {"correct": 1, "total": 2})
+                        t      = max(rec.get("total", 2), 2)
+                        acc    = rec.get("correct", 1) / t
+                        hist   = _mh.get(key, [])
+                        recent = hist[-50:] if hist else []
+                        form   = sum(recent) / len(recent) if len(recent) >= 5 else acc
+                        raw    = acc * 0.60 + form * 0.40
+                        cal    = 1.0 if key in _best_mkts_now else 0.75
+                        return raw * 100 * cal
 
-                    # Apply market synergy adjustments
-                    _odds_repeating_flag = bool(_repeat_chk.get("matched"))
-                    _mkt_scores = _apply_market_synergy(
-                        _mkt_scores, bot_data, ev_odds,
-                        league_model, odds_repeating=_odds_repeating_flag
-                    )
+                    _scores: dict[str, float] = {
+                        k: _mkt_score(k) for k in ("dc", "btts", "ou", "1x2", "htft")
+                    }
 
-                    # Apply position pattern boost to primary candidates
-                    _pos_boost = _position_pattern_boost(
-                        m["home"], m["away"],
-                        bot_data.get(f"standings_{lid}", {}),
-                        league_model
-                    )
-                    # Position boost strengthens the leading market
-                    _top_mkt_tmp = max(_mkt_scores, key=_mkt_scores.get)
-                    _mkt_scores[_top_mkt_tmp] = _mkt_scores[_top_mkt_tmp] + _pos_boost
+                    # Per-market trap filtering — downgrades only that market
+                    if _is_trap:
+                        for _tk in ("1x2", "htft"):
+                            _scores[_tk] = _scores.get(_tk, 50) * 0.50
+                        _scores["dc"] = _scores.get("dc", 50) * 0.80
+                    if _repeat_chk.get("matched"):
+                        _scores["dc"]   = min(100, _scores.get("dc",   50) + 8)
+                        _scores["btts"] = min(100, _scores.get("btts", 50) + 5)
+                        _scores["1x2"]  = max(0,   _scores.get("1x2",  50) - 10)
+                        _scores["htft"] = max(0,   _scores.get("htft", 50) - 8)
+                    if _league_acc < 0.50:
+                        _scores["dc"]   = min(100, _scores.get("dc",   50) + 8)
+                        _scores["btts"] = min(100, _scores.get("btts", 50) + 5)
+                        _scores["1x2"]  = max(0,   _scores.get("1x2",  50) - 8)
 
-                    # Apply odds memory boost to dc and btts
-                    for _om_mkt in ("dc", "btts"):
-                        _om_odds = ev_odds.get(_om_mkt, {})
-                        if _om_odds:
-                            try:
-                                _om_best_k = min(_om_odds, key=lambda k: float(_om_odds[k]))
-                                _om_price  = float(_om_odds[_om_best_k])
-                                _om_boost  = _odds_memory_boost(bot_data, _om_mkt, _om_price)
-                                _mkt_scores[_om_mkt] = _mkt_scores.get(_om_mkt, 50) + _om_boost
-                            except (TypeError, ValueError):
-                                pass
+                    _ranked = sorted(_scores.items(), key=lambda x: -x[1])
+                    _primary_mkt   = _ranked[0][0]
+                    _primary_score = _ranked[0][1]
 
-                    # Rank markets by score — primary = highest, secondary = second
-                    _ranked_mkts = sorted(
-                        [(mk, sc) for mk, sc in _mkt_scores.items() if sc > 0],
-                        key=lambda x: -x[1]
-                    )
+                    if _primary_score < 55:
+                        continue   # no market good enough — skip
 
-                    # Primary = top ranked market
-                    _primary_mkt = _ranked_mkts[0][0] if _ranked_mkts else "1x2"
-
-                    # Secondary = second ranked, only if score difference < 25pts
-                    # and market is different enough (not same family)
                     _secondary_mkt = None
-                    if len(_ranked_mkts) >= 2:
-                        _sec_candidate = _ranked_mkts[1][0]
-                        _score_gap     = _ranked_mkts[0][1] - _ranked_mkts[1][1]
-                        # Don't show secondary if gap too large (primary dominates)
-                        # and ensure it's actually in passing markets or close to it
-                        if _score_gap < 25 and _ranked_mkts[1][1] > 40:
-                            _secondary_mkt = _sec_candidate
+                    if len(_ranked) >= 2:
+                        _sec_key, _sec_score = _ranked[1]
+                        if _sec_score >= 50 and (_primary_score - _sec_score) < 20:
+                            _secondary_mkt = _sec_key
 
-                    # Get pick strings for primary and secondary
                     _dyn_tip, _dyn_odds_hint = get_final_pick(
                         _primary_mkt, p, ev_odds, fp_records=_recs_card
                     )
-
                     _extra_mkts_card = []
                     if _secondary_mkt:
                         _sec_tip, _ = get_final_pick(
@@ -12408,7 +12133,7 @@ async def _run_auto_post(bot, bot_data: dict):
                         )
                         _extra_mkts_card = [(_secondary_mkt, _sec_tip)]
 
-                    # 2. Risk level from trap score
+                    # Risk from trap
                     if _trap_score >= 4:
                         _risk_label = "HIGH"
                     elif _trap_score >= 2:
@@ -12416,7 +12141,6 @@ async def _run_auto_post(bot, bot_data: dict):
                     else:
                         _risk_label = "LOW"
 
-                    # 3. Agreement totals
                     _agree_total_card = max(len(_best_mkts_now), 1)
 
                     # 5. Build the clean card
@@ -12495,6 +12219,161 @@ async def _run_auto_post(bot, bot_data: dict):
             except Exception as exc:
                 import traceback
                 log.warning(f"auto_post lid={lid}: {exc}\n{traceback.format_exc()}")
+
+    # ── IMMEDIATE RESULT UPDATES ───────────────────────────────────────────────
+    # Runs every tick BEFORE any early-return. Results are revealed the moment
+    # scores arrive — no waiting for next prediction or skip message.
+    _pending_updates = bot_data.get("pending_result_updates", {})
+    if _pending_updates:
+        _ru_acc = _access(bot_data)
+        _ru_targets: set = set()
+        if ADMIN_ID:    _ru_targets.add(str(ADMIN_ID))
+        if CHANNEL_ID:  _ru_targets.add(str(CHANNEL_ID))
+        _ru_targets.update(str(x) for x in _ru_acc.get("allowed_channels", set()))
+        for _rc in bot_data.get("auto_chats", set()):
+            try:
+                _ruid = int(_rc)
+            except (ValueError, TypeError):
+                _ruid = 0
+            if _ruid < 0 or _is_authorized_user(_ruid, bot_data) or (ADMIN_ID and _ruid == ADMIN_ID):
+                _ru_targets.add(str(_rc))
+        _ru_msg_ids   = bot_data.setdefault("auto_msg_ids", {})
+        _done_keys    = []
+
+        for _upd_key, _upd in list(_pending_updates.items()):
+            _upd_lid    = _upd.get("lid")
+            _upd_rid    = _upd.get("round_id")
+            _upd_scores = _upd.get("scores", {})
+            if not _upd_scores:
+                _done_keys.append(_upd_key)
+                continue
+
+            _lid_s    = str(_upd_lid)
+            _rid_s    = str(_upd_rid)
+            _card_rid = str(_upd.get("card_rid", "") or _rid_s)
+
+            # Find stored card metadata
+            _stored_cards = (
+                bot_data.get(f"sent_cards_{_lid_s}_{_card_rid}") or
+                bot_data.get(f"sent_cards_{_lid_s}_{_rid_s}") or
+                bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", [])
+            )
+            if not _stored_cards:
+                for _sk2 in list(bot_data.keys()):
+                    if _sk2.startswith(f"sent_cards_{_upd_lid}_") and bot_data[_sk2]:
+                        _stored_cards = bot_data[_sk2]
+                        _card_rid     = _sk2.replace(f"sent_cards_{_upd_lid}_", "")
+                        log.info(f"result_update: found cards via scan {_sk2}")
+                        break
+            if not _stored_cards:
+                log.info(f"result_update: no stored cards for lid={_upd_lid} "
+                         f"prev_rid={_upd_rid} — retrying next tick")
+                continue
+
+            _any_edited        = False
+            _any_msg_ids_found = False
+
+            for _ru_chat in _ru_targets:
+                _ru_chat_msgs = _ru_msg_ids.get(str(_ru_chat), {})
+                _mid_list = (
+                    _ru_chat_msgs.get(f"{_lid_s}_prev_cards_{_card_rid}") or
+                    _ru_chat_msgs.get(f"{_lid_s}_prev_cards_{_rid_s}") or
+                    _ru_chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}") or
+                    _ru_chat_msgs.get(f"{_lid_s}_cards") or
+                    []
+                )
+                if not _mid_list:
+                    continue
+                _any_msg_ids_found = True
+
+                for idx, card_info in enumerate(_stored_cards):
+                    if idx >= len(_mid_list):
+                        break
+                    _h    = card_info.get("home", "")
+                    _a    = card_info.get("away", "")
+                    _tip  = card_info.get("tip", "")
+                    _dtip = card_info.get("dyn_tip", _tip)
+                    _pmkt = card_info.get("primary_mkt", "1x2")
+                    fk    = _fixture_key(_h, _a)
+                    score = _upd_scores.get(fk) or _upd_scores.get(f"{_h}|{_a}")
+                    _rev  = False
+                    if not score:
+                        score = _upd_scores.get(f"{_a}|{_h}")
+                        _rev  = True
+                    if not score:
+                        continue
+                    sh, sa = score
+                    if _rev: sh, sa = sa, sh
+                    ft_out  = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
+                    _btts_a = sh > 0 and sa > 0
+                    _dc_cov = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
+
+                    if _dtip in _dc_cov:
+                        ok = ft_out in _dc_cov[_dtip]
+                    elif _pmkt == "btts" or _dtip in ("YES","NO","BTTS YES","BTTS NO","BTTS"):
+                        _is_yes = _dtip in ("YES", "BTTS YES")
+                        ok = (_btts_a == _is_yes)
+                    elif _pmkt == "ou" or "OVER" in str(_dtip).upper() or "UNDER" in str(_dtip).upper():
+                        _is_ov = "OVER" in str(_dtip).upper()
+                        try:
+                            _ln = float(str(_dtip).upper().replace("OVER","").replace("UNDER","").strip())
+                        except ValueError:
+                            _ln = 2.5
+                        ok = ((sh + sa) > _ln) == _is_ov
+                    elif _pmkt == "htft" and "/" in str(_dtip):
+                        _ftc = _dtip.split("/")[-1] if "/" in _dtip else ""
+                        ok   = ({"1":"HOME","X":"DRAW","2":"AWAY"}.get(_ftc) == ft_out)
+                    else:
+                        ok = (_dtip.split()[0] if _dtip else "") == ft_out
+
+                    _res_str = f"{'✅' if ok else '❌'} {sh}–{sa}"
+                    new_text = card_info.get("card_text", "").replace("⏳ pending", _res_str)
+                    if new_text and "⏳ pending" not in new_text:
+                        try:
+                            await bot.edit_message_text(
+                                chat_id=_ru_chat,
+                                message_id=_mid_list[idx],
+                                text=new_text,
+                                parse_mode="Markdown",
+                            )
+                            await asyncio.sleep(0.2)
+                            _any_edited = True
+                            log.info(f"✅ Result updated: lid={_upd_lid} {_h}v{_a} → {_res_str}")
+                        except Exception as _ex:
+                            if "Message is not modified" not in str(_ex):
+                                log.warning(f"result edit failed → {_ru_chat} {_h}v{_a}: {_ex}")
+                            else:
+                                _any_edited = True  # already correct
+
+            if _any_edited:
+                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
+                # Trigger market learning now that result is known
+                for _ci in _stored_cards:
+                    fk_ci = _fixture_key(_ci.get("home",""), _ci.get("away",""))
+                    sc_ci = _upd_scores.get(fk_ci) or _upd_scores.get(f"{_ci.get('home','')}|{_ci.get('away','')}")
+                    _ci_rev = False
+                    if not sc_ci:
+                        sc_ci   = _upd_scores.get(f"{_ci.get('away','')}|{_ci.get('home','')}")
+                        _ci_rev = True
+                    if sc_ci:
+                        _sh_c, _sa_c = sc_ci
+                        if _ci_rev: _sh_c, _sa_c = _sa_c, _sh_c
+                        _ft_c   = "HOME" if _sh_c > _sa_c else "AWAY" if _sa_c > _sh_c else "DRAW"
+                        _os_sn  = (bot_data.get("odds_store", {})
+                                   .get(_lid_s, {}).get(_rid_s, {})
+                                   .get(fk_ci, {}).get("odds_snapshot", {}))
+                        if _os_sn:
+                            update_market_learning(bot_data, _ci.get("primary_mkt","1x2"), _ft_c, _os_sn)
+                _done_keys.append(_upd_key)
+
+            elif not _any_msg_ids_found and _stored_cards:
+                # Cards exist but no message IDs (lost on redeploy) — can't edit, mark done
+                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
+                log.warning(f"⚠️ result_update: lid={_upd_lid} rid={_upd_rid} — no msg IDs, marking done")
+                _done_keys.append(_upd_key)
+
+        for _dk in _done_keys:
+            _pending_updates.pop(_dk, None)
 
     if not sections:
         if not _had_events:
@@ -12603,176 +12482,6 @@ async def _run_auto_post(bot, bot_data: dict):
 
     brain_block = _brain_summary(bot_data)
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
-
-    # ── Update previously sent cards with results ──────────────────────────────
-    # Runs EVERY tick BEFORE any early-return so results always fire regardless of round state.
-    _pending_updates = bot_data.get("pending_result_updates", {})
-    if _pending_updates:
-        _ru_acc = _access(bot_data)
-        _ru_targets = set()
-        if ADMIN_ID: _ru_targets.add(str(ADMIN_ID))
-        if CHANNEL_ID: _ru_targets.add(str(CHANNEL_ID))
-        _ru_targets.update(str(x) for x in _ru_acc.get("allowed_channels", set()))
-        _ru_chats = bot_data.get("auto_chats", set())
-        for _rc in _ru_chats:
-            try:
-                _ruid = int(_rc)
-            except (ValueError, TypeError):
-                _ruid = 0
-            if _ruid < 0 or _is_authorized_user(_ruid, bot_data) or (ADMIN_ID and _ruid == ADMIN_ID):
-                _ru_targets.add(str(_rc))
-        _ru_msg_ids = bot_data.setdefault("auto_msg_ids", {})
-
-        _processed_keys = []
-        for _upd_key, _upd in list(_pending_updates.items()):
-            _upd_lid     = _upd.get("lid")
-            _upd_rid     = _upd.get("round_id")
-            _upd_scores  = _upd.get("scores", {})
-            if not _upd_scores:
-                _processed_keys.append(_upd_key)
-                continue
-
-            _lid_str_key  = str(_upd_lid)
-            _rid_str_key  = str(_upd_rid)
-            # card_rid is the round whose cards were actually sent (may differ from prev_rid)
-            _card_rid_key = str(_upd.get("card_rid", "") or _rid_str_key)
-
-            # Try card_rid first, then prev_rid, then scan all keys for this league
-            _stored_cards = (
-                bot_data.get(f"sent_cards_{_lid_str_key}_{_card_rid_key}") or
-                bot_data.get(f"sent_cards_{_lid_str_key}_{_rid_str_key}") or
-                bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", [])
-            )
-            # Last resort: scan all sent_cards_ for this league
-            if not _stored_cards:
-                for _sk2 in list(bot_data.keys()):
-                    if _sk2.startswith(f"sent_cards_{_upd_lid}_") and bot_data[_sk2]:
-                        _stored_cards  = bot_data[_sk2]
-                        _card_rid_key  = _sk2.replace(f"sent_cards_{_upd_lid}_", "")
-                        log.info(f"result_update: found cards via scan {_sk2}")
-                        break
-            if not _stored_cards:
-                log.info(f"result_update: no stored cards for lid={_upd_lid} "
-                         f"prev_rid={_upd_rid} card_rid={_card_rid_key} — retrying next tick. "
-                         f"Available: {[k for k in bot_data if k.startswith('sent_cards_')]}")
-                continue
-
-            _any_edited = False
-            _any_msg_ids_found = False
-            for _ru_chat in _ru_targets:
-                _ru_chat_msgs = _ru_msg_ids.get(str(_ru_chat), {})
-                _mid_list = (
-                    _ru_chat_msgs.get(f"{_lid_str_key}_prev_cards_{_card_rid_key}") or
-                    _ru_chat_msgs.get(f"{_lid_str_key}_prev_cards_{_rid_str_key}") or
-                    _ru_chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}") or
-                    _ru_chat_msgs.get(f"{_lid_str_key}_cards") or
-                    []
-                )
-                if not _mid_list:
-                    log.info(f"result_update: no msg_ids for chat={_ru_chat} lid={_upd_lid} "
-                             f"card_rid={_card_rid_key} prev_rid={_upd_rid} — "
-                             f"available keys: {list(_ru_chat_msgs.keys())[:8]}")
-                    continue
-                _any_msg_ids_found = True
-                for idx, card_info in enumerate(_stored_cards):
-                    if idx >= len(_mid_list):
-                        break
-                    _h = card_info.get("home", "")
-                    _a = card_info.get("away", "")
-                    _tip     = card_info.get("tip", "")
-                    _dyn_tip = card_info.get("dyn_tip", _tip)
-                    _pmkt    = card_info.get("primary_mkt", "1x2")
-                    fk = _fixture_key(_h, _a)
-                    # Try canonical home|away key first
-                    score = _upd_scores.get(fk) or _upd_scores.get(f"{_h}|{_a}")
-                    _score_reversed = False
-                    if not score:
-                        # Try reversed — but remember to swap scores back to card orientation
-                        score = _upd_scores.get(f"{_a}|{_h}")
-                        _score_reversed = True
-                    if not score:
-                        continue
-                    sh, sa = score
-                    # If we matched via the reversed key, the stored tuple is (away_goals, home_goals)
-                    # relative to the card — swap back so sh=home_goals, sa=away_goals
-                    if _score_reversed:
-                        sh, sa = sa, sh
-                    ft_out = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
-                    _btts_actual = (sh > 0 and sa > 0)
-                    _dc_covers = {"1X": ("HOME","DRAW"), "X2": ("DRAW","AWAY"), "12": ("HOME","AWAY")}
-                    if _dyn_tip in _dc_covers:
-                        ok = ft_out in _dc_covers[_dyn_tip]
-                    elif _pmkt == "btts" or _dyn_tip in ("BTTS YES", "BTTS NO", "BTTS"):
-                        ok = (_btts_actual == (_dyn_tip != "BTTS NO"))
-                    elif _pmkt == "ou" or "OVER" in str(_dyn_tip).upper() or "UNDER" in str(_dyn_tip).upper():
-                        _is_over = "OVER" in str(_dyn_tip).upper()
-                        try:
-                            _line = float(str(_dyn_tip).upper().replace("OVER","").replace("UNDER","").strip())
-                        except ValueError:
-                            _line = 2.5
-                        ok = ((sh + sa) > _line) == _is_over
-                    elif _pmkt == "htft" and "/" in str(_dyn_tip):
-                        _ft_char = _dyn_tip.split("/")[-1] if "/" in _dyn_tip else ""
-                        _ft_dir  = {"1": "HOME", "X": "DRAW", "2": "AWAY"}.get(_ft_char)
-                        ok = (_ft_dir == ft_out) if _ft_dir else False
-                    else:
-                        tip_out = _dyn_tip.split()[0] if _dyn_tip else (_tip.split()[0] if _tip else "")
-                        ok = (tip_out == ft_out)
-                    result_edit_str = f"{'✅' if ok else '❌'} {sh}–{sa}"
-                    new_card = card_info.get("card_text", "").replace("⏳ pending", result_edit_str)
-                    if new_card and "⏳ pending" not in new_card:
-                        try:
-                            await bot.edit_message_text(
-                                chat_id=_ru_chat,
-                                message_id=_mid_list[idx],
-                                text=new_card,
-                                parse_mode="Markdown"
-                            )
-                            await asyncio.sleep(0.2)
-                            _any_edited = True
-                            log.info(f"✅ Result edit: lid={_upd_lid} rid={_upd_rid} {_h}v{_a} → {result_edit_str}")
-                        except Exception as exc:
-                            if "Message is not modified" not in str(exc):
-                                log.warning(f"result edit failed → {_ru_chat} lid={_upd_lid} {_h}v{_a}: {exc}")
-                            else:
-                                _any_edited = True  # already updated — treat as done
-
-            if _any_edited:
-                # Mark as done so we don't re-edit next tick
-                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
-                log.info(f"✅ Results updated for lid={_upd_lid} rid={_upd_rid}")
-                for _ci in _stored_cards:
-                    _ci_h  = _ci.get("home","")
-                    _ci_a  = _ci.get("away","")
-                    _ci_pm = _ci.get("primary_mkt","1x2")
-                    fk_ci  = _fixture_key(_ci_h, _ci_a)
-                    sc_ci  = _upd_scores.get(fk_ci) or _upd_scores.get(f"{_ci_h}|{_ci_a}")
-                    _ci_reversed = False
-                    if not sc_ci:
-                        sc_ci = _upd_scores.get(f"{_ci_a}|{_ci_h}")
-                        _ci_reversed = True
-                    if sc_ci:
-                        _sh_ci, _sa_ci = sc_ci
-                        if _ci_reversed:
-                            _sh_ci, _sa_ci = _sa_ci, _sh_ci  # re-orient to card home/away
-                        _ft_ci = "HOME" if _sh_ci > _sa_ci else "AWAY" if _sa_ci > _sh_ci else "DRAW"
-                        _os_snap = (bot_data.get("odds_store", {})
-                                    .get(str(_upd_lid), {})
-                                    .get(str(_upd_rid), {})
-                                    .get(fk_ci, {})
-                                    .get("odds_snapshot", {}))
-                        if _os_snap:
-                            update_market_learning(bot_data, _ci_pm, _ft_ci, _os_snap)
-            # If we have stored cards but NO message IDs for any chat (lost on redeploy),
-            # we can't edit — mark done to stop infinite retrying and log clearly.
-            if not _any_edited and not _any_msg_ids_found and _stored_cards:
-                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
-                log.warning(f"⚠️ result_update: lid={_upd_lid} rid={_upd_rid} — cards exist but NO message IDs found "
-                            f"(message IDs lost on redeploy). Cannot edit. Marking done.")
-            _processed_keys.append(_upd_key)
-
-        for k in _processed_keys:
-            _pending_updates.pop(k, None)
 
     # ── NEW ROUND — send one message per match card ───────────────────────────
     if round_key != prev_key:
@@ -13971,7 +13680,7 @@ async def _do_brainstat(message, c):
 
         s_icon = "🟢" if _streak == 0 else ("🟡" if _streak < 3 else ("🔴" if _streak < 6 else "⛔"))
         streak_note = (" — conf −10" if _streak >= 3 else "")
-        streak_note += (" — FORCED DRAW" if _streak >= 6 else "")
+        streak_note += (" — caution active" if _streak >= 6 else "")
         _sep26 = "━" * 26
         # ── Signal routing summary per league ────────────────────────────────
         _router_lines = []
@@ -13990,18 +13699,6 @@ async def _do_brainstat(message, c):
                 f"odds:{_rl_ot} fp:{_rl_ft}"
             )
 
-        # ── Odds memory summary ───────────────────────────────────────────────
-        _om_data = c.bot_data.get("odds_memory", {})
-        _om_lines = []
-        for _om_mkt in ("dc", "btts"):
-            _om_mkt_data = _om_data.get(_om_mkt, {})
-            _om_total = sum(v.get("wins",0)+v.get("loss",0) for v in _om_mkt_data.values())
-            _om_wins  = sum(v.get("wins",0) for v in _om_mkt_data.values())
-            if _om_total >= 10:
-                _om_acc = _om_wins / _om_total
-                _om_icon = "✅" if _om_acc > 0.65 else ("⚠️" if _om_acc < 0.45 else "🟡")
-                _om_lines.append(f"  {_om_icon} {_om_mkt.upper()}: {_om_acc:.0%} ({_om_wins}/{_om_total}) across {len(_om_mkt_data)} price bands")
-
         mm_block = (
             _sep26 + "\n"
             "📊 *Multi-Market Engine*\n"
@@ -14012,8 +13709,6 @@ async def _do_brainstat(message, c):
             + s_icon + " Loss streak: *" + str(_streak) + "*" + streak_note + "\n"
             + ("\n🔀 *Signal Router — per league*\n" + "\n".join(_router_lines) + "\n"
                if _router_lines else "")
-            + ("\n🧠 *Odds Memory*\n" + "\n".join(_om_lines) + "\n"
-               if _om_lines else "")
         )
     else:
         mm_block = f"{'━'*26}\n📊 *Multi-Market Engine:* building…\n"
@@ -14168,7 +13863,6 @@ async def _do_backup_inner(message, c):
         "ml_weights":          bd.get("ml_weights", {}),
         "risk":                bd.get("risk", {}),
         "odds_store":          bd.get("odds_store", {}),
-        "odds_memory":         bd.get("odds_memory", {}),
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -14454,10 +14148,6 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     if "odds_store" in data and data["odds_store"]:
         bot_data["odds_store"] = data["odds_store"]
         log.info(f"✅ Restored odds_store from backup")
-
-    if "odds_memory" in data and data["odds_memory"]:
-        bot_data["odds_memory"] = data["odds_memory"]
-        log.info(f"✅ Restored odds_memory from backup")
 
     if "ml_weights" in data and data["ml_weights"]:
         bot_data["ml_weights"] = data["ml_weights"]
@@ -14836,10 +14526,6 @@ def _load_baked_data(bot_data: dict, baked: dict):
     if baked.get("odds_store"):
         bot_data["odds_store"] = baked["odds_store"]
         log.info(f"💾 Restored odds_store from baked data")
-
-    if baked.get("odds_memory"):
-        bot_data["odds_memory"] = baked["odds_memory"]
-        log.info(f"💾 Restored odds_memory from baked data")
 
     if baked.get("pending_predictions"):
         existing = bot_data.setdefault("pending_predictions", {})
