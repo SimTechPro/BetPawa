@@ -353,12 +353,24 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                     period_obj  = pr.get("period") or {}
                     period_slug = str(period_obj.get("slug") or "").upper()
                     pr_type     = str(pr.get("type") or "").upper()
-                    is_fulltime = (
-                        "FULL_TIME" in period_slug or
-                        period_slug == "" or
-                        pr_type == "SCORE"
+
+                    # Require POSITIVE full-time identification.
+                    # Empty slug is NOT treated as full-time — it is ambiguous
+                    # and causes HT scores to be mistaken for FT scores.
+                    _ft_slug = (
+                        "FULL_TIME"    in period_slug or
+                        "REGULAR_TIME" in period_slug or
+                        "SECOND_HALF"  in period_slug or
+                        period_slug    == "FT"
                     )
-                    if "HALF" not in period_slug and is_fulltime:
+                    _ht_slug = (
+                        "FIRST_HALF" in period_slug or
+                        "HALF_TIME"  in period_slug or
+                        period_slug  == "HT"
+                    )
+                    is_fulltime = _ft_slug and not _ht_slug
+
+                    if is_fulltime:
                         v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
                         if v is not None:
                             if "HOME" in ptype:
@@ -366,16 +378,25 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                             elif "AWAY" in ptype:
                                 away_sc = v
 
+                # Fallback: slug was empty/unknown — use pr_type=="SCORE" only
+                # when period number is NOT 1 (first half).
                 if home_sc is None or away_sc is None:
-                    pd_num = entry.get("period")
-                    try:    pd_int = int(pd_num) if pd_num is not None else -1
-                    except: pd_int = -1
-                    if pd_int == 0:
-                        v = _int(entry.get("score") or entry.get("value"))
-                        if v is not None:
-                            pt = ptype.lower()
-                            if "home" in pt:   home_sc = v
-                            elif "away" in pt: away_sc = v
+                    for pr in (entry.get("periodResults") or []):
+                        if not isinstance(pr, dict):
+                            continue
+                        period_obj  = pr.get("period") or {}
+                        period_slug = str(period_obj.get("slug") or "").upper()
+                        period_num  = period_obj.get("id") or period_obj.get("number")
+                        pr_type     = str(pr.get("type") or "").upper()
+                        _slug_empty = period_slug in ("", "NONE")
+                        _is_ht_num  = str(period_num) == "1" if period_num is not None else False
+                        if _slug_empty and pr_type == "SCORE" and not _is_ht_num:
+                            v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                            if v is not None:
+                                if "HOME" in ptype and home_sc is None:
+                                    home_sc = v
+                                elif "AWAY" in ptype and away_sc is None:
+                                    away_sc = v
 
             if home_sc is not None and away_sc is not None:
                 return home_sc, away_sc
