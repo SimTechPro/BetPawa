@@ -297,13 +297,28 @@ def _int(v) -> int | None:
         return None
 
 def _extract_score(event: dict) -> tuple[int | None, int | None]:
-    """Extract home/away full-time score from event dict."""
+    """
+    Extract home/away FULL-TIME score from event dict.
+
+    betPawa participantPeriodResults contains one entry per participant (HOME/AWAY).
+    Each entry has a periodResults list — one item per period (HT, FT, etc.).
+    The slug/type fields are unreliable across API versions.
+
+    STRATEGY: collect ALL numeric scores per participant across all periods,
+    then take the MAXIMUM — full-time is always >= half-time, so the highest
+    value is the final score. This is robust regardless of slug naming.
+
+    Exception: if there is only ONE period result entry, use it directly
+    (some rounds only return the final score).
+    """
 
     # 0. injected scores (from two-stage prediction flow)
     _ih = event.get("_injected_score_h")
     _ia = event.get("_injected_score_a")
     if _ih is not None and _ia is not None:
         return int(_ih), int(_ia)
+
+    # 1. top-level score dict
     sc = event.get("score")
     if isinstance(sc, dict):
         h = _int(sc.get("home") or sc.get("homeScore") or sc.get("scoreHome"))
@@ -311,7 +326,7 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
         if h is not None and a is not None:
             return h, a
 
-    # 2. top-level HomeScore / AwayScore
+    # 2. top-level HomeScore / AwayScore fields
     h = _int(event.get("HomeScore") or event.get("homeScore"))
     a = _int(event.get("AwayScore") or event.get("awayScore"))
     if h is not None and a is not None:
@@ -319,87 +334,113 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
 
     # 3. results sub-dict
     res = event.get("results")
-    if isinstance(res, dict):
+    if not isinstance(res, dict):
+        return None, None
 
-        for sub in ("scoreboard", "display", "fullTime", "score"):
-            s2 = res.get(sub)
-            if isinstance(s2, dict):
-                h = _int(s2.get("scoreHome") or s2.get("home") or s2.get("homeScore"))
-                a = _int(s2.get("scoreAway") or s2.get("away") or s2.get("awayScore"))
-                if h is not None and a is not None:
-                    return h, a
+    # 3a. named sub-dicts (fullTime is unambiguous when present)
+    for sub in ("fullTime", "scoreboard", "display", "score"):
+        s2 = res.get(sub)
+        if isinstance(s2, dict):
+            h = _int(s2.get("scoreHome") or s2.get("home") or s2.get("homeScore"))
+            a = _int(s2.get("scoreAway") or s2.get("away") or s2.get("awayScore"))
+            if h is not None and a is not None:
+                return h, a
 
-        h = _int(res.get("HomeScore") or res.get("homeScore") or res.get("scoreHome"))
-        a = _int(res.get("AwayScore") or res.get("awayScore") or res.get("scoreAway"))
-        if h is not None and a is not None:
-            return h, a
+    # 3b. flat scoreHome/scoreAway on results dict
+    h = _int(res.get("HomeScore") or res.get("homeScore") or res.get("scoreHome"))
+    a = _int(res.get("AwayScore") or res.get("awayScore") or res.get("scoreAway"))
+    if h is not None and a is not None:
+        return h, a
 
-        # participantPeriodResults — betPawa confirmed structure
-        ppr = res.get("participantPeriodResults")
-        if isinstance(ppr, list) and ppr:
-            home_sc = away_sc = None
-            for entry in ppr:
-                if not isinstance(entry, dict):
+    # 3c. participantPeriodResults — take MAX across all periods per participant.
+    #     FT >= HT always, so the highest value is always the final score.
+    #     Log the raw structure once so we can see actual slug values.
+    ppr = res.get("participantPeriodResults")
+    if isinstance(ppr, list) and ppr:
+        home_vals = []
+        away_vals = []
+        _logged   = False
+
+        for entry in ppr:
+            if not isinstance(entry, dict):
+                continue
+            p_info = entry.get("participant") or {}
+            ptype  = str(
+                p_info.get("type") or entry.get("type") or
+                entry.get("participantType") or entry.get("side") or ""
+            ).upper()
+
+            period_results = entry.get("periodResults") or []
+
+            # Log raw structure once per process lifetime so we can see slugs
+            if not _logged and period_results:
+                _logged = True
+                _pr0 = period_results[0] if period_results else {}
+                log.debug(
+                    f"PPR DEBUG ptype={ptype} "
+                    f"n_periods={len(period_results)} "
+                    f"period0_keys={list(_pr0.keys())} "
+                    f"period0_period={_pr0.get('period')} "
+                    f"period0_type={_pr0.get('type')} "
+                    f"period0_result={_pr0.get('result')} "
+                    f"period0_score={_pr0.get('score')} "
+                    f"all_periods={[{'period':pr.get('period'),'type':pr.get('type'),'result':pr.get('result'),'score':pr.get('score')} for pr in period_results]}"
+                )
+
+            for pr in period_results:
+                if not isinstance(pr, dict):
                     continue
-                p_info = entry.get("participant") or {}
-                ptype = str(
-                    p_info.get("type") or entry.get("type") or
-                    entry.get("participantType") or entry.get("side") or ""
-                ).upper()
+                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                if v is None:
+                    continue
 
-                for pr in (entry.get("periodResults") or []):
-                    if not isinstance(pr, dict):
-                        continue
-                    period_obj  = pr.get("period") or {}
-                    period_slug = str(period_obj.get("slug") or "").upper()
-                    pr_type     = str(pr.get("type") or "").upper()
+                # Explicitly skip if the period identifies itself as half-time
+                period_obj  = pr.get("period") or {}
+                period_slug = str(period_obj.get("slug") or "").upper()
+                period_name = str(period_obj.get("name") or "").upper()
+                pr_type     = str(pr.get("type") or "").upper()
+                _is_ht = (
+                    "FIRST_HALF" in period_slug or "HALF_TIME" in period_slug or
+                    "FIRST_HALF" in period_name or "HALF_TIME" in period_name or
+                    period_slug == "HT" or period_name == "HT" or
+                    pr_type == "HALF_TIME"
+                )
+                if _is_ht:
+                    continue   # skip — this is definitely HT
 
-                    # Require POSITIVE full-time identification.
-                    # Empty slug is NOT treated as full-time — it is ambiguous
-                    # and causes HT scores to be mistaken for FT scores.
-                    _ft_slug = (
-                        "FULL_TIME"    in period_slug or
-                        "REGULAR_TIME" in period_slug or
-                        "SECOND_HALF"  in period_slug or
-                        period_slug    == "FT"
-                    )
-                    _ht_slug = (
-                        "FIRST_HALF" in period_slug or
-                        "HALF_TIME"  in period_slug or
-                        period_slug  == "HT"
-                    )
-                    is_fulltime = _ft_slug and not _ht_slug
+                if "HOME" in ptype:
+                    home_vals.append(v)
+                elif "AWAY" in ptype:
+                    away_vals.append(v)
 
-                    if is_fulltime:
-                        v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
-                        if v is not None:
-                            if "HOME" in ptype:
-                                home_sc = v
-                            elif "AWAY" in ptype:
-                                away_sc = v
+        if home_vals and away_vals:
+            # Take the maximum — FT score is always the largest value
+            return max(home_vals), max(away_vals)
 
-                # Fallback: slug was empty/unknown — use pr_type=="SCORE" only
-                # when period number is NOT 1 (first half).
-                if home_sc is None or away_sc is None:
-                    for pr in (entry.get("periodResults") or []):
-                        if not isinstance(pr, dict):
-                            continue
-                        period_obj  = pr.get("period") or {}
-                        period_slug = str(period_obj.get("slug") or "").upper()
-                        period_num  = period_obj.get("id") or period_obj.get("number")
-                        pr_type     = str(pr.get("type") or "").upper()
-                        _slug_empty = period_slug in ("", "NONE")
-                        _is_ht_num  = str(period_num) == "1" if period_num is not None else False
-                        if _slug_empty and pr_type == "SCORE" and not _is_ht_num:
-                            v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
-                            if v is not None:
-                                if "HOME" in ptype and home_sc is None:
-                                    home_sc = v
-                                elif "AWAY" in ptype and away_sc is None:
-                                    away_sc = v
-
-            if home_sc is not None and away_sc is not None:
-                return home_sc, away_sc
+        # Last resort: if explicit HT-skip left us empty, take max of ALL values
+        # (this handles cases where every period has an ambiguous slug)
+        home_all = []
+        away_all = []
+        for entry in ppr:
+            if not isinstance(entry, dict):
+                continue
+            p_info = entry.get("participant") or {}
+            ptype  = str(
+                p_info.get("type") or entry.get("type") or
+                entry.get("participantType") or entry.get("side") or ""
+            ).upper()
+            for pr in (entry.get("periodResults") or []):
+                if not isinstance(pr, dict):
+                    continue
+                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                if v is None:
+                    continue
+                if "HOME" in ptype:
+                    home_all.append(v)
+                elif "AWAY" in ptype:
+                    away_all.append(v)
+        if home_all and away_all:
+            return max(home_all), max(away_all)
 
     return None, None
 
@@ -13701,6 +13742,305 @@ async def _standings_job(context):
             log.debug(f"standings_job [{lid}]: {_e}")
 
 
+async def _elite_job(context):
+    """
+    Independent Elite Strategy posting job.
+    Runs every 30s on its own — does NOT wait for the main engine to fire.
+
+    Gates (all must pass):
+      1. Strategy pattern qualifies  (strong lost / weak won)
+      2. Market score >= 10          (markets net-agree after ranked validation)
+      3. HT/FT present & NOT conflict (if HT/FT is available it must agree or be absent)
+      4. Cycle not in hard-reject phase at low confidence
+      5. Final confidence >= 75%
+      6. Dedup: never post same league+round_id twice
+
+    Card format is visually distinct from main cards so users know the source.
+    Result update reuses the existing pending_result_updates queue.
+    """
+    import traceback as _tb
+    bot      = context.bot
+    bot_data = context.bot_data
+
+    # Build send targets (same logic as main engine)
+    acc          = _access(bot_data)
+    send_targets = set()
+    if ADMIN_ID:   send_targets.add(str(ADMIN_ID))
+    if CHANNEL_ID: send_targets.add(str(CHANNEL_ID))
+    send_targets.update(str(x) for x in acc.get("allowed_channels", set()))
+    for cid in bot_data.get("auto_chats", set()):
+        try:
+            uid = int(cid)
+        except (ValueError, TypeError):
+            uid = 0
+        if uid < 0 or _is_authorized_user(uid, bot_data) or (ADMIN_ID and uid == ADMIN_ID):
+            send_targets.add(str(cid))
+
+    if not send_targets:
+        return
+
+    async with httpx.AsyncClient() as client:
+        for lid in LEAGUES:
+            try:
+                stats = bot_data.get(f"stats_{lid}")
+                if not stats:
+                    continue
+
+                league_model = _get_model(bot_data, lid)
+                standings    = bot_data.get(f"standings_{lid}", {})
+                if not standings:
+                    continue
+
+                # Need at least some history before firing
+                ml_size = len(league_model.get("match_log", []))
+                if ml_size < 18:
+                    continue
+
+                # Fetch upcoming round with odds
+                try:
+                    round_name, round_id, _season_id, events, _ = await fetch_next_round(client, lid)
+                except Exception:
+                    continue
+
+                if not events or not round_id:
+                    continue
+
+                # Dedup — one elite post per league per round
+                _dedup_key = f"elite_sent_{lid}_{round_id}"
+                if bot_data.get(_dedup_key):
+                    continue
+
+                elite_cards = []
+
+                for raw in events:
+                    try:
+                        m       = _norm_event(raw)
+                        ev_odds = _extract_odds(raw)
+                        home    = m["home"]
+                        away    = m["away"]
+
+                        if not ev_odds.get("1x2"):
+                            continue  # no odds — can't validate markets
+
+                        result = elite_strategy_predict(
+                            home      = home,
+                            away      = away,
+                            odds      = ev_odds,
+                            model     = league_model,
+                            standings = standings,
+                            league_id = lid,
+                        )
+
+                        if not result:
+                            continue
+
+                        # Extra gate: market score must be positive net
+                        if result["market_score"] < 10:
+                            continue
+
+                        # Extra gate: if HT/FT is present it must agree (not conflict)
+                        _htft_det = result["market_details"].get("HTFT")
+                        if _htft_det is False:   # False = conflict, None = absent
+                            continue
+
+                        pred      = result["prediction"]
+                        conf      = result["confidence"]
+                        cycle_lbl = result["cycle_label"]
+                        mkt_det   = result["market_details"]
+                        strat_t   = result["strategy_type"]
+
+                        # Pick highest-ranked confirmed market for display
+                        _ht_map   = {"1": "Home", "X": "Draw", "2": "Away"}
+                        _mkt_show = None
+                        _mkt_ico  = ""
+
+                        if mkt_det.get("HTFT") is True:
+                            _htft_raw = ev_odds.get("htft", {})
+                            try:
+                                _bk, _ = min(_htft_raw.items(), key=lambda x: float(x[1]))
+                                _hp    = _bk.split("/")
+                                _hlbl  = (f"{_ht_map.get(_hp[0],_hp[0])}"
+                                          f"/{_ht_map.get(_hp[1],_hp[1])}"
+                                          if len(_hp) == 2 else _bk)
+                                _mkt_show = f"HT/FT {_hlbl} 🔥"
+                                _mkt_ico  = "⏱"
+                            except Exception:
+                                _mkt_show = "HT/FT 🔥"
+                                _mkt_ico  = "⏱"
+                        elif mkt_det.get("1X2") is True:
+                            _lbl      = "1" if pred == "HOME" else "2"
+                            _mkt_show = f"1X2 — {_lbl} 🔥"
+                            _mkt_ico  = "🎯"
+                        elif mkt_det.get("DC") is True:
+                            _lbl      = "1X" if pred == "HOME" else "X2"
+                            _mkt_show = f"DC — {_lbl}"
+                            _mkt_ico  = "🛡"
+                        elif mkt_det.get("BTTS") is True:
+                            _mkt_show = "BTTS Yes"
+                            _mkt_ico  = "⚽"
+                        elif mkt_det.get("OU") is True:
+                            _mkt_show = "Over 2.5"
+                            _mkt_ico  = "📈"
+
+                        if not _mkt_show:
+                            continue  # no confirmed market to show — skip
+
+                        _pred_icon  = "🏠" if pred == "HOME" else "✈️"
+                        _strat_lbl  = ("Strong LOST → recovers" if strat_t == "STRONG_LOSS"
+                                       else "Weak WON → strong recovers")
+                        _conf_bar   = "█" * int(conf // 10) + "░" * (10 - int(conf // 10))
+
+                        # Market alignment summary (compact)
+                        _mkt_flags  = []
+                        for _mk, _ico2 in [("HTFT","⏱"),("1X2","🎯"),("DC","🛡"),("BTTS","⚽"),("OU","📈")]:
+                            v = mkt_det.get(_mk)
+                            if v is True:  _mkt_flags.append(f"{_ico2}✅")
+                            elif v is False: _mkt_flags.append(f"{_ico2}❌")
+                        _mkt_row = "  ".join(_mkt_flags) if _mkt_flags else "—"
+
+                        card = (
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🧠 *ELITE*  {LEAGUES[lid]['flag']} {LEAGUES[lid]['name'].upper()} • MD{round_name}\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"{_pred_icon} *{home} vs {away}*\n"
+                            f"\n"
+                            f"🎯 Pick     : *{_mkt_ico} {_mkt_show}*\n"
+                            f"📊 Conf     : *{conf:.1f}%*  {_conf_bar}\n"
+                            f"📋 Strategy : {_strat_lbl}\n"
+                            f"🔄 Cycle    : {cycle_lbl}\n"
+                            f"📐 Markets  : {_mkt_row}\n"
+                            f"\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"⏳ pending\n"
+                        )
+
+                        elite_cards.append({
+                            "card":   card,
+                            "home":   home,
+                            "away":   away,
+                            "pred":   pred,
+                            "market": (_mkt_show or "").split()[0].lower(),
+                            "conf":   conf,
+                        })
+
+                    except Exception as _e:
+                        log.debug(f"elite_job lid={lid} match error: {_e}")
+                        continue
+
+                if not elite_cards:
+                    continue
+
+                # Mark dedup
+                bot_data[_dedup_key] = True
+
+                # Send each card individually (same as main engine)
+                _elite_msg_ids = bot_data.setdefault("elite_msg_ids", {})
+
+                for _ec in elite_cards:
+                    for _tgt in send_targets:
+                        try:
+                            _msg = await bot.send_message(
+                                chat_id    = _tgt,
+                                text       = _ec["card"],
+                                parse_mode = "Markdown",
+                            )
+                            # Store msg_id for result update
+                            _elite_msg_ids.setdefault(str(lid), {}).setdefault(
+                                str(round_id), []
+                            ).append({
+                                "chat_id":   _tgt,
+                                "msg_id":    _msg.message_id,
+                                "home":      _ec["home"],
+                                "away":      _ec["away"],
+                                "pred":      _ec["pred"],
+                                "card_text": _ec["card"],
+                            })
+                            log.info(f"🧠 ELITE posted [{LEAGUES[lid]['name']}] "
+                                     f"{_ec['home']} vs {_ec['away']} "
+                                     f"→ {_ec['pred']} conf={_ec['conf']:.1f}% "
+                                     f"chat={_tgt}")
+                        except Exception as _se:
+                            log.warning(f"elite_job send error tgt={_tgt}: {_se}")
+
+            except Exception as _le:
+                log.warning(f"elite_job lid={lid}: {_le}\n{_tb.format_exc()}")
+
+
+async def _elite_result_update_job(context):
+    """
+    Edits Elite cards with ✅/❌ result once the round completes.
+    Runs every 30s alongside the main result updater.
+    """
+    bot      = context.bot
+    bot_data = context.bot_data
+
+    _elite_msg_ids = bot_data.get("elite_msg_ids", {})
+    if not _elite_msg_ids:
+        return
+
+    async with httpx.AsyncClient() as client:
+        for lid_s, rounds in list(_elite_msg_ids.items()):
+            try:
+                lid = int(lid_s)
+            except ValueError:
+                continue
+
+            for rid_s, entries in list(rounds.items()):
+                if not entries:
+                    continue
+
+                # Check if this round has scores now
+                _done_key = f"elite_result_updated_{lid_s}_{rid_s}"
+                if bot_data.get(_done_key):
+                    continue
+
+                try:
+                    score_events = await fetch_round_events(client, rid_s, PAGE_MATCHUPS)
+                    score_events = _filter_league(score_events, lid)
+                    scored       = {e: _extract_score(e) for e in score_events}
+                    scored       = {_norm_event(e)["home"] + "|" + _norm_event(e)["away"]: s
+                                    for e, s in scored.items()
+                                    if s[0] is not None}
+                except Exception:
+                    continue
+
+                if not scored:
+                    continue  # scores not in yet
+
+                all_updated = True
+                for entry in entries:
+                    fk   = entry["home"] + "|" + entry["away"]
+                    sc   = scored.get(fk)
+                    if sc is None:
+                        all_updated = False
+                        continue
+
+                    sh, sa = sc
+                    actual = "HOME" if sh > sa else "AWAY" if sa > sh else "DRAW"
+                    correct = (actual == entry["pred"])
+                    icon    = "✅" if correct else "❌"
+                    result_line = f"{icon} {sh}–{sa}"
+
+                    # Edit the message
+                    try:
+                        _msg_txt = entry.get("last_text", "")
+                        if "⏳ pending" in _msg_txt or not _msg_txt:
+                            pass  # we'll re-fetch — just edit by replacing pending line
+                        await bot.edit_message_text(
+                            chat_id    = entry["chat_id"],
+                            message_id = entry["msg_id"],
+                            text       = (entry.get("card_text", "").replace(
+                                             "⏳ pending", result_line)
+                                          if entry.get("card_text")
+                                          else result_line),
+                            parse_mode = "Markdown",
+                        )
+                    except Exception:
+                        pass  # message may be too old to edit — that's fine
+
+                if all_updated:
+                    bot_data[_done_key] = True
+
 async def _auto_send_job(context):
     await _run_auto_post(context.bot, context.bot_data)
 
@@ -16012,6 +16352,10 @@ def main():
 
     # ── Auto-post every 30 seconds (uses cached stats only) ────────────────────
     app.job_queue.run_repeating(_auto_send_job, interval=30, first=70)
+
+    # ── Elite Strategy independent job — runs every 30s, own dedup ─────────────
+    app.job_queue.run_repeating(_elite_job, interval=30, first=80)
+    app.job_queue.run_repeating(_elite_result_update_job, interval=30, first=85)
 
     # ── Expiry checker — runs every hour ────────────────────────────────────────
     async def _check_expiry_job(context):
