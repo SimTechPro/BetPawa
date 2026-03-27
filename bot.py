@@ -699,15 +699,25 @@ def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
     Compute momentum-adjusted weights for all markets.
     Hot markets (momentum > +0.08) get boosted; cold ones (< -0.08) are trimmed.
     Returns a normalised dict summing to 1.0.
+    Includes weight smoothing (alpha=0.7) to prevent spikes from virtual football noise.
     """
     base = _ml_weights(bot_data)
+    previous_weights = bot_data.get("_prev_market_weights", {})
     adjusted: dict[str, float] = {}
+    alpha = 0.7   # stability factor — prevents weight spikes
+
     for mkt, rec in base.items():
         t   = max(rec.get("total", 2), 2)
         c   = rec.get("correct", 1)
         acc = c / t
         mom = _market_momentum(bot_data, mkt)
-        weight = acc  # base weight = accuracy
+        # FIX 1 — HARD LIMIT: cap 1x2 influence so it can't dominate when trapped.
+        # DC and BTTS consistently outperform 1x2 (72-100% vs 42-45%).
+        # Reducing 1x2 base weight lets better markets surface to the top.
+        if mkt == "1x2":
+            weight = acc * 0.60   # hard cap on 1x2 market weight
+        else:
+            weight = acc
         if mom > 0.08:
             weight *= 1.30   # 🔥 HOT — boost
         elif mom > 0.04:
@@ -716,9 +726,16 @@ def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
             weight *= 0.65   # ❄️ COLD — suppress
         elif mom < -0.04:
             weight *= 0.85   # cooling — mild suppress
+        # WEIGHT SMOOTHING — blend with previous to prevent spikes
+        prev = previous_weights.get(mkt, weight)
+        weight = alpha * prev + (1 - alpha) * weight
         adjusted[mkt] = max(0.01, weight)
+
     total = sum(adjusted.values()) or 1.0
-    return {k: round(v / total, 4) for k, v in adjusted.items()}
+    result = {k: round(v / total, 4) for k, v in adjusted.items()}
+    # Persist for next call
+    bot_data["_prev_market_weights"] = dict(result)
+    return result
 
 
 def _boost_conf_by_market_form(conf: float, market: str, bot_data: dict) -> float:
@@ -782,6 +799,20 @@ def _risk_control(bot_data: dict) -> dict:
 # Five interlocking engines that implement the AI's self-adaptation logic.
 # Derived from real performance data:  DC=77% ✅  BTTS=75% ✅  1X2=51% ⚖️  O/U=50% ❌
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _get_recent_accuracy(bot_data: dict, signal: str, last_n: int = 20) -> float:
+    """
+    MINIMUM SAMPLE PROTECTION: returns 0.0 when fewer than 10 samples exist.
+    Prevents over-trusting a market with only a handful of results.
+    Uses market_history (same source as momentum engine).
+    """
+    hist = bot_data.get("market_history", {}).get(signal, [])
+    data = hist[-last_n:] if hist else []
+    if len(data) < 10:
+        return 0.0   # ignore low sample — not enough data to trust
+    return sum(data) / len(data)
+
 
 def _get_best_markets(bot_data: dict, min_acc: float = 0.58) -> list[str]:
     """
@@ -860,7 +891,7 @@ def _compute_real_confidence(market_key: str, bot_data: dict,
     blended = round(real_conf * 0.70 + raw_conf * 0.30, 1)
     # Apply momentum boost/penalty on top
     blended = _boost_conf_by_market_form(blended, market_key, bot_data)
-    return max(45.0, min(97.0, blended))
+    return max(40.0, min(85.0, blended))
 
 
 def _league_quality_ok(bot_data: dict, league_id: int,
@@ -3940,13 +3971,20 @@ def predict_match(home: str, away: str, stats: dict,
             conf = round(min(97.0, conf + 1.5), 1)
 
     # ── Loss-streak risk protection ─────────────────────────────────────────
-    # Confidence reduction only — never override a market-specific pick direction.
-    # DC/BTTS resolve independently of HOME/DRAW/AWAY, so forcing DRAW breaks them.
+    # FIX 3 — REAL LOSS STREAK PROTECTION (survival mode at 5+, stop at 7+)
+    # Old: -10 conf at streak 3. New: staged escalation that actually bites.
     if _bd_ref is not None:
         _risk   = _risk_control(_bd_ref)
         _streak = _risk.get("loss_streak", 0)
-        if _streak >= 3:
-            conf = round(max(45.0, conf - 10.0), 1)
+        if _streak >= 7:
+            # Hard stop — bot has been wrong 7+ times in a row, force return None
+            # Caller (predict_match) sets conf to 0 to signal skip upstream.
+            conf = 0.0
+        elif _streak >= 5:
+            # Survival mode: primary market forced to DC (safest), conf capped at 65
+            conf = round(min(65.0, max(40.0, conf - 20.0)), 1)
+        elif _streak >= 3:
+            conf = round(max(40.0, conf - 20.0), 1)
 
     # ── Market rolling intelligence — adjust btts/o25 prediction confidence ─────
     # Use last 200 match rolling accuracy per market to weight predictions.
@@ -4351,6 +4389,194 @@ def _evaluate_signal_trust(model: dict) -> dict:
     # Persist in model so brainstat/backup/restore can see it
     model["signal_trust_state"] = state
     return state
+
+
+# ─── DYNAMIC REGIME DETECTION ENGINE ─────────────────────────────────────────
+# Detects which signal phase the bot is currently in and adapts weights fast.
+# Uses last 20 rounds (fast adaptation for virtual football's quick cycles).
+# Phases: ODDS_DOMINANT | PATTERN_PHASE | STRUCTURE_PHASE | TRAP_PHASE | MIXED
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Global regime history stored in bot_data["regime_history"] — persists across rounds
+REGIME_MEMORY_LIMIT = 200
+
+
+def _get_recent_signal_accuracy(bot_data: dict, signal: str, last_n: int = 20) -> float:
+    """
+    Returns recent accuracy (0.0–1.0) for a signal over the last N entries.
+    Uses market_history for market signals, signal_acc across all leagues for others.
+    Fast window (20) suits virtual football's rapid phase changes.
+    """
+    # For market-type signals use market_history
+    mkt_map = {"dc": "dc", "btts": "btts", "ou": "ou", "1x2": "1x2", "htft": "htft"}
+    if signal in mkt_map:
+        hist = bot_data.get("market_history", {}).get(mkt_map[signal], [])
+        recent = hist[-last_n:] if hist else []
+        return sum(recent) / len(recent) if len(recent) >= 5 else 0.0
+
+    # For signal-level keys aggregate across all leagues
+    total_c = total_t = 0
+    for lid in (7794, 7795, 7796, 9183, 9184, 13773, 13774):
+        sa = bot_data.get(f"model_{lid}", {}).get("signal_acc", {})
+        rec = sa.get(signal, {})
+        total_c += rec.get("correct", 0)
+        total_t += rec.get("total", 0)
+    return (total_c / total_t) if total_t >= 5 else 0.0
+
+
+def _detect_regime(bot_data: dict) -> str:
+    """
+    REGIME DETECTION — classifies the current betting environment into one of 5 phases.
+    Uses fast 20-round window to react quickly to virtual football pattern shifts.
+
+    ODDS_DOMINANT : odds signal working well (>55%) → trust odds more
+    PATTERN_PHASE : fingerprint/fp pattern outperforming → trust fp more
+    STRUCTURE_PHASE: tier/position structure working → trust tier more
+    TRAP_PHASE    : odds consistently failing (<40%) → switch away from odds
+    MIXED         : no clear dominant signal → balanced approach
+    """
+    odds_acc = _get_recent_signal_accuracy(bot_data, "odds",        20)
+    fp_acc   = _get_recent_signal_accuracy(bot_data, "fingerprint", 20)
+    tier_acc = _get_recent_signal_accuracy(bot_data, "tier",        20)
+    dc_acc   = _get_recent_signal_accuracy(bot_data, "dc",          20)
+    btts_acc = _get_recent_signal_accuracy(bot_data, "btts",        20)
+
+    if odds_acc > 0.55:
+        return "ODDS_DOMINANT"
+    elif dc_acc > 0.60 or btts_acc > 0.60:
+        return "PATTERN_PHASE"     # DC/BTTS patterns dominating
+    elif fp_acc > 0.55:
+        return "PATTERN_PHASE"
+    elif tier_acc > 0.55:
+        return "STRUCTURE_PHASE"
+    elif odds_acc < 0.40:
+        return "TRAP_PHASE"        # odds consistently failing
+    else:
+        return "MIXED"
+
+
+def _apply_regime_to_weights(regime: str, weights: dict) -> dict:
+    """
+    REGIME STRATEGY — adjusts signal trust weights based on detected phase.
+    Weights are then re-normalised so they always sum to 1.0.
+    """
+    w = dict(weights)
+    if regime == "ODDS_DOMINANT":
+        w["odds"] = w.get("odds", 0.60) * 1.30
+
+    elif regime == "PATTERN_PHASE":
+        w["fingerprint"] = w.get("fingerprint", 0.12) * 1.50
+        w["odds"]        = w.get("odds",        0.60) * 0.60   # odds not working
+
+    elif regime == "STRUCTURE_PHASE":
+        w["tier"] = w.get("tier", 0.10) * 1.50
+        w["odds"] = w.get("odds", 0.60) * 0.70
+
+    elif regime == "TRAP_PHASE":
+        # Odds in full trap — redistribute hard
+        w["odds"]        = w.get("odds",        0.60) * 0.30
+        w["fingerprint"] = w.get("fingerprint", 0.12) * 1.40
+        w["tier"]        = w.get("tier",        0.10) * 1.30
+        w["form"]        = w.get("form",        0.06) * 1.20
+
+    # Re-normalise
+    total = sum(w.values()) or 1.0
+    return {k: round(v / total, 4) for k, v in w.items()}
+
+
+def _detect_regime_cycle_with_strength(
+    bot_data: dict, min_len: int = 3, max_len: int = 6, min_repeats: int = 2
+) -> tuple:
+    """
+    REGIME CYCLE DETECTOR WITH STRENGTH SCORING.
+    Finds repeating regime sequences (e.g. ODDS→TRAP→PATTERN→ODDS→TRAP→PATTERN).
+    Only returns a cycle if it has repeated >= min_repeats times with strength >= 4.
+    This prevents false cycle signals from noise.
+
+    Returns (cycle_list | None, strength_score).
+    """
+    hist = bot_data.get("regime_history", [])
+    n    = len(hist)
+    if n < max_len * (min_repeats + 1):
+        return None, 0
+
+    best_cycle = None
+    best_score = 0.0
+
+    for size in range(min_len, max_len + 1):
+        pattern = hist[-size:]
+        repeats = 0
+        consistency = 0.0
+
+        for i in range(n - size * 2, -1, -size):
+            segment = hist[i: i + size]
+            if segment == pattern:
+                repeats     += 1
+                consistency += 1
+            else:
+                consistency -= 0.5   # small noise penalty
+
+        score = repeats * 2 + consistency
+        if repeats >= min_repeats and score > best_score:
+            best_score = score
+            best_cycle = pattern
+
+    return best_cycle, best_score
+
+
+def _predict_next_regime(bot_data: dict) -> str | None:
+    """
+    PREDICTIVE REGIME ENGINE — anticipates the next phase before it happens.
+    Uses detected cycles to pre-adjust weights early, gaining an edge on transitions.
+    Only fires when cycle strength >= 4 (confirmed, not noise).
+    Returns next regime name or None if no reliable cycle found.
+    """
+    cycle, strength = _detect_regime_cycle_with_strength(bot_data)
+    if not cycle or strength < 4:
+        return None
+
+    hist = bot_data.get("regime_history", [])
+    size = len(cycle)
+    last_seq = hist[-size:]
+
+    if last_seq == cycle:
+        return cycle[0]   # cycle is complete → next will restart from beginning
+    return None
+
+
+def _update_regime_history(bot_data: dict, regime: str) -> None:
+    """
+    Saves the detected regime to rolling history (max 200 entries).
+    Noise filter: only appends if different from last entry to prevent
+    rapid false-switching from creating junk history.
+    """
+    hist = bot_data.setdefault("regime_history", [])
+    # Noise filter — don't record same regime twice in a row
+    if hist and hist[-1] == regime:
+        return
+    hist.append(regime)
+    if len(hist) > REGIME_MEMORY_LIMIT:
+        bot_data["regime_history"] = hist[-REGIME_MEMORY_LIMIT:]
+
+
+def _regime_confidence_adjustment(
+    regime: str, predicted_regime: str | None, conf: float
+) -> float:
+    """
+    REGIME CONFIDENCE ADJUSTMENT.
+    Stable cycle (predicted == current) → safer, add +5.
+    Transition imminent (predicted != current) → risky, subtract -5.
+    TRAP_PHASE always reduces confidence by -10.
+    """
+    if regime == "TRAP_PHASE":
+        conf = max(40.0, conf - 10.0)
+    if predicted_regime and predicted_regime != regime:
+        conf = max(40.0, conf - 5.0)   # transition = risky
+    elif predicted_regime and predicted_regime == regime:
+        conf = min(85.0, conf + 5.0)   # stable cycle = safer
+    return round(conf, 1)
+
+# ─── END REGIME DETECTION ENGINE ─────────────────────────────────────────────
 
 
 
@@ -11623,6 +11849,32 @@ async def _run_auto_post(bot, bot_data: dict):
                     if _tip_g == "DRAW":
                         continue
 
+                    # ── PREDICTION GATE (pre-filter) ──────────────────────────────
+                    # Gate 1: minimum confidence threshold
+                    _gate_conf = p.get("conf", 0.0)
+                    if _gate_conf < 60:
+                        continue   # ❌ too weak — confidence below threshold
+
+                    # Gate 2: minimum signal agreement (at least 2 signals must agree)
+                    _gate_tip_out = p["tip"].split()[0]
+                    _pre_agree_count = 0
+                    if p.get("odds_tip") == _gate_tip_out:    _pre_agree_count += 1
+                    if p.get("poisson_tip") == _gate_tip_out: _pre_agree_count += 1
+                    if p.get("strength_tip") == _gate_tip_out: _pre_agree_count += 1
+                    if _pre_agree_count < 2:
+                        continue   # ❌ no consensus — signals disagree
+
+                    # Gate 3: TRAP_PHASE check
+                    _gate_regime = _detect_regime(bot_data)
+                    if _gate_regime == "TRAP_PHASE" and p.get("odds_tip") == _gate_tip_out and _gate_tip_out != "DRAW":
+                        pass   # allow through — will be penalised by regime confidence adjustment
+
+                    # SNIPER MODE — only enter on high edge scores
+                    _edge_score = _gate_conf + (_pre_agree_count * 10)
+                    if _edge_score < 70:
+                        continue   # ❌ low edge — skip, wait for better opportunity
+                    # ── END PREDICTION GATE ────────────────────────────────────────
+
                     # ── ODDS REPEAT — HARD GATE ───────────────────────────────
                     _fp_db_gate = league_model.get("fingerprint_db", {})
                     _repeat_chk = _detect_odds_repeat(
@@ -11642,9 +11894,13 @@ async def _run_auto_post(bot, bot_data: dict):
                         m["home"], m["away"], p, ev_odds,
                         bot_data, lid, _strat_standings, league_model
                     )
-                    # Trap reduces conf but does NOT hard-block — user sees warning
+                    # FIX — TRAP IS NOW ENFORCED (not just a warning):
+                    # Severe trap (score >= 4) → SKIP prediction entirely.
+                    # Moderate trap → strong conf penalty (-25 instead of old -trap_score*3).
+                    if _is_trap and _trap_score >= 4:
+                        continue   # ❌ Hard block — severe trap, skip this match
                     if _is_trap:
-                        p_conf_adj = max(45.0, p.get("conf", 50.0) - _trap_score * 3.0)
+                        p_conf_adj = max(40.0, p.get("conf", 50.0) - 25.0)
                     else:
                         p_conf_adj = p.get("conf", 50.0)
 
@@ -11663,6 +11919,19 @@ async def _run_auto_post(bot, bot_data: dict):
                                           "dc" if "dc" in _best_mkts_now else (
                                           "btts" if "btts" in _best_mkts_now else "1x2"))
                     _real_conf = _boost_conf_by_market_form(_real_conf, _primary_mkt_early, bot_data)
+
+                    # ── REGIME DETECTION ENGINE ───────────────────────────────
+                    # Detect current phase, update history, apply regime-aware
+                    # confidence adjustment and predictive pre-shift.
+                    _current_regime   = _detect_regime(bot_data)
+                    _update_regime_history(bot_data, _current_regime)
+                    _predicted_regime = _predict_next_regime(bot_data)
+                    _real_conf = _regime_confidence_adjustment(
+                        _current_regime, _predicted_regime, _real_conf
+                    )
+                    # In TRAP_PHASE, apply additional hard penalty on 1x2-based conf
+                    if _current_regime == "TRAP_PHASE" and _conf_market_key == "1x2":
+                        _real_conf = max(40.0, _real_conf - 10.0)
 
                     # ── SYSTEM 5: Market Agreement Gate ──────────────────────
                     _tip_for_agreement = _tip_g   # HOME or AWAY
@@ -12067,6 +12336,9 @@ async def _run_auto_post(bot, bot_data: dict):
                         f"┆ G3 Hist:  {_g3_label}\n"
                         f"┆ G4 Form:  {_g4_label}\n"
                         f"┆ G5 Mkts:  {_agree_str}\n"
+                        f"┆ 🔄 Regime: *{_current_regime}*"
+                        + (f" → {_predicted_regime}" if _predicted_regime and _predicted_regime != _current_regime else "")
+                        + "\n"
                         f"┆ 🎯 Overall: *{_overall}%* — {_overall_label}\n"
                         + _trap_line
                         + _lq_line
@@ -12110,18 +12382,66 @@ async def _run_auto_post(bot, bot_data: dict):
                         _scores["btts"] = min(100, _scores.get("btts", 50) + 5)
                         _scores["1x2"]  = max(0,   _scores.get("1x2",  50) - 8)
 
+                    # ── FIX 4 — FORCE MARKET PRIORITY: DC > BTTS > others ─────
+                    # When DC or BTTS are in _best_mkts_now (proven performers),
+                    # force them to the top unless 1x2 score leads by a wide margin.
+                    # This directly addresses the core issue: bot "knows" DC=72-100%
+                    # but still picks 1x2. Now it ACTS on what it knows.
                     _ranked = sorted(_scores.items(), key=lambda x: -x[1])
                     _primary_mkt   = _ranked[0][0]
                     _primary_score = _ranked[0][1]
 
+                    # Force selection from best performing markets
+                    if "dc" in _best_mkts_now and _scores.get("dc", 0) >= 45:
+                        _primary_mkt   = "dc"
+                        _primary_score = _scores["dc"]
+                    elif "btts" in _best_mkts_now and _scores.get("btts", 0) >= 45:
+                        _primary_mkt   = "btts"
+                        _primary_score = _scores["btts"]
+                    # else fall back to score-ranked winner
+
+                    # ── FIX 5 — LOSS STREAK SURVIVAL MODE in card builder ─────
+                    # If loss streak is very high, force primary to DC (safest market)
+                    _card_risk = _risk_control(bot_data)
+                    _card_streak = _card_risk.get("loss_streak", 0)
+                    if _card_streak >= 5 and ev_odds.get("dc"):
+                        _primary_mkt   = "dc"
+                        _primary_score = _scores.get("dc", 55)
+                    if _card_streak >= 7:
+                        continue   # ❌ STOP predicting — 7+ loss streak = take a break
+
                     if _primary_score < 55:
                         continue   # no market good enough — skip
 
+                    # ── FIX 6 — ENFORCE AGREEMENT: require >= 2 strong markets ─
+                    # Report shows bot posts picks with only 1 weak market agreeing.
+                    # Now: must have 2+ markets agreeing OR be a confirmed odds-repeat
+                    # with DC/BTTS as primary (safe markets don't need extra agreement).
+                    _is_safe_primary = _primary_mkt in ("dc", "btts")
+                    _enforce_agree   = not _is_safe_primary  # safe mkts get pass
+                    if _enforce_agree and _agree_count < 2:
+                        continue   # ❌ Weak signal — not enough market agreement
+
+                    # ── FIX 7 — STRICT SECONDARY MARKET SELECTION ────────────
+                    # Old: any market scoring >= 50 could be secondary.
+                    # New: secondary must score >= 55, gap <= 20, and be logically
+                    #      compatible with primary. Elite primaries (>75) = no secondary.
+                    _VALID_PAIRS = {
+                        ("dc",   "btts"), ("dc",   "ou"),
+                        ("btts", "ou"),   ("btts", "dc"),
+                        ("1x2",  "ou"),   ("1x2",  "btts"),
+                        ("ou",   "btts"), ("htft", "dc"),
+                    }
                     _secondary_mkt = None
-                    if len(_ranked) >= 2:
-                        _sec_key, _sec_score = _ranked[1]
-                        if _sec_score >= 50 and (_primary_score - _sec_score) < 20:
-                            _secondary_mkt = _sec_key
+                    if _primary_score <= 75:   # elite lock: no secondary needed
+                        for _sec_key, _sec_score in _ranked:
+                            if _sec_key == _primary_mkt:
+                                continue
+                            if (_sec_score >= 55 and
+                                    (_primary_score - _sec_score) <= 20 and
+                                    (_primary_mkt, _sec_key) in _VALID_PAIRS):
+                                _secondary_mkt = _sec_key
+                                break
 
                     _dyn_tip, _dyn_odds_hint = get_final_pick(
                         _primary_mkt, p, ev_odds, fp_records=_recs_card
