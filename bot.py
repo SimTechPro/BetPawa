@@ -696,44 +696,66 @@ def _market_momentum(bot_data: dict, market: str) -> float:
 
 def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
     """
-    Compute momentum-adjusted weights for all markets.
-    Hot markets (momentum > +0.08) get boosted; cold ones (< -0.08) are trimmed.
-    Returns a normalised dict summing to 1.0.
-    Includes weight smoothing (alpha=0.7) to prevent spikes from virtual football noise.
+    Momentum-adjusted market weights with performance-earned influence caps.
+
+    All markets start equal and compete on real outcomes.
+    Momentum boosts/suppresses based on short vs long-term form.
+    Weight smoothing (alpha=0.7) prevents spikes from virtual football noise.
+    Minimum weight (0.01) keeps dormant markets alive but negligible.
+
+    No market has a hardcoded cap from the start.
+    Instead, every market earns a dynamic soft-cap based on its own accuracy
+    relative to the rest of the field. A persistent underperformer (e.g. 1x2
+    at 45% vs field avg 60%) gets gently tapered only after 20+ real rounds —
+    and the taper is always proportional and reversible as performance changes.
     """
     base = _ml_weights(bot_data)
     previous_weights = bot_data.get("_prev_market_weights", {})
     adjusted: dict[str, float] = {}
     alpha = 0.7   # stability factor — prevents weight spikes
 
+    # Compute per-market accuracies first (needed for relative soft-cap)
+    accuracies: dict[str, float] = {}
+    for mkt, rec in base.items():
+        t = max(rec.get("total", 2), 2)
+        c = rec.get("correct", 1)
+        accuracies[mkt] = c / t
+
+    avg_acc = sum(accuracies.values()) / len(accuracies) if accuracies else 0.5
+
     for mkt, rec in base.items():
         t   = max(rec.get("total", 2), 2)
-        c   = rec.get("correct", 1)
-        acc = c / t
+        acc = accuracies[mkt]
         mom = _market_momentum(bot_data, mkt)
-        # FIX 1 — HARD LIMIT: cap 1x2 influence so it can't dominate when trapped.
-        # DC and BTTS consistently outperform 1x2 (72-100% vs 42-45%).
-        # Reducing 1x2 base weight lets better markets surface to the top.
-        if mkt == "1x2":
-            weight = acc * 0.60   # hard cap on 1x2 market weight
-        else:
-            weight = acc
+
+        weight = acc
+
+        # Dynamic soft-cap: earned from performance, not hardcoded.
+        # Only activates after 20+ real rounds. A market below field average
+        # gets gently tapered proportionally — and recovers as it improves.
+        if acc < avg_acc and t >= 20:
+            gap   = avg_acc - acc          # e.g. 0.10 below avg
+            taper = max(0.60, 1.0 - gap * 2.0)   # 0.10 gap → 0.80 taper
+            weight *= taper
+
+        # Momentum layer (unchanged)
         if mom > 0.08:
-            weight *= 1.30   # 🔥 HOT — boost
+            weight *= 1.30   # HOT — boost
         elif mom > 0.04:
             weight *= 1.12   # warming — mild boost
         elif mom < -0.08:
-            weight *= 0.65   # ❄️ COLD — suppress
+            weight *= 0.65   # COLD — suppress
         elif mom < -0.04:
             weight *= 0.85   # cooling — mild suppress
-        # WEIGHT SMOOTHING — blend with previous to prevent spikes
-        prev = previous_weights.get(mkt, weight)
+
+        # Weight smoothing — blend with previous to prevent spikes
+        prev   = previous_weights.get(mkt, weight)
         weight = alpha * prev + (1 - alpha) * weight
+
         adjusted[mkt] = max(0.01, weight)
 
     total = sum(adjusted.values()) or 1.0
     result = {k: round(v / total, 4) for k, v in adjusted.items()}
-    # Persist for next call
     bot_data["_prev_market_weights"] = dict(result)
     return result
 
@@ -741,7 +763,7 @@ def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
 def _boost_conf_by_market_form(conf: float, market: str, bot_data: dict) -> float:
     """
     Adjust confidence based on how hot/cold this market is right now.
-    Strong form (+0.65) → +8 pts.  Weak form (<0.45) → -10 pts.
+    Strong form (>0.65) → +8 pts.  Weak form (<0.45) → -10 pts.
     """
     form = _get_market_form(bot_data, market, 50)
     if form > 0.65:
