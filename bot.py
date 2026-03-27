@@ -352,28 +352,14 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
     if h is not None and a is not None:
         return h, a
 
-    # 3c. participantPeriodResults
-    #
-    # CONFIRMED API STRUCTURE (from live logs):
-    #   slug=FIRST_HALF          → goals scored in 1st half only (incremental)
-    #   slug=SECOND_HALF         → goals scored in 2nd half only (incremental)
-    #   slug=FULL_TIME_EXCLUDING_OVERTIME → cumulative total, BUT betPawa
-    #       populates this field during half-time with stale/partial data.
-    #       DO NOT trust it alone.
-    #
-    # SAFE STRATEGY:
-    #   FT = FIRST_HALF + SECOND_HALF
-    #   This is reliable because SECOND_HALF is only non-null after the
-    #   2nd half is actually played. During half-time, SECOND_HALF is missing
-    #   or None, so the sum will correctly return None (match not finished).
-    #
-    # Fallback: if FIRST_HALF+SECOND_HALF not available, use
-    #   FULL_TIME_EXCLUDING_OVERTIME ONLY when SECOND_HALF also exists and
-    #   is non-None — confirming the match is complete.
+    # 3c. participantPeriodResults — take MAX across all periods per participant.
+    #     FT >= HT always, so the highest value is always the final score.
+    #     Log the raw structure once so we can see actual slug values.
     ppr = res.get("participantPeriodResults")
     if isinstance(ppr, list) and ppr:
-        # Per-participant score buckets
-        scores: dict[str, dict[str, int | None]] = {}  # ptype -> {slug: value}
+        home_vals = []
+        away_vals = []
+        _logged   = False
 
         for entry in ppr:
             if not isinstance(entry, dict):
@@ -383,18 +369,21 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                 p_info.get("type") or entry.get("type") or
                 entry.get("participantType") or entry.get("side") or ""
             ).upper()
-            if not ptype:
-                continue
-            if ptype not in scores:
-                scores[ptype] = {}
 
             period_results = entry.get("periodResults") or []
 
-            # Log full raw structure (INFO — always visible in Railway logs)
-            if period_results:
-                log.info(
-                    f"PPR SCORE DEBUG ptype={ptype} "
+            # Log raw structure once per process lifetime so we can see slugs
+            if not _logged and period_results:
+                _logged = True
+                _pr0 = period_results[0] if period_results else {}
+                log.debug(
+                    f"PPR DEBUG ptype={ptype} "
                     f"n_periods={len(period_results)} "
+                    f"period0_keys={list(_pr0.keys())} "
+                    f"period0_period={_pr0.get('period')} "
+                    f"period0_type={_pr0.get('type')} "
+                    f"period0_result={_pr0.get('result')} "
+                    f"period0_score={_pr0.get('score')} "
                     f"all_periods={[{'period':pr.get('period'),'type':pr.get('type'),'result':pr.get('result'),'score':pr.get('score')} for pr in period_results]}"
                 )
 
@@ -402,50 +391,56 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                 if not isinstance(pr, dict):
                     continue
                 v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                if v is None:
+                    continue
+
+                # Explicitly skip if the period identifies itself as half-time
                 period_obj  = pr.get("period") or {}
-                slug = str(period_obj.get("slug") or "").upper()
-                scores[ptype][slug] = v  # store even if None — presence matters
-
-        def _participant_ft(ptype: str) -> int | None:
-            """
-            Compute FT score for one participant.
-            Method 1: FIRST_HALF + SECOND_HALF (safest — requires 2nd half played)
-            Method 2: FULL_TIME_EXCLUDING_OVERTIME only if SECOND_HALF also present
-                      (confirms match is complete, not a mid-game snapshot)
-            """
-            s = scores.get(ptype, {})
-            ht = s.get("FIRST_HALF")
-            sh = s.get("SECOND_HALF")
-            ft = s.get("FULL_TIME_EXCLUDING_OVERTIME")
-
-            # Method 1: sum of halves — most reliable, null if 2nd half not played
-            if ht is not None and sh is not None:
-                return ht + sh
-
-            # Method 2: use FULL_TIME only if SECOND_HALF key exists (match ended)
-            # "SECOND_HALF" in s means the API returned that period, even if 0 goals.
-            # During half-time betPawa does NOT include SECOND_HALF at all.
-            if ft is not None and "SECOND_HALF" in s:
-                return ft
-
-            return None  # match not finished — do not guess
-
-        # Determine home/away participant types
-        home_ptype = next((p for p in scores if "HOME" in p), None)
-        away_ptype = next((p for p in scores if "AWAY" in p), None)
-
-        if home_ptype and away_ptype:
-            h = _participant_ft(home_ptype)
-            a = _participant_ft(away_ptype)
-            if h is not None and a is not None:
-                log.info(f"PPR SCORE RESULT: {home_ptype}={h} {away_ptype}={a}")
-                return h, a
-            else:
-                log.info(
-                    f"PPR: FT not ready yet — "
-                    f"home={scores.get(home_ptype)} away={scores.get(away_ptype)} "
-                    f"(returning None — will retry)"
+                period_slug = str(period_obj.get("slug") or "").upper()
+                period_name = str(period_obj.get("name") or "").upper()
+                pr_type     = str(pr.get("type") or "").upper()
+                _is_ht = (
+                    "FIRST_HALF" in period_slug or "HALF_TIME" in period_slug or
+                    "FIRST_HALF" in period_name or "HALF_TIME" in period_name or
+                    period_slug == "HT" or period_name == "HT" or
+                    pr_type == "HALF_TIME"
                 )
+                if _is_ht:
+                    continue   # skip — this is definitely HT
+
+                if "HOME" in ptype:
+                    home_vals.append(v)
+                elif "AWAY" in ptype:
+                    away_vals.append(v)
+
+        if home_vals and away_vals:
+            # Take the maximum — FT score is always the largest value
+            return max(home_vals), max(away_vals)
+
+        # Last resort: if explicit HT-skip left us empty, take max of ALL values
+        # (this handles cases where every period has an ambiguous slug)
+        home_all = []
+        away_all = []
+        for entry in ppr:
+            if not isinstance(entry, dict):
+                continue
+            p_info = entry.get("participant") or {}
+            ptype  = str(
+                p_info.get("type") or entry.get("type") or
+                entry.get("participantType") or entry.get("side") or ""
+            ).upper()
+            for pr in (entry.get("periodResults") or []):
+                if not isinstance(pr, dict):
+                    continue
+                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                if v is None:
+                    continue
+                if "HOME" in ptype:
+                    home_all.append(v)
+                elif "AWAY" in ptype:
+                    away_all.append(v)
+        if home_all and away_all:
+            return max(home_all), max(away_all)
 
     return None, None
 
@@ -15286,8 +15281,13 @@ async def _do_backup_inner(message, c):
         "strategy_stats":      bd.get("strategy_stats", {}),
         "odds_repeat_stats":   bd.get("odds_repeat_stats", {}),
         "ml_weights":          bd.get("ml_weights", {}),
+        "market_history":      bd.get("market_history", {}),
+        "_prev_market_weights": bd.get("_prev_market_weights", {}),
         "risk":                bd.get("risk", {}),
         "odds_store":          bd.get("odds_store", {}),
+        "regime_history":      bd.get("regime_history", []),
+        "elite_msg_ids":       bd.get("elite_msg_ids", {}),
+        "elite_sent_rounds":   {k: v for k, v in bd.items() if k.startswith("elite_sent_")},
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -15577,6 +15577,27 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     if "ml_weights" in data and data["ml_weights"]:
         bot_data["ml_weights"] = data["ml_weights"]
         log.info(f"✅ Restored ml_weights from backup")
+
+    if "market_history" in data and data["market_history"]:
+        bot_data["market_history"] = data["market_history"]
+        log.info(f"✅ Restored market_history from backup ({len(data['market_history'])} markets)")
+
+    if "_prev_market_weights" in data and data["_prev_market_weights"]:
+        bot_data["_prev_market_weights"] = data["_prev_market_weights"]
+        log.info(f"✅ Restored _prev_market_weights from backup")
+
+    if "regime_history" in data and data["regime_history"]:
+        bot_data["regime_history"] = data["regime_history"]
+        log.info(f"✅ Restored regime_history ({len(data['regime_history'])} entries) from backup")
+
+    if "elite_msg_ids" in data and data["elite_msg_ids"]:
+        bot_data["elite_msg_ids"] = data["elite_msg_ids"]
+        log.info(f"✅ Restored elite_msg_ids from backup")
+
+    if "elite_sent_rounds" in data and data["elite_sent_rounds"]:
+        for k, v in data["elite_sent_rounds"].items():
+            bot_data[k] = v
+        log.info(f"✅ Restored {len(data['elite_sent_rounds'])} elite dedup keys from backup")
 
     if "risk" in data and data["risk"]:
         bot_data["risk"] = data["risk"]
