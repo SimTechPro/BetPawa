@@ -4838,9 +4838,9 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         avail["HT/FT"] = cur_htft
 
     n_available = len(avail)
-    if n_available < 4:
+    if n_available < 2:
         return {"matched": False, "repeat_count": 0,
-                "fail_reason": f"only {n_available} markets in current odds (need 4+)"}
+                "fail_reason": f"only {n_available} markets in current odds (need 2+)"}
 
     # ── CHECK 2: Raw odds exact match per record ──────────────────────────────
     TOL = 0.05  # ±5% tolerance on raw odds value
@@ -9064,8 +9064,8 @@ def _learn_algo_signals(model: dict, predictions: list, results: list,
         "A_act": A_act / total,
         "round_id": round_id_int,
     })
-    # Keep last 100 rounds
-    if len(window) > 100:
+    # Keep last 200 rounds
+    if len(window) > 200:
         window.pop(0)
 
     # ── Engine 3 update: round-ID modulo patterns ─────────────────────────────
@@ -9538,7 +9538,7 @@ def _learn_from_round(bot_data: dict, league_id: int,
                     break
             if _should_save:
                 fp_db[fk].append(record)
-                if len(fp_db[fk]) > 15:
+                if len(fp_db[fk]) > 50:
                     _all_recs  = fp_db[fk]
                     _n_all     = len(_all_recs)
                     _dom       = max(set(r.get("outcome","") for r in _all_recs),
@@ -9884,7 +9884,7 @@ def _learn_from_round(bot_data: dict, league_id: int,
     )
 
     # ── Smart fp_db dict-level eviction ───────────────────────────────────────
-    # When fp_db grows beyond 600 fixture keys, evict the least useful ones.
+    # When fp_db grows beyond 1500 fixture keys, evict the least useful ones.
     # "Least useful" = fixtures with the most chaotic/unstable prediction record:
     #   - Score each fixture 0.0 (worst) → 1.0 (best) on 3 criteria:
     #     1. Consistency: dominant_outcome_conf  (high = outcomes agree = stable)
@@ -9893,8 +9893,8 @@ def _learn_from_round(bot_data: dict, league_id: int,
     #   - Fixtures with full records (≥10) but low consistency (<40%) go first.
     #   - Empty fixtures and very sparse fixtures (1-2 records) are evicted before
     #     fixtures with 3+ records regardless of consistency.
-    # The 400 lowest-scoring fixtures are evicted until back under the cap.
-    _FP_DB_CAP = 600
+    # The 200 lowest-scoring fixtures are evicted until back under the cap.
+    _FP_DB_CAP = 1500
     if len(fp_db) > _FP_DB_CAP:
         _max_rid = max(
             (r.get("round_id", 0) for recs in fp_db.values()
@@ -9918,7 +9918,7 @@ def _learn_from_round(bot_data: dict, league_id: int,
 
         _scored = [(fk, _fp_fixture_score(recs)) for fk, recs in fp_db.items()]
         _scored.sort(key=lambda x: x[1])   # lowest score first = evict first
-        _n_evict = len(fp_db) - _FP_DB_CAP + 100   # evict 100 extra as headroom
+        _n_evict = len(fp_db) - _FP_DB_CAP + 200   # evict 200 extra as headroom
         _evicted = 0
         for _fk, _score in _scored[:_n_evict]:
             del fp_db[_fk]
@@ -9936,7 +9936,7 @@ def _learn_from_round(bot_data: dict, league_id: int,
     # then sparse fixtures, keeping well-performing and recently-active ones.
     _ai    = model.get("ai_brain", {})
     _fmem  = _ai.get("fixture_mem", {})
-    _FM_CAP = 600
+    _FM_CAP = 1500
     if len(_fmem) > _FM_CAP:
         def _fm_fixture_score(mem):
             if not mem:
@@ -10039,28 +10039,27 @@ async def _learning_job(context):
                 log.info(f"   Cleared band data for league {lid}")
         bot_data["_band_data_v2_cleared"] = True
 
-    # ── One-time migration: trim fp_db records to 15 per fixture ───────────────
-    # Old cap was 50 records per fixture — far more than needed and the main cause
-    # of prediction lag (full scans of 230k+ objects every 30 seconds).
-    # Trim to the 15 most recent records per fixture.  Runs once per deploy.
-    if not bot_data.get("_fpdb_trimmed_v1"):
-        log.info("⚙️  One-time migration: trimming fp_db to 15 records per fixture")
-        total_removed = 0
+    # ── One-time migration: raise fp_db cap from 15 → 50 records per fixture ────
+    # The old cap was too low — only 15 records per fixture pair meant the engine
+    # had almost no historical depth. 50 gives a full season of H2H data.
+    if not bot_data.get("_fpdb_trimmed_v2"):
+        log.info("⚙️  One-time migration: raising fp_db per-fixture cap to 50")
+        total_trimmed = 0
         for lid in LEAGUES:
             m = bot_data.get(f"model_{lid}")
             if not isinstance(m, dict): continue
             fp_db = m.get("fingerprint_db", {})
-            removed = 0
-            for fk in fp_db:
+            trimmed = 0
+            for fk in list(fp_db.keys()):
                 recs = fp_db[fk]
-                if isinstance(recs, list) and len(recs) > 15:
-                    removed      += len(recs) - 15
-                    fp_db[fk]     = recs[-15:]   # keep the 15 most recent
-            total_removed += removed
-            if removed:
-                log.info(f"   League {lid}: trimmed {removed} excess records")
-        bot_data["_fpdb_trimmed_v1"] = True
-        log.info(f"✅  fp_db trim complete — {total_removed} records removed")
+                if isinstance(recs, list) and len(recs) > 50:
+                    trimmed += len(recs) - 50
+                    fp_db[fk] = recs[-50:]
+            total_trimmed += trimmed
+            if trimmed:
+                log.info(f"   League {lid}: trimmed {trimmed} records above new cap")
+        bot_data["_fpdb_trimmed_v2"] = True
+        log.info(f"✅  fp_db cap migration complete — {total_trimmed} records trimmed")
 
     # ── One-time migration: purge cross-contaminated fp_db records ──────────────
     # Before the LEAGUE_TEAMS.copy() fix, _filter_league mutated the shared set,
@@ -13177,6 +13176,41 @@ async def _data_collector_job(context):
                             _fixture_key(_norm_event(e)["home"], _norm_event(e)["away"]): _extract_odds(e)
                             for e in evs_up
                         }
+
+                        # Also try matchups page for embedded odds (some past rounds keep them)
+                        if not any(v.get("1x2") for v in odds_map.values()):
+                            evs_mk2 = await fetch_round_events(client, rid, PAGE_MATCHUPS)
+                            evs_mk2 = _filter_league(evs_mk2, lid)
+                            for _e2 in evs_mk2:
+                                _nm2 = _norm_event(_e2)
+                                _fk2 = _fixture_key(_nm2["home"], _nm2["away"])
+                                _od2 = _extract_odds(_e2)
+                                if _od2.get("1x2") and _fk2 not in odds_map:
+                                    odds_map[_fk2] = _od2
+
+                        # Save backfill odds to odds_store so _learn_from_round can use them
+                        # when it falls back to odds_store lookup — this ensures fp_db records
+                        # for backfilled rounds contain real market data instead of empty snapshots.
+                        _os_bf = bot_data.setdefault("odds_store", {})
+                        _lid_os_bf = _os_bf.setdefault(str(lid), {})
+                        _rid_os_bf = _lid_os_bf.setdefault(str(rid), {})
+                        _past_season_id_bf = str(r.get("_seasonId") or r.get("seasonId") or "")
+                        for _fk_bf, _od_bf in odds_map.items():
+                            if _od_bf.get("1x2") and _fk_bf not in _rid_os_bf:
+                                _parts_bf = _fk_bf.split("|") if "|" in _fk_bf else [_fk_bf, ""]
+                                _rid_os_bf[_fk_bf] = {
+                                    "odds_snapshot": _od_bf,
+                                    "home":          _parts_bf[0],
+                                    "away":          _parts_bf[1] if len(_parts_bf) > 1 else "",
+                                    "round_id":      str(rid),
+                                    "league_id":     lid,
+                                    "season_id":     _past_season_id_bf,
+                                    "saved_ts":      time.time(),
+                                    "outcome":       None,
+                                    "score_h":       None,
+                                    "score_a":       None,
+                                    "correct":       None,
+                                }
 
                         # Build predictions + results and learn immediately
                         preds   = []
