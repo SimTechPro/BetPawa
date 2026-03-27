@@ -354,26 +354,28 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
 
     # 3c. participantPeriodResults
     #
-    #  STRATEGY (safe, no guessing):
-    #   Pass 1 — collect scores from periods that are explicitly FT
-    #             (FULL_TIME slug/name/type, or "SECOND_HALF" cumulative score).
-    #   Pass 2 — if FT period found: return those values.
-    #   Pass 3 — if NO period is identifiable at all AND there are exactly
-    #             2 periods per participant (HT + FT): take the larger one.
-    #             This is the only safe "max" heuristic — it requires proof
-    #             that two distinct periods exist, so a mid-game snapshot
-    #             with only HT data (1 period) returns None correctly.
-    #   Never fall back to max-of-all when only 1 period exists — that is
-    #   exactly the half-time-only snapshot and must return None so the bot
-    #   waits for the real result.
+    # CONFIRMED API STRUCTURE (from live logs):
+    #   slug=FIRST_HALF          → goals scored in 1st half only (incremental)
+    #   slug=SECOND_HALF         → goals scored in 2nd half only (incremental)
+    #   slug=FULL_TIME_EXCLUDING_OVERTIME → cumulative total, BUT betPawa
+    #       populates this field during half-time with stale/partial data.
+    #       DO NOT trust it alone.
+    #
+    # SAFE STRATEGY:
+    #   FT = FIRST_HALF + SECOND_HALF
+    #   This is reliable because SECOND_HALF is only non-null after the
+    #   2nd half is actually played. During half-time, SECOND_HALF is missing
+    #   or None, so the sum will correctly return None (match not finished).
+    #
+    # Fallback: if FIRST_HALF+SECOND_HALF not available, use
+    #   FULL_TIME_EXCLUDING_OVERTIME ONLY when SECOND_HALF also exists and
+    #   is non-None — confirming the match is complete.
     ppr = res.get("participantPeriodResults")
     if isinstance(ppr, list) and ppr:
-        home_ft = []
-        away_ft = []
-        home_all_by_entry: dict = {}   # entry_idx -> list[int]
-        away_all_by_entry: dict = {}
+        # Per-participant score buckets
+        scores: dict[str, dict[str, int | None]] = {}  # ptype -> {slug: value}
 
-        for ei, entry in enumerate(ppr):
+        for entry in ppr:
             if not isinstance(entry, dict):
                 continue
             p_info = entry.get("participant") or {}
@@ -381,11 +383,15 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                 p_info.get("type") or entry.get("type") or
                 entry.get("participantType") or entry.get("side") or ""
             ).upper()
+            if not ptype:
+                continue
+            if ptype not in scores:
+                scores[ptype] = {}
 
             period_results = entry.get("periodResults") or []
 
-            # Log full structure on first encounter (INFO so it always shows)
-            if ei == 0 and period_results:
+            # Log full raw structure (INFO — always visible in Railway logs)
+            if period_results:
                 log.info(
                     f"PPR SCORE DEBUG ptype={ptype} "
                     f"n_periods={len(period_results)} "
@@ -396,62 +402,50 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                 if not isinstance(pr, dict):
                     continue
                 v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
-                if v is None:
-                    continue
-
                 period_obj  = pr.get("period") or {}
-                period_slug = str(period_obj.get("slug") or "").upper()
-                period_name = str(period_obj.get("name") or "").upper()
-                pr_type     = str(pr.get("type") or "").upper()
+                slug = str(period_obj.get("slug") or "").upper()
+                scores[ptype][slug] = v  # store even if None — presence matters
 
-                _is_ht = (
-                    "FIRST_HALF" in period_slug or "HALF_TIME" in period_slug or
-                    "FIRST_HALF" in period_name or "HALF_TIME" in period_name or
-                    period_slug in ("HT", "1H") or period_name in ("HT", "1H") or
-                    pr_type in ("HALF_TIME", "FIRST_HALF")
+        def _participant_ft(ptype: str) -> int | None:
+            """
+            Compute FT score for one participant.
+            Method 1: FIRST_HALF + SECOND_HALF (safest — requires 2nd half played)
+            Method 2: FULL_TIME_EXCLUDING_OVERTIME only if SECOND_HALF also present
+                      (confirms match is complete, not a mid-game snapshot)
+            """
+            s = scores.get(ptype, {})
+            ht = s.get("FIRST_HALF")
+            sh = s.get("SECOND_HALF")
+            ft = s.get("FULL_TIME_EXCLUDING_OVERTIME")
+
+            # Method 1: sum of halves — most reliable, null if 2nd half not played
+            if ht is not None and sh is not None:
+                return ht + sh
+
+            # Method 2: use FULL_TIME only if SECOND_HALF key exists (match ended)
+            # "SECOND_HALF" in s means the API returned that period, even if 0 goals.
+            # During half-time betPawa does NOT include SECOND_HALF at all.
+            if ft is not None and "SECOND_HALF" in s:
+                return ft
+
+            return None  # match not finished — do not guess
+
+        # Determine home/away participant types
+        home_ptype = next((p for p in scores if "HOME" in p), None)
+        away_ptype = next((p for p in scores if "AWAY" in p), None)
+
+        if home_ptype and away_ptype:
+            h = _participant_ft(home_ptype)
+            a = _participant_ft(away_ptype)
+            if h is not None and a is not None:
+                log.info(f"PPR SCORE RESULT: {home_ptype}={h} {away_ptype}={a}")
+                return h, a
+            else:
+                log.info(
+                    f"PPR: FT not ready yet — "
+                    f"home={scores.get(home_ptype)} away={scores.get(away_ptype)} "
+                    f"(returning None — will retry)"
                 )
-                _is_ft = (
-                    "FULL_TIME" in period_slug or "FULL_TIME" in period_name or
-                    "SECOND_HALF" in period_slug or "SECOND_HALF" in period_name or
-                    period_slug in ("FT", "2H", "FULL") or period_name in ("FT", "2H", "FULL") or
-                    pr_type in ("FULL_TIME", "SCORE", "FINAL")
-                )
-
-                if _is_ht:
-                    pass   # explicitly skip HT
-                elif _is_ft:
-                    if "HOME" in ptype:
-                        home_ft.append(v)
-                    elif "AWAY" in ptype:
-                        away_ft.append(v)
-                else:
-                    # Period slug is ambiguous — collect separately for fallback
-                    if "HOME" in ptype:
-                        home_all_by_entry.setdefault(ei, []).append(v)
-                    elif "AWAY" in ptype:
-                        away_all_by_entry.setdefault(ei, []).append(v)
-
-        # Pass 1: explicit FT periods found — most reliable
-        if home_ft and away_ft:
-            return max(home_ft), max(away_ft)
-
-        # Pass 2: no explicit FT/HT labels — only safe if there are exactly
-        # 2 periods per participant (confirms HT+FT both present, so max = FT).
-        # If only 1 ambiguous period exists, the match is mid-game (HT only)
-        # → return None so the bot waits for the final result.
-        if home_all_by_entry and away_all_by_entry:
-            home_ambiguous = [v for vals in home_all_by_entry.values() for v in vals]
-            away_ambiguous = [v for vals in away_all_by_entry.values() for v in vals]
-            home_period_count = len(home_ambiguous)
-            away_period_count = len(away_ambiguous)
-            if home_period_count >= 2 and away_period_count >= 2:
-                # Both participants have 2+ ambiguous periods → safe to take max
-                return max(home_ambiguous), max(away_ambiguous)
-            # Only 1 period (half-time snapshot) — do NOT return it
-            log.info(
-                f"PPR: only {home_period_count}/{away_period_count} ambiguous periods "
-                f"— likely mid-game HT snapshot, skipping (returning None)"
-            )
 
     return None, None
 
