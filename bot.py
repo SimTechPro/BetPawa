@@ -696,66 +696,44 @@ def _market_momentum(bot_data: dict, market: str) -> float:
 
 def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
     """
-    Momentum-adjusted market weights with performance-earned influence caps.
-
-    All markets start equal and compete on real outcomes.
-    Momentum boosts/suppresses based on short vs long-term form.
-    Weight smoothing (alpha=0.7) prevents spikes from virtual football noise.
-    Minimum weight (0.01) keeps dormant markets alive but negligible.
-
-    No market has a hardcoded cap from the start.
-    Instead, every market earns a dynamic soft-cap based on its own accuracy
-    relative to the rest of the field. A persistent underperformer (e.g. 1x2
-    at 45% vs field avg 60%) gets gently tapered only after 20+ real rounds —
-    and the taper is always proportional and reversible as performance changes.
+    Compute momentum-adjusted weights for all markets.
+    Hot markets (momentum > +0.08) get boosted; cold ones (< -0.08) are trimmed.
+    Returns a normalised dict summing to 1.0.
+    Includes weight smoothing (alpha=0.7) to prevent spikes from virtual football noise.
     """
     base = _ml_weights(bot_data)
     previous_weights = bot_data.get("_prev_market_weights", {})
     adjusted: dict[str, float] = {}
     alpha = 0.7   # stability factor — prevents weight spikes
 
-    # Compute per-market accuracies first (needed for relative soft-cap)
-    accuracies: dict[str, float] = {}
-    for mkt, rec in base.items():
-        t = max(rec.get("total", 2), 2)
-        c = rec.get("correct", 1)
-        accuracies[mkt] = c / t
-
-    avg_acc = sum(accuracies.values()) / len(accuracies) if accuracies else 0.5
-
     for mkt, rec in base.items():
         t   = max(rec.get("total", 2), 2)
-        acc = accuracies[mkt]
+        c   = rec.get("correct", 1)
+        acc = c / t
         mom = _market_momentum(bot_data, mkt)
-
-        weight = acc
-
-        # Dynamic soft-cap: earned from performance, not hardcoded.
-        # Only activates after 20+ real rounds. A market below field average
-        # gets gently tapered proportionally — and recovers as it improves.
-        if acc < avg_acc and t >= 20:
-            gap   = avg_acc - acc          # e.g. 0.10 below avg
-            taper = max(0.60, 1.0 - gap * 2.0)   # 0.10 gap → 0.80 taper
-            weight *= taper
-
-        # Momentum layer (unchanged)
+        # FIX 1 — HARD LIMIT: cap 1x2 influence so it can't dominate when trapped.
+        # DC and BTTS consistently outperform 1x2 (72-100% vs 42-45%).
+        # Reducing 1x2 base weight lets better markets surface to the top.
+        if mkt == "1x2":
+            weight = acc * 0.60   # hard cap on 1x2 market weight
+        else:
+            weight = acc
         if mom > 0.08:
-            weight *= 1.30   # HOT — boost
+            weight *= 1.30   # 🔥 HOT — boost
         elif mom > 0.04:
             weight *= 1.12   # warming — mild boost
         elif mom < -0.08:
-            weight *= 0.65   # COLD — suppress
+            weight *= 0.65   # ❄️ COLD — suppress
         elif mom < -0.04:
             weight *= 0.85   # cooling — mild suppress
-
-        # Weight smoothing — blend with previous to prevent spikes
-        prev   = previous_weights.get(mkt, weight)
+        # WEIGHT SMOOTHING — blend with previous to prevent spikes
+        prev = previous_weights.get(mkt, weight)
         weight = alpha * prev + (1 - alpha) * weight
-
         adjusted[mkt] = max(0.01, weight)
 
     total = sum(adjusted.values()) or 1.0
     result = {k: round(v / total, 4) for k, v in adjusted.items()}
+    # Persist for next call
     bot_data["_prev_market_weights"] = dict(result)
     return result
 
@@ -763,7 +741,7 @@ def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
 def _boost_conf_by_market_form(conf: float, market: str, bot_data: dict) -> float:
     """
     Adjust confidence based on how hot/cold this market is right now.
-    Strong form (>0.65) → +8 pts.  Weak form (<0.45) → -10 pts.
+    Strong form (+0.65) → +8 pts.  Weak form (<0.45) → -10 pts.
     """
     form = _get_market_form(bot_data, market, 50)
     if form > 0.65:
@@ -3386,6 +3364,647 @@ def _strategy_update_stats(bot_data: dict, market: str,
         if actual == "BTTS_YES":
             stats["correct"]     = stats.get("correct",0) + 1
             stats["btts_correct"] = stats.get("btts_correct",0) + 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── ELITE STRATEGY PREDICTION LAYER ────────────────────────────────────────────
+# Parallel prediction engine.  Does NOT replace any existing logic.
+# Runs alongside predict_match and _strategy_analyze_match.
+# Output is additive: if it produces a result it is shown on the card together
+# with the existing prediction.  If it rejects the match nothing changes.
+#
+# Components:
+#   1. recovery_upset_strategy  — adapter that calls existing _strategy_analyze_match
+#   2. get_last_n_games_elite   — 6-match form helper using model match_log
+#   3. last6_form_confirmation  — form delta for predicted side
+#   4. extract_*_signal helpers — pull market signals from extracted odds
+#   5. ranked_market_validation — HT/FT (35%) → 1X2 (25%) → DC (15%) → BTTS → O/U
+#   6. market_agreement_score   — fraction of markets that agree
+#   7. strategy_learning_boost  — self-learning per strategy type
+#   8. suspicious_odds          — simple odds-trap flag
+#   9. detect_traps             — combined trap scorer
+#  10. compute_final_confidence — weighted blend of all signals
+#  11. apply_cycle_to_confidence — cycle pattern adjustment
+#  12. detect_cycle_pattern / analyze_cycle / alternating_pattern — cycle engine
+#  13. elite_strategy_predict   — main entry point
+#  14. _update_elite_cycle_stats — cycle self-learning updater
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_last_n_games_elite(team: str, n: int, model: dict) -> list[dict]:
+    """
+    Return the last N completed games for a team from the match_log.
+    Each entry: {"result": "WIN"|"DRAW"|"LOSS", "gf": int, "ga": int}
+    """
+    tl = team.lower()
+    ml = model.get("match_log", [])
+    games = []
+    for entry in ml:
+        eh = (entry.get("home") or "").lower()
+        ea = (entry.get("away") or "").lower()
+        sh = entry.get("score_h")
+        sa = entry.get("score_a")
+        if sh is None or sa is None:
+            continue
+        if tl in eh or eh.startswith(tl[:3]):
+            gf, ga = sh, sa
+        elif tl in ea or ea.startswith(tl[:3]):
+            gf, ga = sa, sh
+        else:
+            continue
+        result = "WIN" if gf > ga else "DRAW" if gf == ga else "LOSS"
+        games.append({"result": result, "gf": gf, "ga": ga,
+                       "round_id": entry.get("round_id", 0)})
+    games.sort(key=lambda g: g["round_id"])
+    return games[-n:] if len(games) >= n else games
+
+
+def last6_form_confirmation(home: str, away: str, predicted_side: str,
+                             model: dict) -> float:
+    """
+    Returns a form delta for the predicted side based on last 6 games.
+    Positive = predicted side has better recent form.
+    Range roughly -1.0 … +1.0
+    """
+    home_games = get_last_n_games_elite(home, 6, model)
+    away_games = get_last_n_games_elite(away, 6, model)
+
+    def _pts(games):
+        score = 0
+        for g in games:
+            if   g["result"] == "WIN":  score += 3
+            elif g["result"] == "DRAW": score += 1
+        return score
+
+    home_form = _pts(home_games) / 18.0
+    away_form = _pts(away_games) / 18.0
+
+    if predicted_side == "HOME":
+        return home_form - away_form
+    else:
+        return away_form - home_form
+
+
+# ── Market readers — direction-agnostic ───────────────────────────────────────
+# These read what the MARKET says, completely independently of any strategy
+# prediction.  The caller then compares the market verdict to the strategy
+# signal.  No "does this match my prediction?" logic here at all.
+
+def _elite_read_htft(odds: dict) -> str | None:
+    """
+    Returns the FT outcome the HT/FT market is pricing as most likely
+    (lowest-odds HT/FT combo) → "HOME" | "AWAY" | "DRAW" | None.
+    """
+    htft = odds.get("htft", {})
+    if not htft:
+        return None
+    try:
+        best_k, _ = min(htft.items(), key=lambda x: float(x[1]))
+        ft_part   = best_k.split("/")[-1] if "/" in best_k else ""
+        return {"1": "HOME", "2": "AWAY", "X": "DRAW"}.get(ft_part)
+    except Exception:
+        return None
+
+
+def _elite_read_1x2(odds: dict) -> str | None:
+    """
+    Returns the outcome the 1X2 market prices as most likely
+    → "HOME" | "AWAY" | "DRAW" | None.
+    """
+    o = odds.get("1x2", {})
+    h = o.get("1"); x = o.get("X"); a = o.get("2")
+    if not (h and a):
+        return None
+    try:
+        best = min([("HOME", float(h)), ("DRAW", float(x) if x else 999),
+                    ("AWAY", float(a))], key=lambda t: t[1])
+        return best[0]
+    except Exception:
+        return None
+
+
+def _elite_read_dc(odds: dict) -> str | None:
+    """
+    Returns which side DC covers most (cheapest DC) → "HOME" | "AWAY" | None.
+    DC 1X → HOME, X2 → AWAY, 12 → None (excludes draw, no clear side).
+    """
+    dc = odds.get("dc", {})
+    if not dc:
+        return None
+    try:
+        best_k, _ = min(dc.items(), key=lambda x: float(x[1]))
+        return {"1X": "HOME", "X2": "AWAY"}.get(best_k)   # "12" → None intentionally
+    except Exception:
+        return None
+
+
+def _elite_read_btts(odds: dict) -> bool | None:
+    """
+    Returns True if BTTS Yes is cheaper (market expects both teams to score),
+    False if No is cheaper, None if missing.
+    BTTS is a side-market — it does NOT point to a winner direction.
+    """
+    btts = odds.get("btts", {})
+    y = btts.get("Yes"); n = btts.get("No")
+    if not (y and n):
+        return None
+    try:
+        return float(y) < float(n)
+    except Exception:
+        return None
+
+
+def _elite_read_ou25(odds: dict) -> bool | None:
+    """
+    Returns True if Over 2.5 is cheaper (market expects high-scoring game),
+    False if Under 2.5 is cheaper, None if missing.
+    O/U is a side-market — it does NOT point to a winner direction.
+    """
+    over_price = under_price = None
+    for side, line, price in odds.get("ou", []):
+        if str(line) in ("2.5", "2"):
+            if side == "O":
+                over_price = price
+            elif side == "U":
+                under_price = price
+    if over_price is None or under_price is None:
+        return None
+    try:
+        return float(over_price) < float(under_price)
+    except Exception:
+        return None
+
+
+# ── Core scoring function ─────────────────────────────────────────────────────
+
+def ranked_market_validation_elite(odds: dict, strategy_side: str,
+                                    model: dict) -> tuple[float, dict]:
+    """
+    Each market is read INDEPENDENTLY first — it gives its own verdict.
+    Then we check whether that verdict agrees or disagrees with the strategy signal.
+
+    Market hierarchy (authority order):
+      🥇 HT/FT  → 35 pts agree  |  -50 pts disagree  |  0 if missing/draw
+      🥈 1X2    → 25 pts agree  |  -40 pts disagree
+      🥉 DC     → 15 pts agree  |    0 pts disagree   |  0 if missing/ambiguous
+      🧠 BTTS   → 10 pts agree  |   -8 pts disagree   (side mkt: agree = BTTS Yes)
+      ⚙️ O/U    →  8 pts agree  |    0 pts missing    (side mkt: agree = Over 2.5)
+
+    BTTS/O/U are side markets — they don't point to a winner.
+    They "agree" when the market says goals are expected (supports the strategy's
+    active-team narrative), regardless of direction.
+
+    details dict values:
+      True  = market independently points to same side as strategy
+      False = market independently points to opposite side
+      None  = market absent or genuinely ambiguous (draw / no data)
+    """
+    total_score = 0.0
+    details     = {}
+
+    # ── HT/FT — highest authority ────────────────────────────────────────────
+    htft_verdict = _elite_read_htft(odds)
+    if htft_verdict is None or htft_verdict == "DRAW":
+        details["HTFT"] = None          # missing or draw result — no signal
+    elif htft_verdict == strategy_side:
+        total_score += 35
+        details["HTFT"] = True          # market independently picks same side
+    else:
+        total_score -= 50               # market independently picks opposite side
+        details["HTFT"] = False
+
+    # ── 1X2 ──────────────────────────────────────────────────────────────────
+    ox2_verdict = _elite_read_1x2(odds)
+    if ox2_verdict is None:
+        details["1X2"] = None
+    elif ox2_verdict == strategy_side:
+        total_score += 25
+        details["1X2"] = True
+    elif ox2_verdict == "DRAW":
+        details["1X2"] = None           # draw verdict = ambiguous, no penalty
+    else:
+        total_score -= 40
+        details["1X2"] = False
+
+    # ── DC ───────────────────────────────────────────────────────────────────
+    dc_verdict = _elite_read_dc(odds)
+    if dc_verdict is None:
+        details["DC"] = None
+    elif dc_verdict == strategy_side:
+        total_score += 15
+        details["DC"] = True
+    else:
+        details["DC"] = False           # DC covers opposite side — soft conflict, no pts
+
+    # ── BTTS (side market — agree = expects goals, supports active team) ──────
+    btts_verdict = _elite_read_btts(odds)
+    if btts_verdict is None:
+        details["BTTS"] = None
+    elif btts_verdict is True:          # market says both score = goals flowing = good
+        total_score += 10
+        details["BTTS"] = True
+    else:
+        total_score -= 8
+        details["BTTS"] = False
+
+    # ── O/U 2.5 (side market — agree = Over 2.5) ─────────────────────────────
+    ou_verdict = _elite_read_ou25(odds)
+    if ou_verdict is None:
+        details["OU"] = None
+    elif ou_verdict is True:
+        total_score += 8
+        details["OU"] = True
+    else:
+        details["OU"] = False
+
+    return total_score, details
+
+
+def market_agreement_score_elite(details: dict) -> float:
+    """Fraction of available markets that agree with the prediction."""
+    values = [v for v in details.values() if v is not None]
+    if not values:
+        return 0.0
+    return sum(1 for v in values if v is True) / len(values)
+
+
+def strategy_learning_boost_elite(strategy_type: str, model: dict) -> float:
+    """Small boost from self-learned per-strategy-type accuracy (0–10)."""
+    data = model.get("elite_strategy_stats", {}).get(
+        strategy_type, {"correct": 1, "total": 2}
+    )
+    t = max(data.get("total", 2), 2)
+    accuracy = data.get("correct", 1) / t
+    return accuracy * 10.0
+
+
+def suspicious_odds_elite(odds: dict, strategy_side: str) -> bool:
+    """
+    True when the strategy side has extremely short odds (≤ 1.25).
+    Very short favourites are high-risk in virtual football —
+    the market has already priced in the result with no margin for error.
+    """
+    o = odds.get("1x2", {})
+    key = "1" if strategy_side == "HOME" else "2"
+    try:
+        return float(o.get(key, 99)) <= 1.25
+    except (TypeError, ValueError):
+        return False
+
+
+def detect_traps_elite(odds: dict, strategy_side: str, markets: dict,
+                        model: dict) -> int:
+    """
+    Returns a trap score (0–4+). >= 2 = reject.
+
+    All checks read from market verdicts already computed direction-agnostically.
+    """
+    trap_score = 0
+
+    # HT/FT independently pointed to the OPPOSITE side — strongest trap signal
+    if markets.get("HTFT") is False:
+        trap_score += 2
+
+    # 1X2 also pointed opposite — double trap
+    if markets.get("1X2") is False:
+        trap_score += 1
+
+    # Majority of available markets disagree with strategy
+    if market_agreement_score_elite(markets) < 0.4:
+        trap_score += 1
+
+    # Suspiciously short odds on the strategy side
+    if suspicious_odds_elite(odds, strategy_side):
+        trap_score += 1
+
+    return trap_score
+
+
+def compute_final_confidence_elite(strategy_strength: float, form_score: float,
+                                    market_score: float, learning_boost: float,
+                                    agreement: float) -> float:
+    """
+    Weighted blend of all signals → final confidence 0–100.
+    """
+    raw = (
+        strategy_strength * 0.40 +
+        market_score      * 0.30 +
+        form_score        * 15.0 +    # form_score is -1..+1, scale to percentage points
+        learning_boost    * 0.10 +
+        agreement * 100.0 * 0.05
+    )
+    return round(min(97.0, max(0.0, raw)), 2)
+
+
+# ── Cycle pattern detection ───────────────────────────────────────────────────
+
+def _alternating_pattern_elite(pattern: list) -> bool:
+    if len(pattern) < 3:
+        return False
+    flips = sum(1 for i in range(1, len(pattern)) if pattern[i] != pattern[i - 1])
+    return flips >= len(pattern) * 0.7
+
+
+def analyze_cycle_elite(pattern: list) -> str:
+    strong_losses = pattern.count("STRONG_LOSS")
+    weak_wins     = pattern.count("WEAK_WIN")
+    draws         = pattern.count("DRAW")
+
+    if strong_losses >= 4 and weak_wins >= 3:
+        return "STRONG_FAILURE"
+    if strong_losses >= 3 and (not pattern or pattern[-1] != "STRONG_LOSS"):
+        return "STRONG_RECOVERY"
+    if weak_wins >= 4:
+        return "WEAK_MOMENTUM"
+    if _alternating_pattern_elite(pattern):
+        return "ALTERNATING"
+    if draws >= 4:
+        return "DRAW_PHASE"
+    return "NORMAL"
+
+
+def detect_cycle_pattern_elite(league_id: int, model: dict) -> str:
+    """
+    Classify the recent match-result cycle for this league.
+    Uses the last 12 entries from match_log that have score data.
+    """
+    ml = model.get("match_log", [])
+    # Take the last 15 scored entries
+    scored = [e for e in ml if e.get("score_h") is not None]
+    recent = scored[-15:]
+
+    standings = model.get("_standings_cache") or model.get("_cached_standings") or {}
+    tier_map  = _get_all_tiers(standings) if standings else {}
+
+    pattern = []
+    for entry in recent:
+        home   = entry.get("home", "")
+        away   = entry.get("away", "")
+        sh     = entry.get("score_h")
+        sa     = entry.get("score_a")
+        if sh is None or sa is None:
+            continue
+        result = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
+
+        h_tier = _find_tier(home, tier_map) if tier_map else "MODERATE"
+        a_tier = _find_tier(away, tier_map) if tier_map else "MODERATE"
+
+        if h_tier == "STRONG" and result == "AWAY":
+            pattern.append("STRONG_LOSS")
+        elif a_tier == "STRONG" and result == "HOME":
+            pattern.append("STRONG_LOSS")
+        elif h_tier == "WEAK" and result == "HOME":
+            pattern.append("WEAK_WIN")
+        elif a_tier == "WEAK" and result == "AWAY":
+            pattern.append("WEAK_WIN")
+        elif result == "DRAW":
+            pattern.append("DRAW")
+        else:
+            pattern.append("NORMAL")
+
+    return analyze_cycle_elite(pattern)
+
+
+def apply_cycle_to_confidence_elite(cycle: str, strategy_type: str,
+                                     model: dict, confidence: float) -> tuple[float, str]:
+    """
+    Adjusts confidence based on detected cycle and optionally the cycle's
+    self-learned accuracy.  Returns (adjusted_confidence, cycle_label).
+    """
+    cycle_labels = {
+        "STRONG_RECOVERY": "🟢 Recovery cycle",
+        "STRONG_FAILURE":  "🔴 Strong-fail cycle",
+        "WEAK_MOMENTUM":   "🔵 Weak-momentum cycle",
+        "ALTERNATING":     "⚖️ Alternating cycle",
+        "DRAW_PHASE":      "🟡 Draw phase",
+        "NORMAL":          "⚪ Normal phase",
+    }
+
+    if cycle == "STRONG_RECOVERY":
+        confidence += 8
+    elif cycle == "STRONG_FAILURE":
+        confidence -= 15
+    elif cycle == "WEAK_MOMENTUM" and strategy_type == "WEAK_WIN":
+        confidence += 10
+    elif cycle == "ALTERNATING":
+        confidence -= 10
+    elif cycle == "DRAW_PHASE":
+        confidence -= 8
+
+    # Self-learned cycle accuracy boost
+    cycle_data = model.get("elite_cycle_stats", {}).get(cycle, {})
+    c_total = cycle_data.get("total", 0)
+    c_cor   = cycle_data.get("correct", 0)
+    if c_total >= 10:
+        cycle_accuracy = c_cor / c_total
+        confidence += (cycle_accuracy - 0.5) * 20
+
+    confidence = round(min(97.0, max(0.0, confidence)), 2)
+    label = cycle_labels.get(cycle, cycle)
+    return confidence, label
+
+
+# ── Recovery/upset strategy adapter ──────────────────────────────────────────
+
+def _recovery_upset_strategy_elite(home: str, away: str, model: dict,
+                                    standings: dict) -> dict | None:
+    """
+    Adapter: uses the existing _strategy_analyze_match logic, then converts the
+    result to the shape the elite engine expects:
+      {"signal": "STRONG_RECOVERS"|"WEAK_REPEATS"|"UNCERTAIN",
+       "prediction": "HOME"|"AWAY",
+       "strength": float 0-100,
+       "type": "STRONG_LOSS"|"WEAK_WIN"}
+
+    Returns None when there is no qualifying strategy signal.
+    """
+    if not standings or not model:
+        return None
+
+    tier_map  = _get_all_tiers(standings)
+    h_tier    = _find_tier(home, tier_map)
+    a_tier    = _find_tier(away, tier_map)
+    h_last    = _strategy_get_last_game(home, model)
+    a_last    = _strategy_get_last_game(away, model)
+    if not h_last or not a_last:
+        return None
+    if h_last["result"] == "DRAW" or a_last["result"] == "DRAW":
+        return None
+
+    # ── Pattern 1: Strong team lost → recovery ─────────────────────────────
+    if h_tier == "STRONG" and h_last["result"] == "LOSS" and a_tier in ("WEAK","MODERATE"):
+        return {
+            "signal":     "STRONG_RECOVERS",
+            "prediction": "HOME",
+            "strength":   72.0 + (8.0 if a_tier == "WEAK" else 0.0),
+            "type":       "STRONG_LOSS",
+        }
+    if a_tier == "STRONG" and a_last["result"] == "LOSS" and h_tier in ("WEAK","MODERATE"):
+        return {
+            "signal":     "STRONG_RECOVERS",
+            "prediction": "AWAY",
+            "strength":   72.0 + (8.0 if h_tier == "WEAK" else 0.0),
+            "type":       "STRONG_LOSS",
+        }
+
+    # ── Pattern 2: Weak team won → opponent recovery ───────────────────────
+    if h_tier == "WEAK" and h_last["result"] == "WIN" and a_tier == "STRONG":
+        return {
+            "signal":     "WEAK_REPEATS",
+            "prediction": "AWAY",
+            "strength":   68.0,
+            "type":       "WEAK_WIN",
+        }
+    if a_tier == "WEAK" and a_last["result"] == "WIN" and h_tier == "STRONG":
+        return {
+            "signal":     "WEAK_REPEATS",
+            "prediction": "HOME",
+            "strength":   68.0,
+            "type":       "WEAK_WIN",
+        }
+
+    return {"signal": "UNCERTAIN", "prediction": None, "strength": 0.0, "type": "NONE"}
+
+
+# ── Self-learning updater ─────────────────────────────────────────────────────
+
+def _update_elite_strategy_stats(model: dict, strategy_type: str,
+                                   predicted_side: str, actual: str) -> None:
+    """Update per-strategy-type accuracy for elite learning boost."""
+    stats = model.setdefault("elite_strategy_stats", {})
+    rec   = stats.setdefault(strategy_type, {"correct": 0, "total": 0})
+    rec["total"] += 1
+    if predicted_side == actual:
+        rec["correct"] += 1
+
+
+def _update_elite_cycle_stats(model: dict, cycle: str,
+                               predicted_side: str, actual: str) -> None:
+    """Update per-cycle accuracy for cycle self-learning."""
+    stats = model.setdefault("elite_cycle_stats", {})
+    rec   = stats.setdefault(cycle, {"correct": 0, "total": 0})
+    rec["total"] += 1
+    if predicted_side == actual:
+        rec["correct"] += 1
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
+
+def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
+                            standings: dict, league_id: int) -> dict | None:
+    """
+    Elite Strategy Prediction Layer — runs alongside existing predictions.
+
+    Returns a dict with the elite pick (or None if rejected):
+      {
+        "prediction":    "HOME" | "AWAY",
+        "confidence":    float,
+        "strategy_type": str,
+        "cycle":         str,
+        "cycle_label":   str,
+        "market_score":  float,
+        "market_details": dict,
+        "form_score":    float,
+        "card_line":     str,   ← ready-to-append card line for the Telegram message
+      }
+    """
+    if not model or not standings:
+        return None
+
+    # 1. Primary strategy signal
+    strategy = _recovery_upset_strategy_elite(home, away, model, standings)
+    if not strategy or strategy["signal"] == "UNCERTAIN":
+        return None
+
+    predicted_side = strategy["prediction"]
+    strategy_type  = strategy["type"]
+
+    # 2. Last 6-match form confirmation
+    form_score = last6_form_confirmation(home, away, predicted_side, model)
+
+    # 3. Ranked market validation
+    market_score, market_details = ranked_market_validation_elite(
+        odds, predicted_side, model
+    )
+
+    # 4. Self-learning strategy boost
+    learning_boost = strategy_learning_boost_elite(strategy_type, model)
+
+    # 5. Market agreement fraction
+    agreement = market_agreement_score_elite(market_details)
+
+    # 6. Trap detection — hard reject on trap score >= 2
+    trap_score = detect_traps_elite(odds, predicted_side, market_details, model)
+    if trap_score >= 2:
+        return None
+
+    # 7. Final confidence
+    confidence = compute_final_confidence_elite(
+        strategy["strength"], form_score, market_score, learning_boost, agreement
+    )
+
+    # 8. Strict entry filter — only high-confidence picks
+    if confidence < 75:
+        return None
+
+    # 9. Cycle detection + adjustment
+    cycle = detect_cycle_pattern_elite(league_id, model)
+
+    # Hard filter: dangerous cycles
+    if cycle in ("STRONG_FAILURE", "ALTERNATING") and confidence < 80:
+        return None
+
+    confidence, cycle_label = apply_cycle_to_confidence_elite(
+        cycle, strategy_type, model, confidence
+    )
+
+    # Re-check minimum after cycle adjustment
+    if confidence < 75:
+        return None
+
+    # 10. Build display card line
+    pred_icon = "🏠" if predicted_side == "HOME" else "✈️"
+    pred_lbl  = f"{'1' if predicted_side == 'HOME' else '2'}"
+    mkt_icons = []
+    if market_details.get("HTFT") is True:   mkt_icons.append("HT/FT✅")
+    if market_details.get("1X2")  is True:   mkt_icons.append("1X2✅")
+    if market_details.get("DC")   is True:   mkt_icons.append("DC✅")
+    if market_details.get("BTTS") is True:   mkt_icons.append("BTTS✅")
+    if market_details.get("OU")   is True:   mkt_icons.append("O/U✅")
+    mkt_str = "  ".join(mkt_icons) if mkt_icons else "no market alignment"
+
+    strat_label = {
+        "STRONG_LOSS": "Strong team LOST → recovery",
+        "WEAK_WIN":    "Weak team WON → strong recovers",
+    }.get(strategy_type, strategy_type)
+
+    form_pct = round(max(0.0, min(1.0, (form_score + 1) / 2)) * 100)
+
+    card_line = (
+        f"┆ ━━━ 🧠 *ELITE LAYER* ━━━\n"
+        f"┆ {pred_icon} *Tip: {pred_lbl}*  ·  Conf: *{confidence:.1f}%*\n"
+        f"┆ 📋 Strategy: {strat_label}\n"
+        f"┆ 🔄 Cycle: {cycle_label}\n"
+        f"┆ 📊 Form edge: {form_pct}%  ·  Mkt score: {market_score:.0f}\n"
+        f"┆ ✅ Markets: {mkt_str}\n"
+        f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    return {
+        "prediction":     predicted_side,
+        "confidence":     confidence,
+        "strategy_type":  strategy_type,
+        "cycle":          cycle,
+        "cycle_label":    cycle_label,
+        "market_score":   market_score,
+        "market_details": market_details,
+        "form_score":     form_score,
+        "card_line":      card_line,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── END ELITE STRATEGY PREDICTION LAYER ────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _standings_signal(home: str, away: str,
@@ -12484,6 +13103,69 @@ async def _run_auto_post(bot, bot_data: dict):
 
                     _agree_total_card = max(len(_best_mkts_now), 1)
 
+                    # ── ELITE STRATEGY LAYER (annotation only — no independent filter) ──
+                    # Runs only on matches that already passed ALL existing filters.
+                    # Evaluates market hierarchy: HT/FT → 1X2 → DC → BTTS → O/U
+                    # and appends a compact signal line to the card when confirmed.
+                    _elite_result = elite_strategy_predict(
+                        home       = m["home"],
+                        away       = m["away"],
+                        odds       = ev_odds,
+                        model      = league_model,
+                        standings  = _standings_now,
+                        league_id  = lid,
+                    )
+                    _elite_line = ""
+                    if _elite_result:
+                        # Build compact signal using the highest-ranked aligned market
+                        _ed   = _elite_result["market_details"]
+                        _epred = _elite_result["prediction"]
+                        _econf = _elite_result["confidence"]
+                        _ecycle = _elite_result["cycle_label"]
+
+                        # Pick the best confirmed market in rank order
+                        _emkt_label = None
+                        _emkt_icon  = ""
+                        if _ed.get("HTFT") is True:
+                            # Show the actual HT/FT outcome string
+                            _htft_raw = ev_odds.get("htft", {})
+                            if _htft_raw:
+                                try:
+                                    _best_htft = min(_htft_raw.items(), key=lambda x: x[1])[0]
+                                    _ht_map = {"1":"Home","X":"Draw","2":"Away"}
+                                    _hp = _best_htft.split("/")
+                                    if len(_hp) == 2:
+                                        _htft_lbl = f"{_ht_map.get(_hp[0],_hp[0])}/{_ht_map.get(_hp[1],_hp[1])}"
+                                    else:
+                                        _htft_lbl = _best_htft
+                                    _emkt_label = f"HT/FT {_htft_lbl}🔥"
+                                    _emkt_icon  = "⏱"
+                                except Exception:
+                                    _emkt_label = "HT/FT🔥"
+                                    _emkt_icon  = "⏱"
+                        elif _ed.get("1X2") is True:
+                            _e1x2_lbl = "1" if _epred == "HOME" else "2"
+                            _emkt_label = f"1X2 {_e1x2_lbl}🔥"
+                            _emkt_icon  = "🎯"
+                        elif _ed.get("DC") is True:
+                            _edc_lbl = "1X" if _epred == "HOME" else "X2"
+                            _emkt_label = f"DC {_edc_lbl}"
+                            _emkt_icon  = "🛡"
+                        elif _ed.get("BTTS") is True:
+                            _emkt_label = "BTTS Yes"
+                            _emkt_icon  = "⚽"
+                        elif _ed.get("OU") is True:
+                            _emkt_label = "Over 2.5"
+                            _emkt_icon  = "📈"
+
+                        if _emkt_label:
+                            _elite_line = (
+                                f"\n"
+                                f"Elite Signal : {_emkt_icon} *{_emkt_label}*\n"
+                                f"Elite Conf   : *{_econf:.1f}%*  ·  {_ecycle}\n"
+                            )
+                    # ── END ELITE LAYER ────────────────────────────────────────────
+
                     # 5. Build the clean card
                     _league_hdr_card = (
                         f"━━━━━━━━━━━━━━━━━━\n"
@@ -12505,6 +13187,7 @@ async def _run_auto_post(bot, bot_data: dict):
                             fp_records=_recs_card,
                             extra_markets=_extra_mkts_card,
                         )
+                        + _elite_line
                         + f"\n{result_str}\n"
                     )
                     body += card + "\n"
