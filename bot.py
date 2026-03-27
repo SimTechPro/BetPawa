@@ -352,16 +352,28 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
     if h is not None and a is not None:
         return h, a
 
-    # 3c. participantPeriodResults — take MAX across all periods per participant.
-    #     FT >= HT always, so the highest value is always the final score.
-    #     Log the raw structure once so we can see actual slug values.
+    # 3c. participantPeriodResults
+    #
+    #  STRATEGY (safe, no guessing):
+    #   Pass 1 — collect scores from periods that are explicitly FT
+    #             (FULL_TIME slug/name/type, or "SECOND_HALF" cumulative score).
+    #   Pass 2 — if FT period found: return those values.
+    #   Pass 3 — if NO period is identifiable at all AND there are exactly
+    #             2 periods per participant (HT + FT): take the larger one.
+    #             This is the only safe "max" heuristic — it requires proof
+    #             that two distinct periods exist, so a mid-game snapshot
+    #             with only HT data (1 period) returns None correctly.
+    #   Never fall back to max-of-all when only 1 period exists — that is
+    #   exactly the half-time-only snapshot and must return None so the bot
+    #   waits for the real result.
     ppr = res.get("participantPeriodResults")
     if isinstance(ppr, list) and ppr:
-        home_vals = []
-        away_vals = []
-        _logged   = False
+        home_ft = []
+        away_ft = []
+        home_all_by_entry: dict = {}   # entry_idx -> list[int]
+        away_all_by_entry: dict = {}
 
-        for entry in ppr:
+        for ei, entry in enumerate(ppr):
             if not isinstance(entry, dict):
                 continue
             p_info = entry.get("participant") or {}
@@ -372,18 +384,11 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
 
             period_results = entry.get("periodResults") or []
 
-            # Log raw structure once per process lifetime so we can see slugs
-            if not _logged and period_results:
-                _logged = True
-                _pr0 = period_results[0] if period_results else {}
-                log.debug(
-                    f"PPR DEBUG ptype={ptype} "
+            # Log full structure on first encounter (INFO so it always shows)
+            if ei == 0 and period_results:
+                log.info(
+                    f"PPR SCORE DEBUG ptype={ptype} "
                     f"n_periods={len(period_results)} "
-                    f"period0_keys={list(_pr0.keys())} "
-                    f"period0_period={_pr0.get('period')} "
-                    f"period0_type={_pr0.get('type')} "
-                    f"period0_result={_pr0.get('result')} "
-                    f"period0_score={_pr0.get('score')} "
                     f"all_periods={[{'period':pr.get('period'),'type':pr.get('type'),'result':pr.get('result'),'score':pr.get('score')} for pr in period_results]}"
                 )
 
@@ -394,53 +399,59 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                 if v is None:
                     continue
 
-                # Explicitly skip if the period identifies itself as half-time
                 period_obj  = pr.get("period") or {}
                 period_slug = str(period_obj.get("slug") or "").upper()
                 period_name = str(period_obj.get("name") or "").upper()
                 pr_type     = str(pr.get("type") or "").upper()
+
                 _is_ht = (
                     "FIRST_HALF" in period_slug or "HALF_TIME" in period_slug or
                     "FIRST_HALF" in period_name or "HALF_TIME" in period_name or
-                    period_slug == "HT" or period_name == "HT" or
-                    pr_type == "HALF_TIME"
+                    period_slug in ("HT", "1H") or period_name in ("HT", "1H") or
+                    pr_type in ("HALF_TIME", "FIRST_HALF")
                 )
+                _is_ft = (
+                    "FULL_TIME" in period_slug or "FULL_TIME" in period_name or
+                    "SECOND_HALF" in period_slug or "SECOND_HALF" in period_name or
+                    period_slug in ("FT", "2H", "FULL") or period_name in ("FT", "2H", "FULL") or
+                    pr_type in ("FULL_TIME", "SCORE", "FINAL")
+                )
+
                 if _is_ht:
-                    continue   # skip — this is definitely HT
+                    pass   # explicitly skip HT
+                elif _is_ft:
+                    if "HOME" in ptype:
+                        home_ft.append(v)
+                    elif "AWAY" in ptype:
+                        away_ft.append(v)
+                else:
+                    # Period slug is ambiguous — collect separately for fallback
+                    if "HOME" in ptype:
+                        home_all_by_entry.setdefault(ei, []).append(v)
+                    elif "AWAY" in ptype:
+                        away_all_by_entry.setdefault(ei, []).append(v)
 
-                if "HOME" in ptype:
-                    home_vals.append(v)
-                elif "AWAY" in ptype:
-                    away_vals.append(v)
+        # Pass 1: explicit FT periods found — most reliable
+        if home_ft and away_ft:
+            return max(home_ft), max(away_ft)
 
-        if home_vals and away_vals:
-            # Take the maximum — FT score is always the largest value
-            return max(home_vals), max(away_vals)
-
-        # Last resort: if explicit HT-skip left us empty, take max of ALL values
-        # (this handles cases where every period has an ambiguous slug)
-        home_all = []
-        away_all = []
-        for entry in ppr:
-            if not isinstance(entry, dict):
-                continue
-            p_info = entry.get("participant") or {}
-            ptype  = str(
-                p_info.get("type") or entry.get("type") or
-                entry.get("participantType") or entry.get("side") or ""
-            ).upper()
-            for pr in (entry.get("periodResults") or []):
-                if not isinstance(pr, dict):
-                    continue
-                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
-                if v is None:
-                    continue
-                if "HOME" in ptype:
-                    home_all.append(v)
-                elif "AWAY" in ptype:
-                    away_all.append(v)
-        if home_all and away_all:
-            return max(home_all), max(away_all)
+        # Pass 2: no explicit FT/HT labels — only safe if there are exactly
+        # 2 periods per participant (confirms HT+FT both present, so max = FT).
+        # If only 1 ambiguous period exists, the match is mid-game (HT only)
+        # → return None so the bot waits for the final result.
+        if home_all_by_entry and away_all_by_entry:
+            home_ambiguous = [v for vals in home_all_by_entry.values() for v in vals]
+            away_ambiguous = [v for vals in away_all_by_entry.values() for v in vals]
+            home_period_count = len(home_ambiguous)
+            away_period_count = len(away_ambiguous)
+            if home_period_count >= 2 and away_period_count >= 2:
+                # Both participants have 2+ ambiguous periods → safe to take max
+                return max(home_ambiguous), max(away_ambiguous)
+            # Only 1 period (half-time snapshot) — do NOT return it
+            log.info(
+                f"PPR: only {home_period_count}/{away_period_count} ambiguous periods "
+                f"— likely mid-game HT snapshot, skipping (returning None)"
+            )
 
     return None, None
 
