@@ -352,24 +352,14 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
     if h is not None and a is not None:
         return h, a
 
-    # 3c. participantPeriodResults
-    #
-    # betPawa uses two API shapes depending on round age:
-    #
-    # Shape A — newer rounds (3 periods):
-    #   FIRST_HALF + SECOND_HALF + FULL_TIME_EXCLUDING_OVERTIME
-    #   FT = FIRST_HALF + SECOND_HALF  (sum of incremental half scores)
-    #
-    # Shape B — historical rounds (2 periods):
-    #   FIRST_HALF + FULL_TIME_EXCLUDING_OVERTIME  (no SECOND_HALF)
-    #   FT = FULL_TIME_EXCLUDING_OVERTIME  (already the final cumulative score)
-    #
-    # _extract_score is only ever called on PAGE_MATCHUPS data (completed rounds),
-    # so FULL_TIME_EXCLUDING_OVERTIME always contains the real final score here.
-    # Mid-game snapshots (page=upcoming/live) never reach this function for learning.
+    # 3c. participantPeriodResults — take MAX across all periods per participant.
+    #     FT >= HT always, so the highest value is always the final score.
+    #     Log the raw structure once so we can see actual slug values.
     ppr = res.get("participantPeriodResults")
     if isinstance(ppr, list) and ppr:
-        scores: dict[str, dict[str, int | None]] = {}
+        home_vals = []
+        away_vals = []
+        _logged   = False
 
         for entry in ppr:
             if not isinstance(entry, dict):
@@ -379,43 +369,78 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                 p_info.get("type") or entry.get("type") or
                 entry.get("participantType") or entry.get("side") or ""
             ).upper()
-            if not ptype:
-                continue
-            if ptype not in scores:
-                scores[ptype] = {}
 
+            period_results = entry.get("periodResults") or []
+
+            # Log raw structure once per process lifetime so we can see slugs
+            if not _logged and period_results:
+                _logged = True
+                _pr0 = period_results[0] if period_results else {}
+                log.debug(
+                    f"PPR DEBUG ptype={ptype} "
+                    f"n_periods={len(period_results)} "
+                    f"period0_keys={list(_pr0.keys())} "
+                    f"period0_period={_pr0.get('period')} "
+                    f"period0_type={_pr0.get('type')} "
+                    f"period0_result={_pr0.get('result')} "
+                    f"period0_score={_pr0.get('score')} "
+                    f"all_periods={[{'period':pr.get('period'),'type':pr.get('type'),'result':pr.get('result'),'score':pr.get('score')} for pr in period_results]}"
+                )
+
+            for pr in period_results:
+                if not isinstance(pr, dict):
+                    continue
+                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                if v is None:
+                    continue
+
+                # Explicitly skip if the period identifies itself as half-time
+                period_obj  = pr.get("period") or {}
+                period_slug = str(period_obj.get("slug") or "").upper()
+                period_name = str(period_obj.get("name") or "").upper()
+                pr_type     = str(pr.get("type") or "").upper()
+                _is_ht = (
+                    "FIRST_HALF" in period_slug or "HALF_TIME" in period_slug or
+                    "FIRST_HALF" in period_name or "HALF_TIME" in period_name or
+                    period_slug == "HT" or period_name == "HT" or
+                    pr_type == "HALF_TIME"
+                )
+                if _is_ht:
+                    continue   # skip — this is definitely HT
+
+                if "HOME" in ptype:
+                    home_vals.append(v)
+                elif "AWAY" in ptype:
+                    away_vals.append(v)
+
+        if home_vals and away_vals:
+            # Take the maximum — FT score is always the largest value
+            return max(home_vals), max(away_vals)
+
+        # Last resort: if explicit HT-skip left us empty, take max of ALL values
+        # (this handles cases where every period has an ambiguous slug)
+        home_all = []
+        away_all = []
+        for entry in ppr:
+            if not isinstance(entry, dict):
+                continue
+            p_info = entry.get("participant") or {}
+            ptype  = str(
+                p_info.get("type") or entry.get("type") or
+                entry.get("participantType") or entry.get("side") or ""
+            ).upper()
             for pr in (entry.get("periodResults") or []):
                 if not isinstance(pr, dict):
                     continue
-                v    = _int(pr.get("result") or pr.get("score") or pr.get("value"))
-                slug = str((pr.get("period") or {}).get("slug") or "").upper()
-                if slug:
-                    scores[ptype][slug] = v
-
-        def _ft(ptype: str) -> int | None:
-            s  = scores.get(ptype, {})
-            ht = s.get("FIRST_HALF")
-            sh = s.get("SECOND_HALF")
-            ft = s.get("FULL_TIME_EXCLUDING_OVERTIME")
-
-            # Shape A: SECOND_HALF present → sum of halves
-            if ht is not None and sh is not None:
-                return ht + sh
-
-            # Shape B: only FIRST_HALF + FULL_TIME → use FULL_TIME directly
-            if ft is not None:
-                return ft
-
-            return None
-
-        home_ptype = next((p for p in scores if "HOME" in p), None)
-        away_ptype = next((p for p in scores if "AWAY" in p), None)
-
-        if home_ptype and away_ptype:
-            h = _ft(home_ptype)
-            a = _ft(away_ptype)
-            if h is not None and a is not None:
-                return h, a
+                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                if v is None:
+                    continue
+                if "HOME" in ptype:
+                    home_all.append(v)
+                elif "AWAY" in ptype:
+                    away_all.append(v)
+        if home_all and away_all:
+            return max(home_all), max(away_all)
 
     return None, None
 
@@ -748,13 +773,9 @@ def _dynamic_market_weights(bot_data: dict) -> dict[str, float]:
         c   = rec.get("correct", 1)
         acc = c / t
         mom = _market_momentum(bot_data, mkt)
-        # FIX 1 — HARD LIMIT: cap 1x2 influence so it can't dominate when trapped.
-        # DC and BTTS consistently outperform 1x2 (72-100% vs 42-45%).
-        # Reducing 1x2 base weight lets better markets surface to the top.
-        if mkt == "1x2":
-            weight = acc * 0.60   # hard cap on 1x2 market weight
-        else:
-            weight = acc
+        # No artificial caps — all markets start equal at 50% (correct:1/total:2).
+        # Performance data alone determines which market rises or falls over time.
+        weight = acc
         if mom > 0.08:
             weight *= 1.30   # 🔥 HOT — boost
         elif mom > 0.04:
@@ -873,30 +894,8 @@ def _get_best_markets(bot_data: dict, min_acc: float = 0.58) -> list[str]:
         if t >= 5:
             ranked.append((mkt, eff_acc, dyn_w.get(mkt, acc)))
 
-    # Seed from cumulative league data when ml_weights is still fresh
-    _wts_total = sum(max(rec.get("total", 2), 2) for rec in weights.values())
-    if _wts_total < 35:
-        _btts_accs, _o25_accs, _dc_accs = [], [], []
-        for _lid_key in (7794, 7795, 7796, 9183, 9184, 13773, 13774):
-            _m   = bot_data.get(f"model_{_lid_key}", {})
-            _cum = _m.get("cumulative", {})
-            _bt  = _cum.get("btts_total", 0)
-            _bc  = _cum.get("btts_correct", 0)
-            _ot  = _cum.get("over25_total", 0)
-            _oc  = _cum.get("over25_correct", 0)
-            _mt  = _cum.get("matches_total", 0)
-            _hw  = _cum.get("home_wins", 0)
-            _dw  = _cum.get("draws", 0)
-            if _bt >= 50: _btts_accs.append(_bc / _bt)
-            if _ot >= 50: _o25_accs.append(_oc / _ot)
-            if _mt >= 50: _dc_accs.append((_hw + _dw) / _mt)
-        _known = {m for m, _, _ in ranked}
-        if _btts_accs and "btts" not in _known:
-            ranked.append(("btts", sum(_btts_accs)/len(_btts_accs), 0.25))
-        if _o25_accs and "ou" not in _known:
-            ranked.append(("ou",   sum(_o25_accs)/len(_o25_accs),   0.15))
-        if _dc_accs and "dc" not in _known:
-            ranked.append(("dc",   sum(_dc_accs)/len(_dc_accs),     0.25))
+    # No pre-seeding from cumulative data — markets must earn their position
+    # through actual ml_weights tracking. Fresh start = all equal at 50%.
 
     # Sort: primary = dynamic weight (momentum-adjusted), secondary = eff_acc
     ranked.sort(key=lambda x: (-x[2], -x[1]))
@@ -3721,31 +3720,12 @@ def compute_final_confidence_elite(strategy_strength: float, form_score: float,
                                     agreement: float) -> float:
     """
     Weighted blend of all signals → final confidence 0–100.
-
-    market_score is normalised against a realistic max of 58
-    (= 1X2 + DC + BTTS + OU all agree, no HT/FT).
-    HT/FT adds 35 extra on top → can push above 100% before cap.
-
-    Weights:
-      45% strategy strength  (core signal)
-      30% market confirmation (normalised to 0-100)
-      15% team form          (-1..+1 normalised to 0-100)
-       5% learning boost     (self-learning accuracy 0-100, low on cold start)
-       5% market agreement   (fraction 0-1 → 0-100)
-
-    Cold-start, 2 markets agree (1X2+DC): ~64%  → fires ✅
-    Cold-start, only 1X2 agrees:          ~56%  → blocked ✅
-    Cold-start, no markets agree:         ~45%  → blocked ✅
-    Mature system, all markets agree:     ~83%  → fires ✅
     """
-    form_norm = (form_score + 1.0) / 2.0 * 100.0
-    mkt_norm  = min(100.0, market_score / 58.0 * 100.0)
-
     raw = (
-        strategy_strength * 0.45 +
-        mkt_norm          * 0.30 +
-        form_norm         * 0.15 +
-        learning_boost    * 0.05 +
+        strategy_strength * 0.40 +
+        market_score      * 0.30 +
+        form_score        * 15.0 +    # form_score is -1..+1, scale to percentage points
+        learning_boost    * 0.10 +
         agreement * 100.0 * 0.05
     )
     return round(min(97.0, max(0.0, raw)), 2)
@@ -3998,15 +3978,15 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
         strategy["strength"], form_score, market_score, learning_boost, agreement
     )
 
-    # 8. Entry filter — require meaningful confidence
-    if confidence < 62:
+    # 8. Strict entry filter — only high-confidence picks
+    if confidence < 75:
         return None
 
     # 9. Cycle detection + adjustment
     cycle = detect_cycle_pattern_elite(league_id, model)
 
     # Hard filter: dangerous cycles
-    if cycle in ("STRONG_FAILURE", "ALTERNATING") and confidence < 70:
+    if cycle in ("STRONG_FAILURE", "ALTERNATING") and confidence < 80:
         return None
 
     confidence, cycle_label = apply_cycle_to_confidence_elite(
@@ -4014,7 +3994,7 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
     )
 
     # Re-check minimum after cycle adjustment
-    if confidence < 62:
+    if confidence < 75:
         return None
 
     # 10. Build display card line
@@ -12604,16 +12584,14 @@ async def _run_auto_post(bot, bot_data: dict):
                     # Determine dominant strong market for confidence anchor
                     _best_mkts_now  = _get_best_markets(bot_data)
                     _cycle_mkt_now  = _repeat_chk.get("cycle_tip_market", "1X2")
-                    _conf_market_key = "1x2" if "1x2" in _best_mkts_now else (
-                                        "dc" if "dc" in _best_mkts_now else (
-                                        "btts" if "btts" in _best_mkts_now else "1x2"))
+                    # Use the top-ranked market by actual performance — no preference
+                    _conf_market_key = _best_mkts_now[0] if _best_mkts_now else "1x2"
                     _real_conf = _compute_real_confidence(
                         _conf_market_key, bot_data, _league_acc, p_conf_adj
                     )
                     # Additional momentum boost applied to the primary market of this card
-                    _primary_mkt_early = "1x2" if "1x2" in _best_mkts_now else (
-                                          "dc" if "dc" in _best_mkts_now else (
-                                          "btts" if "btts" in _best_mkts_now else "1x2"))
+                    # Primary market for momentum boost = top performer, not hardcoded
+                    _primary_mkt_early = _best_mkts_now[0] if _best_mkts_now else "1x2"
                     _real_conf = _boost_conf_by_market_form(_real_conf, _primary_mkt_early, bot_data)
 
                     # ── REGIME DETECTION ENGINE ───────────────────────────────
@@ -13074,27 +13052,14 @@ async def _run_auto_post(bot, bot_data: dict):
                         _scores["1x2"]  = max(0,   _scores.get("1x2",  50) - 10)
                         _scores["htft"] = max(0,   _scores.get("htft", 50) - 8)
                     if _league_acc < 0.50:
-                        _scores["dc"]   = min(100, _scores.get("dc",   50) + 8)
-                        _scores["btts"] = min(100, _scores.get("btts", 50) + 5)
-                        _scores["1x2"]  = max(0,   _scores.get("1x2",  50) - 8)
+                        # Low league accuracy — trust all markets equally, no thumb on scale
+                        pass
 
-                    # ── FIX 4 — FORCE MARKET PRIORITY: DC > BTTS > others ─────
-                    # When DC or BTTS are in _best_mkts_now (proven performers),
-                    # force them to the top unless 1x2 score leads by a wide margin.
-                    # This directly addresses the core issue: bot "knows" DC=72-100%
-                    # but still picks 1x2. Now it ACTS on what it knows.
+                    # Market competition — highest score wins, no forced priority.
+                    # Markets earn their position through tracked performance only.
                     _ranked = sorted(_scores.items(), key=lambda x: -x[1])
                     _primary_mkt   = _ranked[0][0]
                     _primary_score = _ranked[0][1]
-
-                    # Force selection from best performing markets
-                    if "dc" in _best_mkts_now and _scores.get("dc", 0) >= 45:
-                        _primary_mkt   = "dc"
-                        _primary_score = _scores["dc"]
-                    elif "btts" in _best_mkts_now and _scores.get("btts", 0) >= 45:
-                        _primary_mkt   = "btts"
-                        _primary_score = _scores["btts"]
-                    # else fall back to score-ranked winner
 
                     # ── FIX 5 — LOSS STREAK SURVIVAL MODE in card builder ─────
                     # If loss streak is very high, force primary to DC (safest market)
@@ -13109,13 +13074,9 @@ async def _run_auto_post(bot, bot_data: dict):
                     if _primary_score < 55:
                         continue   # no market good enough — skip
 
-                    # ── FIX 6 — ENFORCE AGREEMENT: require >= 2 strong markets ─
-                    # Report shows bot posts picks with only 1 weak market agreeing.
-                    # Now: must have 2+ markets agreeing OR be a confirmed odds-repeat
-                    # with DC/BTTS as primary (safe markets don't need extra agreement).
-                    _is_safe_primary = _primary_mkt in ("dc", "btts")
-                    _enforce_agree   = not _is_safe_primary  # safe mkts get pass
-                    if _enforce_agree and _agree_count < 2:
+                    # Enforce agreement: all markets need >= 2 signals agreeing.
+                    # No market gets a free pass — performance decides trust.
+                    if _agree_count < 2:
                         continue   # ❌ Weak signal — not enough market agreement
 
                     # ── FIX 7 — STRICT SECONDARY MARKET SELECTION ────────────
@@ -13828,9 +13789,8 @@ async def _elite_job(context):
                         if not result:
                             continue
 
-                        # Extra gate: at least one market must agree (net positive)
-                        if result["market_score"] <= 0:
-                            log.info(f"🧠 ELITE [{lid}] {home}v{away}: skip — no market agreement (score={result['market_score']:.1f})")
+                        # Extra gate: market score must be positive net
+                        if result["market_score"] < 10:
                             continue
 
                         # Extra gate: if HT/FT is present it must agree (not conflict)
