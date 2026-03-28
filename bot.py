@@ -3664,12 +3664,20 @@ def market_agreement_score_elite(details: dict) -> float:
 
 
 def strategy_learning_boost_elite(strategy_type: str, model: dict) -> float:
-    """Small boost from self-learned per-strategy-type accuracy (0–10)."""
-    data = model.get("elite_strategy_stats", {}).get(
-        strategy_type, {"correct": 1, "total": 2}
-    )
-    t = max(data.get("total", 2), 2)
-    accuracy = data.get("correct", 1) / t
+    """
+    Boost from self-learned per-strategy-type accuracy (0–10).
+    Requires minimum 15 samples before trusting — returns neutral 5.0 until then.
+    Negative boost (penalty) when accuracy is below 40%.
+    """
+    data = model.get("elite_strategy_stats", {}).get(strategy_type, {})
+    t = data.get("total", 0)
+    c = data.get("correct", 0)
+    if t < 15:
+        return 5.0   # neutral — not enough data to trust yet
+    accuracy = c / t
+    # Penalty when strategy type is performing poorly
+    if accuracy < 0.40:
+        return max(0.0, accuracy * 10.0 - 5.0)   # negative boost = penalty
     return accuracy * 10.0
 
 
@@ -3720,13 +3728,22 @@ def compute_final_confidence_elite(strategy_strength: float, form_score: float,
                                     agreement: float) -> float:
     """
     Weighted blend of all signals → final confidence 0–100.
+
+    strategy_strength : 0–100  (base tier/pattern strength)
+    form_score        : -1..+1 (positive = predicted side has better form)
+    market_score      : variable, typically -90..+93 (ranked market net score)
+    learning_boost    : 0–10  (self-learned strategy-type accuracy)
+    agreement         : 0..1  (fraction of markets agreeing)
     """
+    # Normalise market_score to 0–100 range (max possible = 35+25+15+10+8 = 93)
+    mkt_norm = max(0.0, min(100.0, (market_score + 50) / 1.43))
+
     raw = (
-        strategy_strength * 0.40 +
-        market_score      * 0.30 +
-        form_score        * 15.0 +    # form_score is -1..+1, scale to percentage points
-        learning_boost    * 0.10 +
-        agreement * 100.0 * 0.05
+        strategy_strength * 0.35 +
+        mkt_norm          * 0.35 +
+        form_score        * 12.0 +   # form_score -1..+1 → -12..+12 pts
+        learning_boost    * 0.80 +   # 0–10 → 0–8 pts
+        agreement         * 10.0     # 0–1  → 0–10 pts
     )
     return round(min(97.0, max(0.0, raw)), 2)
 
@@ -3946,6 +3963,27 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
     if not model or not standings:
         return None
 
+    # ── GATE 0: minimum data — need enough history to evaluate anything ───────
+    ml_size = len(model.get("match_log", []))
+    if ml_size < 18:
+        return None   # too fresh — no reliable tier/form data yet
+
+    # ── GATE 1: loss streak protection ────────────────────────────────────────
+    # Mirror main engine: hard stop at 7 consecutive wrong, penalty at 5+
+    _risk      = model.get("_elite_risk", {"loss_streak": 0})
+    _e_streak  = _risk.get("loss_streak", 0)
+    if _e_streak >= 7:
+        return None   # hard stop — Elite is on a bad run, go silent
+
+    # ── GATE 2: recent accuracy gate ──────────────────────────────────────────
+    # If Elite has been wrong >= 60% of its last 10 picks, suppress posting.
+    _e_hist   = model.get("elite_pick_history", [])
+    _e_recent = _e_hist[-10:]
+    if len(_e_recent) >= 10:
+        _e_wrong_rate = sum(1 for r in _e_recent if not r) / len(_e_recent)
+        if _e_wrong_rate >= 0.60:
+            return None   # too many recent wrong picks — go quiet
+
     # 1. Primary strategy signal
     strategy = _recovery_upset_strategy_elite(home, away, model, standings)
     if not strategy or strategy["signal"] == "UNCERTAIN":
@@ -3953,6 +3991,13 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
 
     predicted_side = strategy["prediction"]
     strategy_type  = strategy["type"]
+
+    # ── GATE 3: strategy type accuracy — require min 15 samples if we have them
+    _st_data  = model.get("elite_strategy_stats", {}).get(strategy_type, {})
+    _st_total = _st_data.get("total", 0)
+    _st_cor   = _st_data.get("correct", 0)
+    if _st_total >= 30 and (_st_cor / _st_total) < 0.38:
+        return None   # this strategy type is failing — suppress until it recovers
 
     # 2. Last 6-match form confirmation
     form_score = last6_form_confirmation(home, away, predicted_side, model)
@@ -3962,11 +4007,21 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
         odds, predicted_side, model
     )
 
+    # ── GATE 4: market score must be clearly positive ─────────────────────────
+    # Negative or zero = more markets disagree than agree → don't post
+    if market_score <= 0:
+        return None
+
     # 4. Self-learning strategy boost
     learning_boost = strategy_learning_boost_elite(strategy_type, model)
 
     # 5. Market agreement fraction
     agreement = market_agreement_score_elite(market_details)
+
+    # ── GATE 5: minimum market agreement ─────────────────────────────────────
+    # At least 50% of available markets must agree independently
+    if agreement < 0.50:
+        return None
 
     # 6. Trap detection — hard reject on trap score >= 2
     trap_score = detect_traps_elite(odds, predicted_side, market_details, model)
@@ -3977,6 +4032,19 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
     confidence = compute_final_confidence_elite(
         strategy["strength"], form_score, market_score, learning_boost, agreement
     )
+
+    # ── GATE 6: loss streak confidence cap ────────────────────────────────────
+    if _e_streak >= 5:
+        confidence = min(confidence, 70.0)   # survival mode — cap confidence
+    elif _e_streak >= 3:
+        confidence = min(confidence, 80.0)   # caution mode
+
+    # ── GATE 7: high-confidence mistake penalty ────────────────────────────────
+    # If Elite keeps being confidently wrong, shrink the ceiling
+    _hcm = model.get("elite_high_conf_mistakes", 0)
+    if _hcm >= 5 and confidence >= 75:
+        _hcm_penalty = min(10.0, (_hcm - 4) * 1.0)
+        confidence = max(60.0, confidence - _hcm_penalty)
 
     # 8. Strict entry filter — only high-confidence picks
     if confidence < 75:
@@ -3996,6 +4064,15 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
     # Re-check minimum after cycle adjustment
     if confidence < 75:
         return None
+
+    # ── GATE 8: regime awareness ───────────────────────────────────────────────
+    # Reuse the main engine's regime detection — if we're in TRAP_PHASE, penalise
+    # Elite confidence too (markets are unreliable for everyone right now)
+    _regime = model.get("_last_regime", "NORMAL")
+    if _regime == "TRAP_PHASE":
+        confidence = max(60.0, confidence - 8.0)
+        if confidence < 75:
+            return None
 
     # 10. Build display card line
     pred_icon = "🏠" if predicted_side == "HOME" else "✈️"
@@ -11019,9 +11096,8 @@ async def _learning_job(context):
                         round_id=int(round_id) if round_id else 0,
                     )
                     # ── Re-evaluate dynamic signal trust after every round ────
-                    # This re-reads trap state, per-signal accuracy, and updates
-                    # model["signal_trust_state"] so predict_match uses fresh routing.
                     _trust_state = _evaluate_signal_trust(_get_model(bot_data, league_id))
+                    _get_model(bot_data, league_id)["_last_regime"] = _detect_regime(bot_data)
                     log.info(
                         f"🔀 Signal trust updated [{league_id}] R#{round_id}: "
                         f"dominant={_trust_state.get('dominant')} "
@@ -11030,6 +11106,56 @@ async def _learning_job(context):
                         f"tier={_trust_state.get('trust_tier',0):.0%} "
                         f"trapped={'odds' if _trust_state.get('odds_trapped') else 'none'}"
                     )
+
+                    # ── Elite self-learning ─────────────────────────────────────
+                    _elite_model   = _get_model(bot_data, league_id)
+                    _elite_stand   = bot_data.get(f"standings_{league_id}", {})
+                    _e_risk        = _elite_model.setdefault("_elite_risk", {"loss_streak": 0})
+                    _e_hist        = _elite_model.setdefault("elite_pick_history", [])
+                    _e_hcm         = _elite_model.get("elite_high_conf_mistakes", 0)
+
+                    for _res in results:
+                        _rh  = _res.get("home", "")
+                        _ra  = _res.get("away", "")
+                        _rsh = _res.get("actual_h")
+                        _rsa = _res.get("actual_a")
+                        if _rsh is None or _rsa is None:
+                            continue
+                        _actual = ("HOME" if _rsh > _rsa else
+                                   "AWAY" if _rsa > _rsh else "DRAW")
+
+                        _e_strat = _recovery_upset_strategy_elite(
+                            _rh, _ra, _elite_model, _elite_stand
+                        )
+                        if not _e_strat or _e_strat["signal"] == "UNCERTAIN":
+                            continue
+
+                        _e_pred   = _e_strat["prediction"]
+                        _e_stype  = _e_strat["type"]
+                        _e_cycle  = detect_cycle_pattern_elite(league_id, _elite_model)
+                        _e_correct = (_e_pred == _actual)
+
+                        _update_elite_strategy_stats(_elite_model, _e_stype, _e_pred, _actual)
+                        _update_elite_cycle_stats(_elite_model, _e_cycle, _e_pred, _actual)
+
+                        _e_hist.append(_e_correct)
+                        if len(_e_hist) > 20:
+                            _elite_model["elite_pick_history"] = _e_hist[-20:]
+
+                        if _e_correct:
+                            _e_risk["loss_streak"] = 0
+                            _e_hcm = max(0, _e_hcm - 1)
+                        else:
+                            _e_risk["loss_streak"] = _e_risk.get("loss_streak", 0) + 1
+                            _e_hcm += 1
+                        _elite_model["elite_high_conf_mistakes"] = _e_hcm
+
+                        log.info(
+                            f"🧠 Elite learned [{league_id}] {_rh} vs {_ra}: "
+                            f"pred={_e_pred} actual={_actual} "
+                            f"{'✅' if _e_correct else '❌'} "
+                            f"streak={_e_risk['loss_streak']} type={_e_stype}"
+                        )
 
                     # Remove from pending after learning
                     del rounds[round_id]
@@ -13869,12 +13995,13 @@ async def _elite_job(context):
                             f"⏳ pending\n"
                         )
 
+                        _raw_mkt = (_mkt_show or "").split()[0].lower().rstrip("—").strip()
                         elite_cards.append({
                             "card":   card,
                             "home":   home,
                             "away":   away,
-                            "pred":   pred,
-                            "market": (_mkt_show or "").split()[0].lower(),
+                            "pred":   pred,       # "HOME" or "AWAY"
+                            "market": _raw_mkt,   # "ht/ft" / "1x2" / "dc" / "btts" / "over"
                             "conf":   conf,
                         })
 
@@ -13925,6 +14052,10 @@ async def _elite_result_update_job(context):
     """
     Edits Elite cards with ✅/❌ result once the round completes.
     Runs every 30s alongside the main result updater.
+
+    Correct = Elite's predicted direction (HOME/AWAY) matches actual result.
+    The displayed market (HT/FT, 1X2, DC etc.) is shown on the card already —
+    the result line just confirms the direction outcome.
     """
     bot      = context.bot
     bot_data = context.bot_data
@@ -13944,7 +14075,6 @@ async def _elite_result_update_job(context):
                 if not entries:
                     continue
 
-                # Check if this round has scores now
                 _done_key = f"elite_result_updated_{lid_s}_{rid_s}"
                 if bot_data.get(_done_key):
                     continue
@@ -13952,48 +14082,76 @@ async def _elite_result_update_job(context):
                 try:
                     score_events = await fetch_round_events(client, rid_s, PAGE_MATCHUPS)
                     score_events = _filter_league(score_events, lid)
-                    scored       = {e: _extract_score(e) for e in score_events}
-                    scored       = {_norm_event(e)["home"] + "|" + _norm_event(e)["away"]: s
-                                    for e, s in scored.items()
-                                    if s[0] is not None}
+                    # Build scored dict: "home|away" → (sh, sa)
+                    scored = {}
+                    for _se in score_events:
+                        _sm = _norm_event(_se)
+                        _sh, _sa = _extract_score(_se)
+                        if _sh is not None and _sa is not None:
+                            scored[f"{_sm['home']}|{_sm['away']}"] = (_sh, _sa)
                 except Exception:
                     continue
 
                 if not scored:
-                    continue  # scores not in yet
+                    continue  # scores not in yet — retry next tick
 
-                all_updated = True
+                all_done = True
                 for entry in entries:
-                    fk   = entry["home"] + "|" + entry["away"]
-                    sc   = scored.get(fk)
-                    if sc is None:
-                        all_updated = False
+                    # Skip entries already edited
+                    if entry.get("_result_set"):
                         continue
 
-                    sh, sa = sc
-                    actual = "HOME" if sh > sa else "AWAY" if sa > sh else "DRAW"
-                    correct = (actual == entry["pred"])
-                    icon    = "✅" if correct else "❌"
+                    fk = f"{entry['home']}|{entry['away']}"
+                    sc = scored.get(fk)
+                    if sc is None:
+                        all_done = False  # this match score not available yet
+                        continue
+
+                    sh, sa   = sc
+                    actual   = "HOME" if sh > sa else "AWAY" if sa > sh else "DRAW"
+                    pred_dir = entry.get("pred", "")   # HOME or AWAY (Elite direction)
+
+                    # Correct = direction matches.
+                    # For DC picks: 1X = HOME or DRAW, X2 = AWAY or DRAW
+                    _mkt_key = entry.get("market", "")
+                    if _mkt_key == "dc":
+                        # DC 1X = covers HOME+DRAW, DC X2 = covers AWAY+DRAW
+                        if pred_dir == "HOME":
+                            correct = actual in ("HOME", "DRAW")
+                        else:
+                            correct = actual in ("AWAY", "DRAW")
+                    else:
+                        # HT/FT, 1X2, BTTS, O/U — all directional
+                        correct = (actual == pred_dir)
+
+                    icon        = "✅" if correct else "❌"
                     result_line = f"{icon} {sh}–{sa}"
 
-                    # Edit the message
+                    card_text = entry.get("card_text", "")
+                    new_text  = card_text.replace("⏳ pending", result_line) if card_text else result_line
+
                     try:
-                        _msg_txt = entry.get("last_text", "")
-                        if "⏳ pending" in _msg_txt or not _msg_txt:
-                            pass  # we'll re-fetch — just edit by replacing pending line
                         await bot.edit_message_text(
                             chat_id    = entry["chat_id"],
                             message_id = entry["msg_id"],
-                            text       = (entry.get("card_text", "").replace(
-                                             "⏳ pending", result_line)
-                                          if entry.get("card_text")
-                                          else result_line),
+                            text       = new_text,
                             parse_mode = "Markdown",
                         )
-                    except Exception:
-                        pass  # message may be too old to edit — that's fine
+                        entry["_result_set"] = True
+                        log.info(
+                            f"🧠 Elite result updated [{lid}] "
+                            f"{entry['home']} vs {entry['away']}: "
+                            f"{sh}–{sa} {'✅' if correct else '❌'}"
+                        )
+                    except Exception as _ee:
+                        _err = str(_ee).lower()
+                        if "not modified" in _err or "message to edit not found" in _err:
+                            entry["_result_set"] = True  # already up to date or gone
+                        else:
+                            all_done = False   # real error — retry
+                            log.debug(f"Elite edit error [{lid}]: {_ee}")
 
-                if all_updated:
+                if all_done:
                     bot_data[_done_key] = True
 
 async def _auto_send_job(context):
