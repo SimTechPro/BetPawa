@@ -2288,25 +2288,40 @@ async def fetch_completed_round(client, league_id: int):
 
     if _check_round:
         _check_id    = str(_check_round.get("id") or _check_round.get("gameRoundId") or "")
-        score_events = await fetch_round_events(client, _check_id, PAGE_MATCHUPS)
-        score_events = _filter_league(score_events, league_id)
-        if score_events:
-            has_confirmed_scores = all(
-                _extract_score(e)[0] is not None for e in score_events
-            )
-            if has_confirmed_scores:
-                prev_round_id = _check_id
-                # Build score map for previous round — used to update old cards
-                # Do NOT inject into upcoming events (those are not yet played)
-                for sc in score_events:
-                    nm = _norm_event(sc)
-                    sh, sa = _extract_score(sc)
-                    if sh is not None and sa is not None and nm["home"] and nm["away"]:
-                        fk = _fixture_key(nm["home"], nm["away"])
-                        # Only store canonical home|away → (home_score, away_score).
-                        # Never store reversed key — it causes wrong score orientation
-                        # when the lookup falls through to the away|home variant.
-                        prev_scores[fk] = (sh, sa)
+
+        # ── Cooldown guard: wait at least 60s after round end before reading scores ──
+        # betPawa exposes half-time scores on PAGE_MATCHUPS while the second half is
+        # still being played. Reading too early captures (0-1) HT instead of (1-2) FT.
+        # Virtual rounds are ~5 min long. We gate on round END time + 60s buffer.
+        _chk_te       = _check_round.get("tradingTime", {})
+        _chk_end_str  = _chk_te.get("end") if isinstance(_chk_te, dict) else None
+        _chk_end_ms   = (_iso_to_ms(_chk_end_str) if _chk_end_str
+                         else _round_start_ms(_check_round) + 5 * 60 * 1000)
+        _RESULT_DELAY_MS = 60 * 1000   # 60 seconds after round end
+        if now_ms < _chk_end_ms + _RESULT_DELAY_MS:
+            _secs_left = (_chk_end_ms + _RESULT_DELAY_MS - now_ms) / 1000
+            log.info(f"⏳ [{league_id}] Waiting {_secs_left:.0f}s for round {_check_id} "
+                     f"to fully complete before reading scores")
+        else:
+            score_events = await fetch_round_events(client, _check_id, PAGE_MATCHUPS)
+            score_events = _filter_league(score_events, league_id)
+            if score_events:
+                has_confirmed_scores = all(
+                    _extract_score(e)[0] is not None for e in score_events
+                )
+                if has_confirmed_scores:
+                    prev_round_id = _check_id
+                    # Build score map for previous round — used to update old cards
+                    # Do NOT inject into upcoming events (those are not yet played)
+                    for sc in score_events:
+                        nm = _norm_event(sc)
+                        sh, sa = _extract_score(sc)
+                        if sh is not None and sa is not None and nm["home"] and nm["away"]:
+                            fk = _fixture_key(nm["home"], nm["away"])
+                            # Only store canonical home|away → (home_score, away_score).
+                            # Never store reversed key — it causes wrong score orientation
+                            # when the lookup falls through to the away|home variant.
+                            prev_scores[fk] = (sh, sa)
 
     log.info(f"✅ [{league_id}] fetch_completed_round {upcoming_id}: "
              f"{len(events)} events, with_odds={with_odds}/{len(events)}, "
@@ -13956,7 +13971,7 @@ async def _elite_job(context):
                 if ml_size < 18:
                     continue
 
-                # Fetch upcoming round with odds
+                # Fetch upcoming round with odds + capture round end time
                 try:
                     round_name, round_id, _season_id, events, _ = await fetch_next_round(client, lid)
                 except Exception:
@@ -13964,6 +13979,23 @@ async def _elite_job(context):
 
                 if not events or not round_id:
                     continue
+
+                # Capture round end time for the cooldown guard in _elite_result_update_job.
+                # fetch_next_round uses the actual rounds list — re-read it to get tradingTime.
+                # Store now so the result updater knows when to start reading FT scores.
+                _elite_rounds_act = await fetch_round_list(client, lid, past=False)
+                _elite_round_end_ms = 0
+                for _er in (_elite_rounds_act or []):
+                    if str(_er.get("id") or "") == str(round_id):
+                        _er_te = _er.get("tradingTime", {})
+                        _er_end_str = _er_te.get("end") if isinstance(_er_te, dict) else None
+                        if _er_end_str:
+                            _elite_round_end_ms = _iso_to_ms(_er_end_str)
+                        else:
+                            _elite_round_end_ms = _round_start_ms(_er) + 5 * 60 * 1000
+                        break
+                if _elite_round_end_ms:
+                    bot_data[f"elite_round_end_{lid}_{round_id}"] = _elite_round_end_ms
 
                 # Dedup — one elite post per league per round
                 _dedup_key = f"elite_sent_{lid}_{round_id}"
@@ -14114,6 +14146,7 @@ async def _elite_job(context):
                                 "home":      _ec["home"],
                                 "away":      _ec["away"],
                                 "pred":      _ec["pred"],
+                                "market":    _ec["market"],
                                 "card_text": _ec["card"],
                             })
                             log.info(f"🧠 ELITE posted [{LEAGUES[lid]['name']}] "
@@ -14156,6 +14189,17 @@ async def _elite_result_update_job(context):
 
                 _done_key = f"elite_result_updated_{lid_s}_{rid_s}"
                 if bot_data.get(_done_key):
+                    continue
+
+                # ── Cooldown guard: wait 60s after round end before reading scores ──
+                # betPawa exposes HT scores on matchups page mid-round.
+                # We store the round end time when elite cards are created; fall back
+                # to checking if round_id timestamp implies it ended >60s ago.
+                _round_end_ms = bot_data.get(f"elite_round_end_{lid_s}_{rid_s}", 0)
+                _now_ms = int(time.time() * 1000)
+                if _round_end_ms > 0 and _now_ms < _round_end_ms + 60_000:
+                    _wait = (_round_end_ms + 60_000 - _now_ms) / 1000
+                    log.debug(f"⏳ Elite result [{lid_s}/{rid_s}]: waiting {_wait:.0f}s for FT scores")
                     continue
 
                 try:
