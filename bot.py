@@ -352,14 +352,24 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
     if h is not None and a is not None:
         return h, a
 
-    # 3c. participantPeriodResults — take MAX across all periods per participant.
-    #     FT >= HT always, so the highest value is always the final score.
-    #     Log the raw structure once so we can see actual slug values.
+    # 3c. participantPeriodResults
+    #
+    # betPawa uses two API shapes depending on round age:
+    #
+    # Shape A — newer rounds (3 periods):
+    #   FIRST_HALF + SECOND_HALF + FULL_TIME_EXCLUDING_OVERTIME
+    #   FT = FIRST_HALF + SECOND_HALF  (sum of incremental half scores)
+    #
+    # Shape B — historical rounds (2 periods):
+    #   FIRST_HALF + FULL_TIME_EXCLUDING_OVERTIME  (no SECOND_HALF)
+    #   FT = FULL_TIME_EXCLUDING_OVERTIME  (already the final cumulative score)
+    #
+    # _extract_score is only ever called on PAGE_MATCHUPS data (completed rounds),
+    # so FULL_TIME_EXCLUDING_OVERTIME always contains the real final score here.
+    # Mid-game snapshots (page=upcoming/live) never reach this function for learning.
     ppr = res.get("participantPeriodResults")
     if isinstance(ppr, list) and ppr:
-        home_vals = []
-        away_vals = []
-        _logged   = False
+        scores: dict[str, dict[str, int | None]] = {}
 
         for entry in ppr:
             if not isinstance(entry, dict):
@@ -369,78 +379,43 @@ def _extract_score(event: dict) -> tuple[int | None, int | None]:
                 p_info.get("type") or entry.get("type") or
                 entry.get("participantType") or entry.get("side") or ""
             ).upper()
-
-            period_results = entry.get("periodResults") or []
-
-            # Log raw structure once per process lifetime so we can see slugs
-            if not _logged and period_results:
-                _logged = True
-                _pr0 = period_results[0] if period_results else {}
-                log.debug(
-                    f"PPR DEBUG ptype={ptype} "
-                    f"n_periods={len(period_results)} "
-                    f"period0_keys={list(_pr0.keys())} "
-                    f"period0_period={_pr0.get('period')} "
-                    f"period0_type={_pr0.get('type')} "
-                    f"period0_result={_pr0.get('result')} "
-                    f"period0_score={_pr0.get('score')} "
-                    f"all_periods={[{'period':pr.get('period'),'type':pr.get('type'),'result':pr.get('result'),'score':pr.get('score')} for pr in period_results]}"
-                )
-
-            for pr in period_results:
-                if not isinstance(pr, dict):
-                    continue
-                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
-                if v is None:
-                    continue
-
-                # Explicitly skip if the period identifies itself as half-time
-                period_obj  = pr.get("period") or {}
-                period_slug = str(period_obj.get("slug") or "").upper()
-                period_name = str(period_obj.get("name") or "").upper()
-                pr_type     = str(pr.get("type") or "").upper()
-                _is_ht = (
-                    "FIRST_HALF" in period_slug or "HALF_TIME" in period_slug or
-                    "FIRST_HALF" in period_name or "HALF_TIME" in period_name or
-                    period_slug == "HT" or period_name == "HT" or
-                    pr_type == "HALF_TIME"
-                )
-                if _is_ht:
-                    continue   # skip — this is definitely HT
-
-                if "HOME" in ptype:
-                    home_vals.append(v)
-                elif "AWAY" in ptype:
-                    away_vals.append(v)
-
-        if home_vals and away_vals:
-            # Take the maximum — FT score is always the largest value
-            return max(home_vals), max(away_vals)
-
-        # Last resort: if explicit HT-skip left us empty, take max of ALL values
-        # (this handles cases where every period has an ambiguous slug)
-        home_all = []
-        away_all = []
-        for entry in ppr:
-            if not isinstance(entry, dict):
+            if not ptype:
                 continue
-            p_info = entry.get("participant") or {}
-            ptype  = str(
-                p_info.get("type") or entry.get("type") or
-                entry.get("participantType") or entry.get("side") or ""
-            ).upper()
+            if ptype not in scores:
+                scores[ptype] = {}
+
             for pr in (entry.get("periodResults") or []):
                 if not isinstance(pr, dict):
                     continue
-                v = _int(pr.get("result") or pr.get("score") or pr.get("value"))
-                if v is None:
-                    continue
-                if "HOME" in ptype:
-                    home_all.append(v)
-                elif "AWAY" in ptype:
-                    away_all.append(v)
-        if home_all and away_all:
-            return max(home_all), max(away_all)
+                v    = _int(pr.get("result") or pr.get("score") or pr.get("value"))
+                slug = str((pr.get("period") or {}).get("slug") or "").upper()
+                if slug:
+                    scores[ptype][slug] = v
+
+        def _ft(ptype: str) -> int | None:
+            s  = scores.get(ptype, {})
+            ht = s.get("FIRST_HALF")
+            sh = s.get("SECOND_HALF")
+            ft = s.get("FULL_TIME_EXCLUDING_OVERTIME")
+
+            # Shape A: SECOND_HALF present → sum of halves
+            if ht is not None and sh is not None:
+                return ht + sh
+
+            # Shape B: only FIRST_HALF + FULL_TIME → use FULL_TIME directly
+            if ft is not None:
+                return ft
+
+            return None
+
+        home_ptype = next((p for p in scores if "HOME" in p), None)
+        away_ptype = next((p for p in scores if "AWAY" in p), None)
+
+        if home_ptype and away_ptype:
+            h = _ft(home_ptype)
+            a = _ft(away_ptype)
+            if h is not None and a is not None:
+                return h, a
 
     return None, None
 
@@ -3746,12 +3721,31 @@ def compute_final_confidence_elite(strategy_strength: float, form_score: float,
                                     agreement: float) -> float:
     """
     Weighted blend of all signals → final confidence 0–100.
+
+    market_score is normalised against a realistic max of 58
+    (= 1X2 + DC + BTTS + OU all agree, no HT/FT).
+    HT/FT adds 35 extra on top → can push above 100% before cap.
+
+    Weights:
+      45% strategy strength  (core signal)
+      30% market confirmation (normalised to 0-100)
+      15% team form          (-1..+1 normalised to 0-100)
+       5% learning boost     (self-learning accuracy 0-100, low on cold start)
+       5% market agreement   (fraction 0-1 → 0-100)
+
+    Cold-start, 2 markets agree (1X2+DC): ~64%  → fires ✅
+    Cold-start, only 1X2 agrees:          ~56%  → blocked ✅
+    Cold-start, no markets agree:         ~45%  → blocked ✅
+    Mature system, all markets agree:     ~83%  → fires ✅
     """
+    form_norm = (form_score + 1.0) / 2.0 * 100.0
+    mkt_norm  = min(100.0, market_score / 58.0 * 100.0)
+
     raw = (
-        strategy_strength * 0.40 +
-        market_score      * 0.30 +
-        form_score        * 15.0 +    # form_score is -1..+1, scale to percentage points
-        learning_boost    * 0.10 +
+        strategy_strength * 0.45 +
+        mkt_norm          * 0.30 +
+        form_norm         * 0.15 +
+        learning_boost    * 0.05 +
         agreement * 100.0 * 0.05
     )
     return round(min(97.0, max(0.0, raw)), 2)
@@ -4004,15 +3998,15 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
         strategy["strength"], form_score, market_score, learning_boost, agreement
     )
 
-    # 8. Strict entry filter — only high-confidence picks
-    if confidence < 75:
+    # 8. Entry filter — require meaningful confidence
+    if confidence < 62:
         return None
 
     # 9. Cycle detection + adjustment
     cycle = detect_cycle_pattern_elite(league_id, model)
 
     # Hard filter: dangerous cycles
-    if cycle in ("STRONG_FAILURE", "ALTERNATING") and confidence < 80:
+    if cycle in ("STRONG_FAILURE", "ALTERNATING") and confidence < 70:
         return None
 
     confidence, cycle_label = apply_cycle_to_confidence_elite(
@@ -4020,7 +4014,7 @@ def elite_strategy_predict(home: str, away: str, odds: dict, model: dict,
     )
 
     # Re-check minimum after cycle adjustment
-    if confidence < 75:
+    if confidence < 62:
         return None
 
     # 10. Build display card line
@@ -13834,8 +13828,9 @@ async def _elite_job(context):
                         if not result:
                             continue
 
-                        # Extra gate: market score must be positive net
-                        if result["market_score"] < 10:
+                        # Extra gate: at least one market must agree (net positive)
+                        if result["market_score"] <= 0:
+                            log.info(f"🧠 ELITE [{lid}] {home}v{away}: skip — no market agreement (score={result['market_score']:.1f})")
                             continue
 
                         # Extra gate: if HT/FT is present it must agree (not conflict)
@@ -15281,13 +15276,8 @@ async def _do_backup_inner(message, c):
         "strategy_stats":      bd.get("strategy_stats", {}),
         "odds_repeat_stats":   bd.get("odds_repeat_stats", {}),
         "ml_weights":          bd.get("ml_weights", {}),
-        "market_history":      bd.get("market_history", {}),
-        "_prev_market_weights": bd.get("_prev_market_weights", {}),
         "risk":                bd.get("risk", {}),
         "odds_store":          bd.get("odds_store", {}),
-        "regime_history":      bd.get("regime_history", []),
-        "elite_msg_ids":       bd.get("elite_msg_ids", {}),
-        "elite_sent_rounds":   {k: v for k, v in bd.items() if k.startswith("elite_sent_")},
         "models":              models,
         # ── Migration flags: carry forward so a restore never re-runs
         # destructive one-time migrations on already-clean data.
@@ -15577,27 +15567,6 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
     if "ml_weights" in data and data["ml_weights"]:
         bot_data["ml_weights"] = data["ml_weights"]
         log.info(f"✅ Restored ml_weights from backup")
-
-    if "market_history" in data and data["market_history"]:
-        bot_data["market_history"] = data["market_history"]
-        log.info(f"✅ Restored market_history from backup ({len(data['market_history'])} markets)")
-
-    if "_prev_market_weights" in data and data["_prev_market_weights"]:
-        bot_data["_prev_market_weights"] = data["_prev_market_weights"]
-        log.info(f"✅ Restored _prev_market_weights from backup")
-
-    if "regime_history" in data and data["regime_history"]:
-        bot_data["regime_history"] = data["regime_history"]
-        log.info(f"✅ Restored regime_history ({len(data['regime_history'])} entries) from backup")
-
-    if "elite_msg_ids" in data and data["elite_msg_ids"]:
-        bot_data["elite_msg_ids"] = data["elite_msg_ids"]
-        log.info(f"✅ Restored elite_msg_ids from backup")
-
-    if "elite_sent_rounds" in data and data["elite_sent_rounds"]:
-        for k, v in data["elite_sent_rounds"].items():
-            bot_data[k] = v
-        log.info(f"✅ Restored {len(data['elite_sent_rounds'])} elite dedup keys from backup")
 
     if "risk" in data and data["risk"]:
         bot_data["risk"] = data["risk"]
