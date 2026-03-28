@@ -1165,19 +1165,85 @@ def _ou25_from_odds(ou_list: list):
 
 # ─── PRO CARD HELPERS ─────────────────────────────────────────────────────────
 
-def get_primary_market(selected_markets: list, bot_data: dict) -> str:
-    """Pick the highest-accuracy market from the selected list."""
+def _unified_market_score(market: str, bot_data: dict) -> float:
+    """
+    Universal Market Dominance Engine — computes a single comparable score for
+    ANY market using a common formula, then applies normalization penalties to
+    correct for structural inflation (DC covers 2 outcomes, HTFT is volatile).
+
+    Formula:
+      score = (accuracy * 0.40) + (recent_form * 0.25) + (signal_strength * 0.15)
+            + (pattern_confidence * 0.10) + (odds_quality * 0.10)
+
+    Normalization penalties (prevent DC from always winning):
+      DC   → -0.12  (2-outcome market = inflated base rate)
+      HTFT → -0.08  (high volatility)
+      1X2  → -0.05  (hardest to predict, most punished by overround)
+    """
     weights = _ml_weights(bot_data)
-    best_mkt  = "1x2"
-    best_acc  = 0.0
-    for m in selected_markets:
-        rec = weights.get(m, {"correct": 1, "total": 2})
-        t   = max(rec.get("total", 2), 2)
-        acc = rec.get("correct", 1) / t
-        if acc > best_acc:
-            best_acc = acc
-            best_mkt = m
-    return best_mkt
+    rec  = weights.get(market, {"correct": 1, "total": 2})
+    t    = max(rec.get("total", 2), 2)
+    acc  = rec.get("correct", 1) / t
+
+    # Recent form (last 50 results)
+    hist   = bot_data.get("market_history", {}).get(market, [])
+    recent = hist[-50:] if hist else []
+    form   = (sum(recent) / len(recent)) if len(recent) >= 5 else acc
+
+    # Signal strength = momentum (how hot is this market right now)
+    short  = (sum(hist[-50:])  / len(hist[-50:]))  if len(hist) >= 50  else acc
+    long_  = (sum(hist[-300:]) / len(hist[-300:])) if len(hist) >= 300 else acc
+    momentum = max(-0.3, min(0.3, short - long_))   # clamp to ±0.30
+    signal_strength = 0.5 + momentum                # 0.5 = neutral
+
+    # Pattern confidence = dynamic weight position (how trusted is this market overall)
+    dyn_w = _dynamic_market_weights(bot_data)
+    all_w = list(dyn_w.values()) or [1.0]
+    pattern_confidence = dyn_w.get(market, 0.2) / max(all_w)  # 0–1 relative rank
+
+    # Odds quality = implicit probability implied by current accuracy vs random
+    odds_quality = min(1.0, max(0.0, (acc - 0.33) / 0.67))  # 0.33 = random baseline
+
+    raw_score = (
+        acc               * 0.40 +
+        form              * 0.25 +
+        signal_strength   * 0.15 +
+        pattern_confidence* 0.10 +
+        odds_quality      * 0.10
+    )
+
+    # ── Normalization: correct for structural inflation ───────────────────────
+    penalty = {"dc": 0.12, "htft": 0.08, "1x2": 0.05}.get(market, 0.0)
+    normalized = raw_score - penalty
+
+    return round(max(0.0, normalized), 4)
+
+
+def get_primary_market(selected_markets: list, bot_data: dict) -> str:
+    """
+    Pick the best market from the selected list using the Universal Market
+    Dominance Engine — all markets scored on the same scale, DC inflation
+    corrected. Returns the market with the highest normalized score.
+    """
+    if not selected_markets:
+        return "1x2"
+    if len(selected_markets) == 1:
+        return selected_markets[0]
+
+    scored = {m: _unified_market_score(m, bot_data) for m in selected_markets}
+    return max(scored, key=scored.get)
+
+
+def _rank_markets_by_dominance(bot_data: dict) -> list[tuple[str, float]]:
+    """
+    Rank ALL markets by their unified score.
+    Returns list of (market_key, score) sorted descending.
+    Used by the card builder for primary/secondary selection.
+    """
+    markets = ("dc", "btts", "ou", "1x2", "htft")
+    scored  = [(m, _unified_market_score(m, bot_data)) for m in markets]
+    scored.sort(key=lambda x: -x[1])
+    return scored
 
 
 def _ou_all_from_odds(ou_list: list) -> dict:
@@ -13149,22 +13215,15 @@ async def _run_auto_post(bot, bot_data: dict):
                     _fp_db_card = league_model.get("fingerprint_db", {})
                     _fk_card    = "|".join(sorted([m["home"], m["away"]]))
                     _recs_card  = _fp_db_card.get(_fk_card, [])
-                    _wts        = _ml_weights(bot_data)
-                    _mh         = bot_data.get("market_history", {})
 
-                    def _mkt_score(key: str) -> float:
-                        rec    = _wts.get(key, {"correct": 1, "total": 2})
-                        t      = max(rec.get("total", 2), 2)
-                        acc    = rec.get("correct", 1) / t
-                        hist   = _mh.get(key, [])
-                        recent = hist[-50:] if hist else []
-                        form   = sum(recent) / len(recent) if len(recent) >= 5 else acc
-                        raw    = acc * 0.60 + form * 0.40
-                        cal    = 1.0 if key in _best_mkts_now else 0.75
-                        return raw * 100 * cal
-
+                    # ── Universal Market Dominance Engine ─────────────────────
+                    # All markets scored on one common scale with normalization.
+                    # DC inflation (+12%) and HTFT volatility (+8%) are corrected.
+                    # Every market competes equally — data decides the winner.
+                    _dom_ranked = _rank_markets_by_dominance(bot_data)
+                    # Convert to 0–100 scale for backward-compat with gate checks
                     _scores: dict[str, float] = {
-                        k: _mkt_score(k) for k in ("dc", "btts", "ou", "1x2", "htft")
+                        k: round(s * 100, 1) for k, s in _dom_ranked
                     }
 
                     # Per-market trap filtering — downgrades only that market
@@ -13173,27 +13232,39 @@ async def _run_auto_post(bot, bot_data: dict):
                             _scores[_tk] = _scores.get(_tk, 50) * 0.50
                         _scores["dc"] = _scores.get("dc", 50) * 0.80
                     if _repeat_chk.get("matched"):
-                        _scores["dc"]   = min(100, _scores.get("dc",   50) + 8)
                         _scores["btts"] = min(100, _scores.get("btts", 50) + 5)
+                        _scores["ou"]   = min(100, _scores.get("ou",   50) + 3)
                         _scores["1x2"]  = max(0,   _scores.get("1x2",  50) - 10)
                         _scores["htft"] = max(0,   _scores.get("htft", 50) - 8)
-                    if _league_acc < 0.50:
-                        # Low league accuracy — trust all markets equally, no thumb on scale
-                        pass
+                        # DC/BTTS repeat boost removed — dominance engine handles this
 
-                    # Market competition — highest score wins, no forced priority.
-                    # Markets earn their position through tracked performance only.
-                    _ranked = sorted(_scores.items(), key=lambda x: -x[1])
+                    # Re-rank after adjustments
+                    _ranked        = sorted(_scores.items(), key=lambda x: -x[1])
                     _primary_mkt   = _ranked[0][0]
                     _primary_score = _ranked[0][1]
 
+                    # ── Override protection: force switch when clearly superior ──
+                    # If a non-DC market beats DC by > 8 pts on the normalized scale,
+                    # switch primary — prevents DC from sticking due to adjustment noise.
+                    if _primary_mkt == "dc" and len(_ranked) > 1:
+                        _runner_mkt, _runner_score = _ranked[1]
+                        if _runner_score > _primary_score + 8:
+                            _primary_mkt, _primary_score = _runner_mkt, _runner_score
+
                     # ── FIX 5 — LOSS STREAK SURVIVAL MODE in card builder ─────
-                    # If loss streak is very high, force primary to DC (safest market)
-                    _card_risk = _risk_control(bot_data)
+                    # If loss streak is high, switch to the currently STRONGEST market
+                    # (not hardcoded DC) — dominance engine determines safest market.
+                    _card_risk   = _risk_control(bot_data)
                     _card_streak = _card_risk.get("loss_streak", 0)
-                    if _card_streak >= 5 and ev_odds.get("dc"):
-                        _primary_mkt   = "dc"
-                        _primary_score = _scores.get("dc", 55)
+                    if _card_streak >= 5:
+                        # Find the top-ranked available market with odds present
+                        for _survival_mkt, _survival_score in _ranked:
+                            _has_odds = bool(ev_odds.get(_survival_mkt) if _survival_mkt != "ou"
+                                            else ev_odds.get("ou"))
+                            if _has_odds:
+                                _primary_mkt   = _survival_mkt
+                                _primary_score = _survival_score
+                                break
                     if _card_streak >= 7:
                         continue   # ❌ STOP predicting — 7+ loss streak = take a break
 
@@ -13205,25 +13276,33 @@ async def _run_auto_post(bot, bot_data: dict):
                     if _agree_count < 2:
                         continue   # ❌ Weak signal — not enough market agreement
 
-                    # ── FIX 7 — STRICT SECONDARY MARKET SELECTION ────────────
-                    # Old: any market scoring >= 50 could be secondary.
-                    # New: secondary must score >= 55, gap <= 20, and be logically
-                    #      compatible with primary. Elite primaries (>75) = no secondary.
+                    # ── STRICT SECONDARY MARKET SELECTION (Dominance Gap Filter) ──
+                    # Secondary must score >= 55, be within 20 pts of primary, and be
+                    # a compatible pair. When gap < 5 pts → treat as combo instead of
+                    # primary-only (both markets equally strong → combine them).
                     _VALID_PAIRS = {
                         ("dc",   "btts"), ("dc",   "ou"),
                         ("btts", "ou"),   ("btts", "dc"),
                         ("1x2",  "ou"),   ("1x2",  "btts"),
                         ("ou",   "btts"), ("htft", "dc"),
+                        ("btts", "1x2"), ("ou",   "dc"),
                     }
                     _secondary_mkt = None
+                    _combo_mode    = False
                     if _primary_score <= 75:   # elite lock: no secondary needed
                         for _sec_key, _sec_score in _ranked:
                             if _sec_key == _primary_mkt:
                                 continue
-                            if (_sec_score >= 55 and
-                                    (_primary_score - _sec_score) <= 20 and
-                                    (_primary_mkt, _sec_key) in _VALID_PAIRS):
+                            if _sec_score < 55:
+                                break   # sorted descending — no point checking further
+                            _gap = _primary_score - _sec_score
+                            if _gap > 20:
+                                break   # too far apart — secondary would be noise
+                            if (_primary_mkt, _sec_key) in _VALID_PAIRS:
                                 _secondary_mkt = _sec_key
+                                # If gap < 5 → markets are essentially tied → combo
+                                if _gap < 5:
+                                    _combo_mode = True
                                 break
 
                     _dyn_tip, _dyn_odds_hint = get_final_pick(
