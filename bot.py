@@ -10022,6 +10022,13 @@ async def cb_menu(u: Update, c: ContextTypes.DEFAULT_TYPE):
                         f"🧠 Merged {chunks_loaded}/{n_chunks} brain chunk(s) into restore.",
                         parse_mode="Markdown"
                     )
+                elif n_chunks > 0:
+                    await query.message.reply_text(
+                        "⚠️ *Brain chunks stored in memory expired.*\n\n"
+                        "The fingerprint DB, match history, and AI memory could not be loaded.\n"
+                        "Send the `vsbot_brain_*.txt` file(s) directly here to restore them.",
+                        parse_mode="Markdown"
+                    )
                 await _apply_backup_to_bot(data, query.message, c.bot_data)
             else:
                 await wait.edit_text("⚠️ Stored file expired. Send or forward the backup .txt file here and I will load it automatically.")
@@ -12891,10 +12898,49 @@ async def _do_brainstat(message, c):
 
     league_scores, league_lines = [], []
 
+    # ── Pending predictions summary ───────────────────────────────────────────
+    # Show this prominently when rounds_learned is 0 so user knows what's happening
+    _pending_bd = c.bot_data.get("pending_predictions", {})
+    _total_pending_rounds = sum(len(v) for v in _pending_bd.values())
+    _total_pending_preds  = sum(
+        len(preds) for rounds in _pending_bd.values()
+        for preds in rounds.values()
+    )
+    _pending_note = ""
+    if _total_pending_rounds > 0:
+        _pending_note = (
+            f"⏳ *Pending learning:* {_total_pending_rounds} rounds / "
+            f"{_total_pending_preds} predictions queued\n"
+            f"   _(learning job runs every 2 min — results arrive in ~6 min after each round)_\n"
+        )
+
     for lid, linfo in LEAGUES.items():
         model = c.bot_data.get(f"model_{lid}")
-        if not model or model.get("rounds_learned", 0) == 0:
-            league_lines.append(f"┌ {linfo['flag']} *{linfo['name']}*\n└ ⚫ No data yet\n")
+        if not model:
+            league_lines.append(f"┌ {linfo['flag']} *{linfo['name']}*\n└ ⚫ No model data\n")
+            continue
+
+        if model.get("rounds_learned", 0) == 0:
+            # Still show trajectory stats and pending counts even with 0 rounds
+            _ts_b = model.get("trajectory_stats", {})
+            def _ts_line_b(ct, lbl):
+                r = _ts_b.get(ct, {}); t = r.get("total", 0); c2 = r.get("correct", 0)
+                if t == 0: return f"   {lbl}: no data yet"
+                dot = "🟢" if t >= 5 and c2/t >= 0.68 else "🟡" if t >= 5 and c2/t >= 0.52 else "🔴" if t >= 5 else "🔵"
+                return f"   {dot} {lbl}: {c2}/{t}" + (f" = {round(c2/t*100)}%" if t >= 5 else " (building)")
+            _pend_lid = sum(len(v) for v in _pending_bd.get(str(lid), {}).values())
+            _pend_r   = len(_pending_bd.get(str(lid), {}))
+            _fp_n     = len(model.get("fingerprint_db", {}))
+            _ml_n     = len(model.get("match_log", []))
+            league_lines.append(
+                f"┌ {linfo['flag']} *{linfo['name']}*  🔵 building\n"
+                + (f"│ ⏳ {_pend_r} rounds / {_pend_lid} preds pending\n" if _pend_lid else "│ ⏳ No pending predictions\n")
+                + (f"│ 🗄 FP-DB: {_fp_n} fixtures · ML: {_ml_n} entries\n" if _fp_n or _ml_n else "│ 🗄 No fingerprint data yet\n")
+                + f"│ 🔬 Trajectory:\n"
+                + f"{_ts_line_b('strong_lost', 'StrongRecovery')}\n"
+                + f"{_ts_line_b('weak_won',    'WeakRegression')}\n"
+                + f"└─────────────────────────────\n"
+            )
             continue
 
         cum   = model.get("cumulative", {})
@@ -13038,7 +13084,8 @@ async def _do_brainstat(message, c):
         f"{'━'*26}\n"
         f"{icon} *Overall: {total_correct}/{total_preds} correct ({overall_pct:.1%})*\n"
         f"📚 {active}/{len(LEAGUES)} leagues active\n"
-        f"{'━'*26}\n\n"
+        + (f"\n{_pending_note}" if _pending_note else "")
+        + f"{'━'*26}\n\n"
         f"{_strat_summary}"
         f"{'━'*26}\n\n"
         f"{_or_summary}"
@@ -13527,52 +13574,84 @@ async def _apply_backup_to_bot(data: dict, message, bot_data: dict):
             rds  = m.get("rounds_learned", 0)
             acc  = m.get("outcome_acc", 0)
             fp_fixtures = len(m.get("fingerprint_db", {}))
-            fp_records  = sum(len(v) for v in m.get("fingerprint_db", {}).values())
-
-            # AI brain stats
-            ai      = m.get("ai_brain", {})
-            fm      = ai.get("fixture_mem", {})
-            ai_fxs  = len(fm)
-            ai_mat  = sum(1 for v in fm.values() if len(v) >= 6)
-            ai_vet  = sum(1 for v in fm.values() if len(v) >= 10)
-            intel   = ai.get("intelligence", {})
-            ai_eval = intel.get("rounds_evaluated", 0)
-            ai_lessons = sum(
-                1 for v in fm.values()
-                if len(v) >= 6 and
-                   sum(1 for r in v[-10:] if not r.get("correct",True)) / max(len(v[-10:]),1) >= 0.40
+            fp_records  = sum(
+                len(v) for v in m.get("fingerprint_db", {}).values()
+                if isinstance(v, list)
             )
-            w       = m.get("weights", {})
-            w_str   = (f"O{w.get('odds',0):.0%} FP{w.get('fingerprint',0):.0%} "
-                       f"T{w.get('tier',0):.0%} F{w.get('form',0):.0%}") if w else ""
-            sa      = ai.get("signal_acc", {})
+
+            # AI brain stats — safe access
+            ai      = m.get("ai_brain", {}) if isinstance(m.get("ai_brain"), dict) else {}
+            fm      = ai.get("fixture_mem", {}) if isinstance(ai.get("fixture_mem"), dict) else {}
+            ai_fxs  = len(fm)
+            ai_mat  = sum(1 for v in fm.values() if isinstance(v, list) and len(v) >= 6)
+            ai_vet  = sum(1 for v in fm.values() if isinstance(v, list) and len(v) >= 10)
+            intel   = ai.get("intelligence", {}) if isinstance(ai.get("intelligence"), dict) else {}
+            ai_eval = intel.get("rounds_evaluated", 0)
+            ai_lessons = 0
+            for v in fm.values():
+                if not isinstance(v, list) or len(v) < 6:
+                    continue
+                recent = v[-10:]
+                if recent and (sum(1 for r in recent if isinstance(r, dict) and not r.get("correct", True)) / len(recent)) >= 0.40:
+                    ai_lessons += 1
+
+            w     = m.get("weights", {}) if isinstance(m.get("weights"), dict) else {}
+            w_str = (f"O{w.get('odds',0):.0%} FP{w.get('fingerprint',0):.0%} "
+                     f"T{w.get('tier',0):.0%} F{w.get('form',0):.0%}") if w else "defaults"
+            sa    = ai.get("signal_acc", {}) if isinstance(ai.get("signal_acc"), dict) else {}
+
+            # Trajectory stats
+            _ts   = m.get("trajectory_stats", {}) if isinstance(m.get("trajectory_stats"), dict) else {}
+            def _tstr(ct):
+                r = _ts.get(ct, {}); t = r.get("total", 0); c = r.get("correct", 0)
+                return f"{c}/{t}={round(c/t*100)}%" if t >= 5 else f"0/{t}"
+
             def _sacc_str(sig):
-                r = sa.get(sig, {}); t = r.get("total",0); c = r.get("correct",0)
+                r = sa.get(sig, {})
+                if not isinstance(r, dict): return "—"
+                t = r.get("total", 0); c = r.get("correct", 0)
                 return f"{c/t:.0%}" if t >= 10 else "—"
 
-            if rds > 0:
-                ln = (
+            # Cumulative stats for display
+            _cum  = m.get("cumulative", {}) if isinstance(m.get("cumulative"), dict) else {}
+            _mt   = _cum.get("matches_total", 0)
+            _ml_n = len(m.get("match_log", []))
+
+            if rds > 0 or fp_fixtures > 0 or _mt > 0 or _ml_n > 0:
+                _body = (
                     f"  {flag} *{name}*\n"
-                    f"    📊 {rds} rounds · 1X2 {acc:.0%} · "
-                    f"FP-DB {fp_fixtures}fx/{fp_records}rec\n"
-                    f"    🤖 AI mem {ai_fxs}fx ({ai_mat} mature, {ai_vet} veteran) "
-                    f"· {ai_lessons} active lessons\n"
-                    f"    ⚡ Sig — Odds:{_sacc_str('odds')} "
-                    f"FP:{_sacc_str('fingerprint')} Tier:{_sacc_str('tier')} Form:{_sacc_str('form')}\n"
-                    f"    ⚖️ Weights: {w_str}"
+                    f"    📊 {rds}r · 1X2 {acc:.0%} · {_mt} games · ML:{_ml_n}\n"
+                    f"    🗄 FP-DB {fp_fixtures}fx/{fp_records}rec\n"
+                    f"    🤖 AI mem {ai_fxs}fx ({ai_mat} mature, {ai_vet} veteran)"
+                    + (f" · {ai_lessons} lessons" if ai_lessons else "")
+                    + f"\n"
+                    f"    ⚡ Odds:{_sacc_str('odds')} FP:{_sacc_str('fingerprint')} "
+                    f"Tier:{_sacc_str('tier')} Form:{_sacc_str('form')}\n"
+                    f"    🔬 Traj SR:{_tstr('strong_lost')} WR:{_tstr('weak_won')}\n"
+                    f"    ⚖️ {w_str}"
                 )
                 if ai_eval:
-                    ln += f" · {ai_eval} AI evals"
-                league_lines.append(ln)
+                    _body += f" · {ai_eval} AI evals"
+                league_lines.append(_body)
             else:
                 league_lines.append(
-                    f"  {flag} *{name}*: building… ({fp_fixtures} fixtures stored)"
+                    f"  {flag} *{name}*: ⚫ empty (no data restored)"
+                    + (" — send brain file too" if not fp_fixtures else "")
                 )
-        except Exception:
-            pass
+        except Exception as _ex:
+            log.warning(f"_apply_backup_to_bot display error lid={lid_str}: {_ex}")
+            try:
+                _flag = LEAGUES.get(int(lid_str), {}).get("flag", "🏳")
+                _name = LEAGUES.get(int(lid_str), {}).get("name", lid_str)
+                league_lines.append(f"  {_flag} *{_name}*: ⚠️ display error — data may still be restored")
+            except Exception:
+                league_lines.append(f"  ⚠️ League {lid_str}: display error — check logs")
 
     if not league_lines:
-        league_lines.append("  _(no league data in this backup)_")
+        league_lines.append(
+            "  _(no league data in this backup)_\n"
+            "  _💡 Send the `vsbot_brain_*.txt` file alongside the core backup to restore brain data._"
+        )
 
     text = (
         f"✅ *Brain Restored!*\n"
@@ -13777,11 +13856,41 @@ async def handle_admin_document(u: Update, c: ContextTypes.DEFAULT_TYPE):
         log.info(f"✅ {chunks_merged} brain chunk(s) merged into core backup during document restore")
 
     await wait.delete()
+
+    # ── Diagnose what we're about to restore ──────────────────────────────────
+    _models_count   = len(data.get("models", {}))
+    _has_brain_data = any(
+        bool(m.get("fingerprint_db") or m.get("match_log") or m.get("ai_brain"))
+        for m in data.get("models", {}).values()
+        if isinstance(m, dict)
+    )
+
     if brain_merged:
         await u.message.reply_text(
-            "✅ *Core backup + Brain file merged!* Restoring full brain…",
+            f"✅ *Core backup + {chunks_merged} brain chunk(s) merged!* Restoring full brain…",
             parse_mode="Markdown"
         )
+    elif _models_count > 0 and not _has_brain_data:
+        # Core file received but NO brain data — warn clearly
+        await u.message.reply_text(
+            "⚠️ *Brain data not found!*\n\n"
+            "This is the *core backup only* (users, stats, model weights).\n"
+            "The fingerprint DB, match history, and AI memory are in the "
+            "separate `vsbot_brain_*.txt` file(s).\n\n"
+            "📌 *Next step:* Send the `vsbot_brain_*.txt` file(s) here and "
+            "the bot will merge them automatically.\n\n"
+            "_Restoring core data now…_",
+            parse_mode="Markdown"
+        )
+    elif _models_count == 0:
+        await u.message.reply_text(
+            "⚠️ *No league models in backup.*\n\n"
+            "The backup was created from a fresh/wiped bot. "
+            "Send both the core `vsbot_backup_*.txt` AND all `vsbot_brain_*.txt` "
+            "chunk files to restore learned data.",
+            parse_mode="Markdown"
+        )
+
     await _apply_backup_to_bot(data, u.message, c.bot_data)
 
 
@@ -13851,8 +13960,31 @@ def _load_baked_data(bot_data: dict, baked: dict):
         for lid_str, m in baked["models"].items():
             if not isinstance(m, dict):
                 continue
-            # Allow restore even if rounds_learned=0 as long as match_log has data
-            if m.get("rounds_learned", 0) == 0 and not m.get("match_log"):
+            # ── Skip only if the model is genuinely empty — has NO data at all ──
+            # Old condition was: rounds_learned==0 AND no match_log
+            # That was too aggressive — it skipped models after migration v4 wiped
+            # fp_db/match_log but left weights, cumulative, trajectory_stats, etc.
+            # New condition: skip only if truly nothing useful exists.
+            _cum = m.get("cumulative", {})
+            _has_any_data = (
+                m.get("rounds_learned", 0) > 0
+                or bool(m.get("match_log"))
+                or bool(m.get("fingerprint_db"))
+                or _cum.get("matches_total", 0) > 0
+                or _cum.get("outcome_total", 0) > 0
+                or m.get("signal_acc", {}).get("odds", {}).get("total", 0) > 0
+                or m.get("trajectory_stats", {}).get("strong_lost", {}).get("total", 0) > 0
+                or m.get("trajectory_stats", {}).get("weak_won",    {}).get("total", 0) > 0
+                or bool(m.get("pattern_memory"))
+                or bool(m.get("ai_brain", {}).get("fixture_mem"))
+            )
+            if not _has_any_data:
+                try:
+                    lid   = int(lid_str)
+                    lname = LEAGUES.get(lid, {}).get("name", lid_str)
+                    log.info(f"💾 Skipping truly empty model {lname} (no data at all)")
+                except Exception:
+                    pass
                 continue
             key      = f"model_{lid_str}"
             existing = bot_data.get(key)
