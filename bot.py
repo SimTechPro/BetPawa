@@ -11277,6 +11277,7 @@ async def _run_auto_post(bot, bot_data: dict):
                 agreed = total = 0
                 body           = ""
                 match_cards    = []
+                display_preds  = []
                 round_preds    = []
 
                 # Get learned model for this league
@@ -11766,6 +11767,13 @@ async def _run_auto_post(bot, bot_data: dict):
                     )
                     body += card + "─────────────────\n"
                     match_cards.append(card)
+                    display_preds.append({
+                        "home":     m["home"],
+                        "away":     m["away"],
+                        "tip":      our_t,
+                        "dyn_tip":  our_t,   # 1X2 only — tip is always HOME/DRAW/AWAY
+                        "primary_mkt": "1x2",
+                    })
 
                 if not body:
                     _had_events = True  # league had events but none passed filters
@@ -11790,9 +11798,10 @@ async def _run_auto_post(bot, bot_data: dict):
                 sections.append({
                     "lid":        lid,
                     "round_id":   str(round_id),
-                    "match_cards": match_cards,   # list of per-match card strings
+                    "match_cards": match_cards,
                     "league_header": _league_header,
-                    "text": (                     # kept for change-detection
+                    "round_preds_ref": display_preds,   # 1:1 with match_cards for result editing
+                    "text": (
                         _league_header
                         + body + acc_line
                     ),
@@ -11922,15 +11931,36 @@ async def _run_auto_post(bot, bot_data: dict):
     # ── NEW ROUND — send one message per match card ───────────────────────────
     if round_key != prev_key:
         any_sent = False
-        # Track which league+round combos were already sent this session
         _sent_map = bot_data.setdefault("auto_sent_per_league", {})
+
+        # Pre-save sent_cards_ metadata before sending so result edits work
+        # even if a send fails for some chats.
+        for sec in sections:
+            _lid_str_pre = str(sec["lid"])
+            _rid_str_pre = str(sec["round_id"])
+            if _sent_map.get(_lid_str_pre) == _rid_str_pre:
+                continue
+            _hdr_pre    = sec["league_header"]
+            _cards_pre  = sec.get("match_cards", [])
+            _preds_pre  = sec.get("round_preds_ref", [])
+            bot_data[f"sent_cards_{_lid_str_pre}_{_rid_str_pre}"] = [
+                {
+                    "home":        pred.get("home", ""),
+                    "away":        pred.get("away", ""),
+                    "tip":         pred.get("tip", ""),
+                    "dyn_tip":     pred.get("dyn_tip", pred.get("tip", "")),
+                    "primary_mkt": pred.get("primary_mkt", "1x2"),
+                    "card_text":   _hdr_pre + _cards_pre[i] if i < len(_cards_pre) else "",
+                }
+                for i, pred in enumerate(_preds_pre)
+            ]
+
         for chat in send_targets:
             chat_msgs = msg_ids.setdefault(str(chat), {})
             try:
                 for sec in sections:
                     _lid_str  = str(sec["lid"])
                     _rid_str  = str(sec["round_id"])
-                    # Skip if this exact league+round was already sent
                     if _sent_map.get(_lid_str) == _rid_str:
                         continue
                     _hdr   = sec["league_header"]
@@ -11944,40 +11974,8 @@ async def _run_auto_post(bot, bot_data: dict):
                         _mid_list.append(sent.message_id)
                         await asyncio.sleep(0.3)
                     chat_msgs[f"{sec['lid']}_cards"] = _mid_list
-                    _sent_map[_lid_str] = _rid_str  # mark as sent
-
-                    # Store card info + message IDs for result update later
-                    # When previous round finishes, we edit these messages with ✅/❌
-                    _card_infos = []
-                    for idx, card in enumerate(_mid_list):
-                        # Extract home/away/tip from round_preds if available
-                        # We stored round_preds in pending_predictions
-                        _card_infos.append({
-                            "msg_id":    card,
-                            "card_idx":  idx,
-                        })
-                    # Store round_preds per section for result lookup
-                    _sec_preds = sec.get("round_preds_ref", [])
-                    bot_data[f"sent_cards_{_lid_str}_{_rid_str}"] = [
-                        {
-                            "home":      pred.get("home", ""),
-                            "away":      pred.get("away", ""),
-                            "tip":       pred.get("tip", ""),
-                            "card_text": _hdr + _cards[i] if i < len(_cards) else "",
-                        }
-                        for i, pred in enumerate(
-                            (bot_data.get("pending_predictions", {})
-                             .get(_lid_str, {})
-                             .get(_rid_str, {})
-                             .get("preds", []))
-                        )
-                    ]
-                    # Store message IDs per chat for editing
-                    for chat2 in send_targets:
-                        _c2msgs = msg_ids.setdefault(str(chat2), {})
-                        # FIX: use chat2's own stored IDs — str(chat) was wrong for channels/other users
-                        _c2msgs[f"{_lid_str}_prev_cards_{_rid_str}"] = \
-                            msg_ids.get(str(chat2), {}).get(f"{_lid_str}_cards", [])
+                    chat_msgs[f"{_lid_str}_prev_cards_{_rid_str}"] = _mid_list
+                    _sent_map[_lid_str] = _rid_str
 
                 any_sent = True
                 log.info(f"📨 New picks posted → {chat} ({sum(len(s.get('match_cards',[])) for s in sections)} matches, round_key={round_key})")
