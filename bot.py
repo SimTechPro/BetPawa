@@ -11535,7 +11535,6 @@ async def _run_auto_post(bot, bot_data: dict):
                     _mkts = []
                     for _k, _lbl, _ico in [
                         ("ou15_result", "Over 1.5",  "📊"),
-                        ("ou25_result", "Over 2.5",  "📈"),
                         ("ou35_result", "Over 3.5",  "📊"),
                         ("btts_result", "BTTS Yes",  "⚽"),
                     ]:
@@ -11714,6 +11713,43 @@ async def _run_auto_post(bot, bot_data: dict):
                         f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
 
+                    # ── Trajectory + Confirmation block ───────────────────────
+                    _traj_conf_line = ""
+
+                    # Confirmation signals — show which signals agree with tip
+                    _chks = p.get("confirm_checks", [])
+                    _crate = p.get("confirm_rate", 0.0)
+                    if _chks:
+                        _sig_icons = {"odds": "📊", "fp": "🔮", "mom": "📈", "history": "📂"}
+                        _yes = [_sig_icons.get(s, s) for s, ok in _chks if ok]
+                        _no  = [_sig_icons.get(s, s) for s, ok in _chks if not ok]
+                        _cbar = "█" * round(_crate * 5) + "░" * (5 - round(_crate * 5))
+                        _clbl = ("🟢 All agree" if _crate == 1.0
+                                 else "🟡 Majority" if _crate >= 0.5
+                                 else "🔴 Split")
+                        _yes_str = " ".join(_yes) if _yes else "—"
+                        _no_str  = " ".join(_no)  if _no  else "—"
+                        _traj_conf_line += (
+                            f"┆ 🔍 *Confirm:* {_cbar} {_crate:.0%}  {_clbl}\n"
+                            f"┆    ✅ {_yes_str}   ❌ {_no_str}\n"
+                        )
+
+                    # Trajectory cycle type — only show when present and meaningful
+                    _tct = round_preds[-1].get("trajectory_cycle_type") if round_preds else None
+                    if _tct:
+                        _tct_icons = {"strong_lost": "🔄", "weak_won": "⚡"}
+                        _tct_ico   = _tct_icons.get(_tct, "🔬")
+                        _ts_data   = league_model.get("trajectory_stats", {})
+                        _tr        = _ts_data.get(_tct, {})
+                        _tt        = _tr.get("total", 0)
+                        _tc        = _tr.get("correct", 0)
+                        if _tt >= 5:
+                            _ta   = _tc / _tt
+                            _tdot = "🟢" if _ta >= 0.68 else "🟡" if _ta >= 0.52 else "🔴"
+                            _traj_conf_line += f"┆ {_tct_ico} Trajectory: {_tdot} {_ta:.0%}, {_tt} samples\n"
+                        else:
+                            _traj_conf_line += f"┆ {_tct_ico} Trajectory: building\n"
+
                     # ── Final card ────────────────────────────────────────────
                     card = (
                         f"*{m['home']}  v  {m['away']}*\n"
@@ -11724,6 +11760,7 @@ async def _run_auto_post(bot, bot_data: dict):
                         + _mom_line
                         + _strategy_line
                         + _repeat_line
+                        + _traj_conf_line
                         + _gate_line
                         + f"{result_str}\n"
                     )
