@@ -11735,21 +11735,32 @@ async def _run_auto_post(bot, bot_data: dict):
                             f"┆    ✅ {_yes_str}   ❌ {_no_str}\n"
                         )
 
-                    # Trajectory cycle type — only show when present and meaningful
+                    # Trajectory — always show best available trajectory stat
                     _tct = round_preds[-1].get("trajectory_cycle_type") if round_preds else None
+                    _ts_data = league_model.get("trajectory_stats", {})
+                    # Prefer cycle-specific stat; fall back to best stat across all cycle types
+                    _traj_shown = False
                     if _tct:
                         _tct_icons = {"strong_lost": "🔄", "weak_won": "⚡"}
-                        _tct_ico   = _tct_icons.get(_tct, "🔬")
-                        _ts_data   = league_model.get("trajectory_stats", {})
+                        _tct_ico   = _tct_icons.get(_tct, "🔄")
                         _tr        = _ts_data.get(_tct, {})
                         _tt        = _tr.get("total", 0)
                         _tc        = _tr.get("correct", 0)
                         if _tt >= 5:
                             _ta   = _tc / _tt
                             _tdot = "🟢" if _ta >= 0.68 else "🟡" if _ta >= 0.52 else "🔴"
-                            _traj_conf_line += f"┆ {_tct_ico} Trajectory: {_tdot} {_ta:.0%}, {_tt} samples\n"
-                        else:
-                            _traj_conf_line += f"┆ {_tct_ico} Trajectory: building\n"
+                            _traj_conf_line += f"┆ 🔄 Trajectory: {_tdot} {_ta:.0%}, {_tt} samples\n"
+                            _traj_shown = True
+                        # else: hide — not enough data yet, fall through to combined check
+                    if not _traj_shown:
+                        # No cycle type — show combined trajectory from all available stats
+                        _all_tt = sum(_ts_data.get(k, {}).get("total", 0) for k in ("strong_lost", "weak_won"))
+                        _all_tc = sum(_ts_data.get(k, {}).get("correct", 0) for k in ("strong_lost", "weak_won"))
+                        if _all_tt >= 5:
+                            _ta   = _all_tc / _all_tt
+                            _tdot = "🟢" if _ta >= 0.68 else "🟡" if _ta >= 0.52 else "🔴"
+                            _traj_conf_line += f"┆ 🔄 Trajectory: {_tdot} {_ta:.0%}, {_all_tt} samples\n"
+                        # else: hide — not enough data yet
 
                     # ── Final card ────────────────────────────────────────────
                     card = (
