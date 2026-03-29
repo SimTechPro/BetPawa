@@ -6501,6 +6501,8 @@ def _recovery_pattern_analysis(
             curr = mem_records[i]
             # Determine outcome for strong_team in each record
             def _outcome_for_team(rec, team):
+                if not isinstance(rec, dict):
+                    return None   # guard: persistence may restore tuples instead of dicts
                 tl = team.lower()
                 h = rec.get("home","").lower(); a = rec.get("away","").lower()
                 if tl in h:
@@ -12474,11 +12476,17 @@ async def _data_collector_job(context):
                                 _get_model(bot_data, lid), preds, results,
                                 round_id_int=int(rid) if rid.isdigit() else 0
                             )
-                            _ai_postmatch_analysis(
-                                _get_model(bot_data, lid), preds, results,
-                                standings=bot_data.get(f"standings_{lid}"),
-                                round_id=int(rid) if rid.isdigit() else 0,
-                            )
+                            try:
+                                _ai_postmatch_analysis(
+                                    _get_model(bot_data, lid), preds, results,
+                                    standings=bot_data.get(f"standings_{lid}"),
+                                    round_id=int(rid) if rid.isdigit() else 0,
+                                )
+                            except Exception as _apa_err:
+                                log.warning(
+                                    f"COLLECTOR _ai_postmatch_analysis [{name}] rnd={rid}: "
+                                    f"{_apa_err}\n{traceback.format_exc()}"
+                                )
                             # ── Trajectory stats backfill ──────────────────────
                             # Update trajectory_stats for each result where a
                             # trajectory cycle type was tagged on the prediction.
