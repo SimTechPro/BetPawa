@@ -2616,6 +2616,158 @@ def _strategy_get_last_game(team: str, model: dict) -> dict | None:
     return g
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── TRAJECTORY CONFIRMATION ENGINE ────────────────────────────────────────────
+# Adds a confirmation layer on top of strong_lost / weak_won cycle triggers.
+# Does NOT replace existing cycle logic — it validates it before committing.
+# Phase 2: self-learns from trajectory accuracy tracked in model["trajectory_stats"].
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_team_matches_with_pos(team: str, model: dict, standings: dict) -> list[dict]:
+    """
+    Build last 6 match records for a team in the format required by
+    trajectory_confirmation():  {team_pos, opp_pos, goals_for, goals_against}
+    Uses current standings for position lookup (best available approximation).
+    """
+    games = _team_last6(team, model, n=6)
+    if not games:
+        return []
+    team_row = _find_in_standings(team, standings) if standings else None
+    result = []
+    for g in games:
+        opp      = g.get("opponent", "")
+        opp_row  = _find_in_standings(opp, standings) if (standings and opp) else None
+        result.append({
+            "team_pos":      (team_row.get("pos", 99) if team_row  else 99),
+            "opp_pos":       (opp_row.get("pos",  99) if opp_row   else 99),
+            "goals_for":     int(g.get("gf", 0)),
+            "goals_against": int(g.get("ga", 0)),
+        })
+    return result
+
+
+def trajectory_confirmation(team_matches: list, current_opp_pos: int,
+                             cycle_type: str, model: dict | None = None) -> dict:
+    """
+    Validates a strong_lost or weak_won cycle signal against the team's
+    recent performance trajectory BEFORE committing to a prediction.
+
+    cycle_type: "strong_lost"  — strong team just lost, we expect recovery
+                "weak_won"     — weak team just won, we expect regression
+
+    Phase 2 (self-learning): if model has trajectory_stats with ≥10 samples
+    for this cycle_type, the confidence boost is nudged up/down based on how
+    accurate trajectory has been historically.
+
+    Returns:
+        confirm (bool)          — False = HARD REJECT this pick
+        confidence_boost (float)— add to confidence score (can be negative)
+        reason (str)            — human-readable explanation
+    """
+    if len(team_matches) < 4:
+        return {"confirm": True, "confidence_boost": 0, "reason": "not_enough_data",
+                "used": False}
+
+    scores = []
+    similar_matches = []
+
+    for match in team_matches[-6:]:
+        team_pos = match.get("team_pos", 99)
+        opp_pos  = match.get("opp_pos",  99)
+        gf       = match.get("goals_for", 0)
+        ga       = match.get("goals_against", 0)
+
+        position_diff = team_pos - opp_pos
+
+        if gf > ga:    result_m = "win"
+        elif gf == ga: result_m = "draw"
+        else:          result_m = "loss"
+
+        if position_diff > 0:   # team is ranked higher (stronger)
+            if result_m == "win":   score = 1
+            elif result_m == "draw": score = 0
+            else:                   score = -2
+        else:                   # team is ranked lower (weaker)
+            if result_m == "win":   score = 2
+            elif result_m == "draw": score = 1
+            else:                   score = -1
+
+        scores.append(score)
+
+        if abs(opp_pos - current_opp_pos) <= 2:
+            similar_matches.append(score)
+
+    # ── Trend detection ───────────────────────────────────────────────────────
+    trend = sum(scores[i] - scores[i - 1] for i in range(1, len(scores)))
+    if   trend < -1: trend_type = "decreasing"
+    elif trend >  1: trend_type = "increasing"
+    else:            trend_type = "stable"
+
+    # ── Consistency ───────────────────────────────────────────────────────────
+    positive    = sum(1 for s in scores if s >= 0)
+    consistency = positive / len(scores)
+
+    # ── Similar opponent validation ───────────────────────────────────────────
+    similar_score = (sum(similar_matches) / len(similar_matches)
+                     if len(similar_matches) >= 2 else 0)
+
+    # ── Decision ──────────────────────────────────────────────────────────────
+    confirm = True
+    boost   = 0
+    reason  = "neutral"
+
+    if cycle_type == "strong_lost":
+        if trend_type == "decreasing":
+            confirm = False
+            boost   = -20
+            reason  = "weakening_detected"
+        elif trend_type == "stable" and consistency >= 0.7:
+            confirm = True
+            boost   = +15
+            reason  = "stable_rebound"
+        else:
+            confirm = True
+            boost   = -5
+            reason  = "uncertain"
+
+    elif cycle_type == "weak_won":
+        if trend_type == "increasing":
+            confirm = False
+            boost   = -15
+            reason  = "real_improvement"
+        else:
+            confirm = True
+            boost   = +10
+            reason  = "likely_regression"
+
+    # Similar match reinforcement
+    if similar_score > 0:
+        boost += 10
+
+    # ── Phase 2: self-learning adjustment from trajectory_stats ───────────────
+    if model is not None and confirm:
+        _ts = model.get("trajectory_stats", {})
+        _rec = _ts.get(cycle_type, {})
+        _t   = _rec.get("total", 0)
+        _c   = _rec.get("correct", 0)
+        if _t >= 10:
+            _accuracy = _c / _t
+            if _accuracy < 0.55:
+                boost -= 10   # trajectory has been wrong too often → weaken it
+                reason += "+hist_penalty"
+            elif _accuracy > 0.70:
+                boost += 10   # trajectory has been reliably right → strengthen it
+                reason += "+hist_bonus"
+
+    return {
+        "confirm":          confirm,
+        "confidence_boost": boost,
+        "reason":           reason,
+        "used":             True,
+        "cycle_type":       cycle_type,
+    }
+
+
 def _strategy_analyze_match(home: str, away: str,
                               standings: dict, model: dict,
                               hist_home_win_pct: float,
@@ -2682,6 +2834,10 @@ def _strategy_analyze_match(home: str, away: str,
     strategy_pct = 0.0
     reason       = ""
 
+    # ── Trajectory data (built once, reused below) ───────────────────────────
+    _home_traj_matches = _get_team_matches_with_pos(home, model, standings)
+    _away_traj_matches = _get_team_matches_with_pos(away, model, standings)
+
     # STRONG team LOST → expect recovery
     if home_tier == "STRONG" and home_lost:
         if away_tier in ("WEAK", "MODERATE"):
@@ -2704,6 +2860,18 @@ def _strategy_analyze_match(home: str, away: str,
                 reason = (f"{home} pos{home_pos} STRONG lost {home_last['gf']}-{home_last['ga']} "
                           f"vs pos{home_last_opp_pos}, plays {away} pos{away_pos} {away_tier}")
 
+            # ── Trajectory confirmation ───────────────────────────────────────
+            _traj = trajectory_confirmation(
+                team_matches=_home_traj_matches,
+                current_opp_pos=away_pos,
+                cycle_type="strong_lost",
+                model=model,
+            )
+            if not _traj["confirm"]:
+                return None   # 🚨 HARD REJECTION — trajectory says no rebound
+            strategy_pct = min(95.0, strategy_pct + _traj["confidence_boost"])
+            reason += f" [traj:{_traj['reason']}]"
+
     elif away_tier == "STRONG" and away_lost:
         if home_tier in ("WEAK", "MODERATE"):
             strategy_tip = "AWAY"
@@ -2717,6 +2885,18 @@ def _strategy_analyze_match(home: str, away: str,
             reason = (f"{away} pos{away_pos} STRONG lost {away_last['gf']}-{away_last['ga']} "
                       f"vs pos{away_last_opp_pos}, plays {home} pos{home_pos} {home_tier}")
 
+            # ── Trajectory confirmation ───────────────────────────────────────
+            _traj = trajectory_confirmation(
+                team_matches=_away_traj_matches,
+                current_opp_pos=home_pos,
+                cycle_type="strong_lost",
+                model=model,
+            )
+            if not _traj["confirm"]:
+                return None
+            strategy_pct = min(95.0, strategy_pct + _traj["confidence_boost"])
+            reason += f" [traj:{_traj['reason']}]"
+
     # WEAK team WON → check if opponent confirms it will lose
     elif home_tier == "WEAK" and home_won:
         if away_tier == "STRONG" and away_lost:
@@ -2725,6 +2905,18 @@ def _strategy_analyze_match(home: str, away: str,
             strategy_pct = 68.0
             reason = (f"{home} pos{home_pos} WEAK won vs pos{home_last_opp_pos}, "
                       f"{away} pos{away_pos} STRONG lost — strong recovers")
+
+            _traj = trajectory_confirmation(
+                team_matches=_home_traj_matches,
+                current_opp_pos=away_pos,
+                cycle_type="weak_won",
+                model=model,
+            )
+            if not _traj["confirm"]:
+                return None
+            strategy_pct = min(95.0, strategy_pct + _traj["confidence_boost"])
+            reason += f" [traj:{_traj['reason']}]"
+
         elif away_tier == "STRONG" and away_won:
             # Weak won, strong also won → strong confirmed → AWAY WIN straight
             strategy_tip = "AWAY"
@@ -2750,6 +2942,18 @@ def _strategy_analyze_match(home: str, away: str,
             strategy_pct = 68.0
             reason = (f"{away} pos{away_pos} WEAK won vs pos{away_last_opp_pos}, "
                       f"{home} pos{home_pos} STRONG lost — strong recovers")
+
+            _traj = trajectory_confirmation(
+                team_matches=_away_traj_matches,
+                current_opp_pos=home_pos,
+                cycle_type="weak_won",
+                model=model,
+            )
+            if not _traj["confirm"]:
+                return None
+            strategy_pct = min(95.0, strategy_pct + _traj["confidence_boost"])
+            reason += f" [traj:{_traj['reason']}]"
+
         elif home_tier == "STRONG" and home_won:
             strategy_tip = "HOME"
             strategy_pct = 75.0
@@ -2818,6 +3022,20 @@ def _strategy_analyze_match(home: str, away: str,
             history_pct = hist_away_win_pct + hist_draw_pct
         history_agrees = history_pct >= 50.0
 
+    # ── Confidence floor gate (from trajectory suggestions step 4) ───────────
+    # After trajectory adjustments, if strategy_pct is still below 60,
+    # the signal is too weak to be worth posting — reject cleanly.
+    if strategy_pct < 60.0:
+        return {
+            "strategy_tip":   strategy_tip,
+            "market":         market,
+            "strategy_pct":   round(strategy_pct, 1),
+            "history_pct":    0.0,
+            "history_agrees": False,
+            "reason":         f"below_confidence_floor({strategy_pct:.0f}%)",
+            "card_line":      "",
+        }
+
     # Only show if history agrees
     if not history_agrees:
         return {
@@ -2837,26 +3055,53 @@ def _strategy_analyze_match(home: str, away: str,
         "BTTS": "Yes",
     }.get(market, "?")
 
+    # Include trajectory signal in card when informative
+    _traj_tag = ""
+    if "[traj:" in reason:
+        import re as _re
+        _m = _re.search(r"\[traj:([^\]]+)\]", reason)
+        if _m:
+            _traj_reason = _m.group(1)
+            _traj_icons = {
+                "stable_rebound":     "🔄 stable rebound",
+                "uncertain":          "⚠️ uncertain",
+                "likely_regression":  "📉 regression likely",
+                "weakening_detected": "❌ weakening",
+                "real_improvement":   "📈 real improvement",
+                "not_enough_data":    "",
+            }
+            _traj_label = _traj_icons.get(_traj_reason.split("+")[0], _traj_reason)
+            if _traj_label:
+                _traj_tag = f" · 🔬 {_traj_label}"
+
     card_line = (
         f"┆ 🎯 *Strategy*: ({market}) {mkt_label} "
-        f"· {strategy_pct:.0f}% + {history_pct:.0f}%\n"
+        f"· {strategy_pct:.0f}% + {history_pct:.0f}%{_traj_tag}\n"
     )
 
+    # Determine cycle type for learning
+    _cycle_type = None
+    if "STRONG lost" in reason or "strong_lost" in reason:
+        _cycle_type = "strong_lost"
+    elif "WEAK won" in reason or "weak_won" in reason:
+        _cycle_type = "weak_won"
+
     return {
-        "strategy_tip":   strategy_tip,
-        "market":         market,
-        "mkt_label":      mkt_label,
-        "strategy_pct":   round(strategy_pct, 1),
-        "history_pct":    round(history_pct, 1),
-        "history_agrees": True,
-        "reason":         reason,
-        "card_line":      card_line,
-        "home_last":      home_last,
-        "away_last":      away_last,
-        "home_pos":       home_pos,
-        "away_pos":       away_pos,
-        "home_tier":      home_tier,
-        "away_tier":      away_tier,
+        "strategy_tip":         strategy_tip,
+        "market":               market,
+        "mkt_label":            mkt_label,
+        "strategy_pct":         round(strategy_pct, 1),
+        "history_pct":          round(history_pct, 1),
+        "history_agrees":       True,
+        "reason":               reason,
+        "card_line":            card_line,
+        "home_last":            home_last,
+        "away_last":            away_last,
+        "home_pos":             home_pos,
+        "away_pos":             away_pos,
+        "home_tier":            home_tier,
+        "away_tier":            away_tier,
+        "trajectory_cycle_type": _cycle_type,   # for learning in _learn_from_round
     }
 
 
@@ -2892,6 +3137,27 @@ def _strategy_brain_summary(bot_data: dict) -> str:
         f"   BTTS:    {btts_cor}/{btts_tot} = {b_acc}%",
         f"   Skipped (no history agree): {skipped}",
     ]
+
+    # ── Trajectory stats (Phase 2) ────────────────────────────────────────────
+    _traj_lines = []
+    for lid in bot_data:
+        if not lid.startswith("model_"):
+            continue
+        m = bot_data.get(lid, {})
+        if not isinstance(m, dict):
+            continue
+        _ts = m.get("trajectory_stats", {})
+        for _ct in ("strong_lost", "weak_won"):
+            _rec = _ts.get(_ct, {})
+            _t   = _rec.get("total", 0)
+            _c   = _rec.get("correct", 0)
+            if _t >= 5:
+                _a = round(_c / _t * 100)
+                _dot = "🟢" if _a >= 68 else "🟡" if _a >= 52 else "🔴"
+                _traj_lines.append(f"   {_dot} {_ct}: {_c}/{_t} = {_a}%")
+    if _traj_lines:
+        lines.append("🔄 *Trajectory Accuracy*")
+        lines.extend(_traj_lines)
     return "\n".join(lines) + "\n"
 
 
@@ -6838,6 +7104,13 @@ def _get_model(bot_data: dict, league_id: int) -> dict:
         "recent_10_correct": 0,
         "recent_10_total":   0,
         "recent_10_acc":     0.0,
+        # ── TRAJECTORY STATS — Phase 2 self-learning ──────────────────────────
+        # Tracks trajectory_confirmation() prediction accuracy per cycle_type.
+        # Used inside trajectory_confirmation() to nudge boost up/down once ≥10 samples.
+        "trajectory_stats": {
+            "strong_lost": {"correct": 0, "total": 0},
+            "weak_won":    {"correct": 0, "total": 0},
+        },
     }
     if key not in bot_data or bot_data[key] is None:
         bot_data[key] = defaults
@@ -6872,6 +7145,14 @@ def _get_model(bot_data: dict, league_id: int) -> dict:
         m.setdefault("recent_10_correct", 0)
         m.setdefault("recent_10_total",   0)
         m.setdefault("recent_10_acc",     0.0)
+        # ── Trajectory stats forward-compat ───────────────────────────────────
+        m.setdefault("trajectory_stats", {
+            "strong_lost": {"correct": 0, "total": 0},
+            "weak_won":    {"correct": 0, "total": 0},
+        })
+        ts_default = m["trajectory_stats"]
+        ts_default.setdefault("strong_lost", {"correct": 0, "total": 0})
+        ts_default.setdefault("weak_won",    {"correct": 0, "total": 0})
         # ── SELF-CONSTRUCTING INTELLIGENCE ENGINE ─────────────────────────────
         # mistake_dna: per fixture, record every wrong prediction with full context
         # {fixture_key: [{predicted, actual, conf, odds_h, odds_d, odds_a,
@@ -8838,6 +9119,28 @@ def _learn_from_round(bot_data: dict, league_id: int,
                 _learn_actual = _btts_actual if _strat_mkt == "BTTS" else _actual_out
                 _strategy_update_stats(bot_data, _strat_mkt, _strat_tip, _learn_actual)
 
+            # ── Trajectory stats learning (Phase 2 — self-learning) ──────────
+            # Only runs when strategy used trajectory confirmation.
+            # Checks whether the trajectory prediction was correct so future
+            # predictions for the same cycle_type get a calibrated boost/penalty.
+            _traj_cycle = pred.get("trajectory_cycle_type")
+            _traj_tip   = pred.get("strategy_tip")   # HOME or AWAY
+            if _traj_cycle and _traj_tip:
+                _traj_correct = (_traj_tip == ft_out)
+                _ts_dict = model.setdefault("trajectory_stats", {
+                    "strong_lost": {"correct": 0, "total": 0},
+                    "weak_won":    {"correct": 0, "total": 0},
+                })
+                _ts_rec = _ts_dict.setdefault(_traj_cycle, {"correct": 0, "total": 0})
+                _ts_rec["total"] += 1
+                if _traj_correct:
+                    _ts_rec["correct"] += 1
+                log.debug(
+                    f"🔄 trajectory_stats [{_traj_cycle}]: "
+                    f"{'✅' if _traj_correct else '❌'} → "
+                    f"{_ts_rec['correct']}/{_ts_rec['total']}"
+                )
+
             # ── Odds repeat learning ──────────────────────────────────────────
             if pred.get("odds_repeat"):
                 _or_stats = bot_data.setdefault("odds_repeat_stats", {
@@ -9282,6 +9585,9 @@ async def _learning_job(context):
                 "btts_count": 0, "over25_count": 0,
             }
             m["rounds_learned"] = 0
+            # trajectory_stats is deliberately NOT reset here — it tracks
+            # trajectory_confirmation() accuracy which is independent of fp_db/match_log
+            # contamination. Resetting it would lose hard-won calibration data.
             # Also wipe cached standings in bot_data
             bot_data.pop(f"standings_{lid}", None)
             wiped_leagues += 1
@@ -9890,6 +10196,8 @@ async def cmd_resetdata(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "btts_count": 0, "over25_count": 0,
         }
         m["rounds_learned"] = 0
+        # trajectory_stats intentionally NOT wiped — calibration data is independent
+        # of fp_db contamination and too valuable to discard on a data reset.
         c.bot_data.pop(f"standings_{lid}", None)
         wiped.append(LEAGUES[lid]["name"])
 
@@ -11227,10 +11535,12 @@ async def _run_auto_post(bot, bot_data: dict):
                     if _strategy_result and _strategy_result.get("history_agrees"):
                         _strategy_line = _strategy_result.get("card_line", "")
                         # Store for learning
-                        round_preds[-1]["strategy_tip"]    = _strategy_result.get("strategy_tip")
-                        round_preds[-1]["strategy_market"] = _strategy_result.get("market")
-                        round_preds[-1]["strategy_pct"]    = _strategy_result.get("strategy_pct")
-                        round_preds[-1]["history_pct"]     = _strategy_result.get("history_pct")
+                        round_preds[-1]["strategy_tip"]          = _strategy_result.get("strategy_tip")
+                        round_preds[-1]["strategy_market"]       = _strategy_result.get("market")
+                        round_preds[-1]["strategy_pct"]          = _strategy_result.get("strategy_pct")
+                        round_preds[-1]["history_pct"]           = _strategy_result.get("history_pct")
+                        # Store trajectory cycle type so _learn_from_round can update trajectory_stats
+                        round_preds[-1]["trajectory_cycle_type"] = _strategy_result.get("trajectory_cycle_type")
 
                     # ── Odds repeat — already detected at gate, reuse result ──
                     _repeat_line = ""
@@ -11708,6 +12018,40 @@ async def _standings_job(context):
 async def _auto_send_job(context):
     await _run_auto_post(context.bot, context.bot_data)
 
+
+
+def _get_collector_trajectory_cycle(home: str, away: str,
+                                      model: dict, standings: dict) -> str | None:
+    """
+    Lightweight helper used by the data_collector to tag each prediction
+    with the cycle_type it would have triggered (if any).
+    This lets backfill learning update trajectory_stats without needing
+    to re-run the full strategy engine per match.
+    Returns "strong_lost", "weak_won", or None.
+    """
+    if not standings or not model:
+        return None
+    try:
+        tier_map   = _get_all_tiers(standings)
+        home_tier  = _find_tier(home, tier_map)
+        away_tier  = _find_tier(away, tier_map)
+        home_last  = _strategy_get_last_game(home, model)
+        away_last  = _strategy_get_last_game(away, model)
+        if not home_last or not away_last:
+            return None
+        h_result = home_last.get("result", "")
+        a_result = away_last.get("result", "")
+        if ((home_tier == "STRONG" and h_result == "LOSS" and away_tier in ("WEAK","MODERATE")) or
+                (away_tier == "STRONG" and a_result == "LOSS" and home_tier in ("WEAK","MODERATE"))):
+            return "strong_lost"
+        if ((home_tier == "WEAK" and h_result == "WIN") or
+                (away_tier == "WEAK" and a_result == "WIN")):
+            return "weak_won"
+    except Exception:
+        pass
+    return None
+
+
 async def _data_collector_job(context):
     """
     Runs every 4 minutes — the brain's dedicated data intake pipe.
@@ -11832,6 +12176,12 @@ async def _data_collector_job(context):
                                     "_skipped":       False,
                                     "_skip_reason":   "",
                                     "_lead_market":   "1x2",
+                                    # Trajectory: evaluate on the fly for collector predictions
+                                    # so backfill learning also updates trajectory_stats.
+                                    "trajectory_cycle_type": _get_collector_trajectory_cycle(
+                                        m["home"], m["away"], league_model,
+                                        bot_data.get(f"standings_{lid}", {})
+                                    ),
                                 })
                             except Exception as em:
                                 log.warning(f"COLLECTOR [{name}] match error: {em}")
@@ -11958,6 +12308,37 @@ async def _data_collector_job(context):
                                 standings=bot_data.get(f"standings_{lid}"),
                                 round_id=int(rid) if rid.isdigit() else 0,
                             )
+                            # ── Trajectory stats backfill ──────────────────────
+                            # Update trajectory_stats for each result where a
+                            # trajectory cycle type was tagged on the prediction.
+                            _bf_model = _get_model(bot_data, lid)
+                            _bf_standings = bot_data.get(f"standings_{lid}", {})
+                            _result_map_bf = {
+                                _fixture_key(r["home"], r["away"]): r
+                                for r in results
+                            }
+                            for _bp in preds:
+                                _bfk  = _fixture_key(_bp.get("home",""), _bp.get("away",""))
+                                _bres = _result_map_bf.get(_bfk)
+                                if not _bres:
+                                    continue
+                                _bct  = _bp.get("trajectory_cycle_type")
+                                _btip = _bp.get("tip", "").split()[0] if _bp.get("tip") else None
+                                if not _bct or not _btip:
+                                    continue
+                                _bah = _bres.get("actual_h", 0) or 0
+                                _baa = _bres.get("actual_a", 0) or 0
+                                if _bah > _baa:   _bft = "HOME"
+                                elif _bah < _baa: _bft = "AWAY"
+                                else:             _bft = "DRAW"
+                                _bts = _bf_model.setdefault("trajectory_stats", {
+                                    "strong_lost": {"correct": 0, "total": 0},
+                                    "weak_won":    {"correct": 0, "total": 0},
+                                })
+                                _btr = _bts.setdefault(_bct, {"correct": 0, "total": 0})
+                                _btr["total"] += 1
+                                if _btip == _bft:
+                                    _btr["correct"] += 1
                             collected[bk] = 1
                             backfilled += 1
                             log.info(
@@ -12400,9 +12781,17 @@ async def _do_rawstatus(message, c):
             )
         else:
             dot    = "🟢" if acc >= 0.60 else "🟡"
+            # Build trajectory stats suffix
+            _ts_raw  = model.get("trajectory_stats", {})
+            _traj_parts_rs = []
+            for _ct, _lbl in (("strong_lost", "SR"), ("weak_won", "WR")):
+                _rec = _ts_raw.get(_ct, {}); _t = _rec.get("total", 0); _c = _rec.get("correct", 0)
+                if _t >= 5:
+                    _traj_parts_rs.append(f"{_lbl}:{_c}/{_t}={round(_c/_t*100)}%")
+            _traj_suffix = (" · 🔬" + ",".join(_traj_parts_rs)) if _traj_parts_rs else ""
             detail = (
                 f"{rds}r · {n_fix} fixtures · {n_rec} records · "
-                f"🔒{n_mature} mature · {acc:.0%}acc"
+                f"🔒{n_mature} mature · {acc:.0%}acc{_traj_suffix}"
             )
         store_lines.append(f"{dot} {linfo['flag']} *{linfo['name']}*: {detail}")
 
@@ -12565,6 +12954,18 @@ async def _do_brainstat(message, c):
         calib_lbl = ("🔵 calibrated" if abs(calib) <= 2
                      else ("🔺 overconfident" if calib > 0 else "🔻 underconfident"))
 
+        # ── Trajectory stats for this league ─────────────────────────────────
+        _ts_data = model.get("trajectory_stats", {})
+        _traj_parts = []
+        for _ct, _ct_label in (("strong_lost", "StrongRec"), ("weak_won", "WeakReg")):
+            _tr = _ts_data.get(_ct, {}); _tt = _tr.get("total", 0); _tc = _tr.get("correct", 0)
+            if _tt >= 5:
+                _ta = _tc / _tt
+                _dot = "🟢" if _ta >= 0.68 else "🟡" if _ta >= 0.52 else "🔴"
+                _traj_parts.append(f"{_dot} {_ct_label} {_ta:.0%}({_tc}/{_tt})")
+        _traj_line = (f"│ 🔬 Trajectory: {' · '.join(_traj_parts)}\n"
+                      if _traj_parts else "│ 🔬 Trajectory: building (need 5+ samples)\n")
+
         league_lines.append(
             f"┌ {linfo['flag']} *{linfo['name']}*  {_status_icon(ts)} *{ts*100:.0f}%*\n"
             f"│ {_bar(ts)} → 100%\n"
@@ -12581,6 +12982,7 @@ async def _do_brainstat(message, c):
             + (f"│ 🔥 Sweet spot: ~{best_band}% confidence → {best_band_acc:.0%} correct\n" if best_band else "")
             + (f"│ ⚠️ High-conf mistakes: {hcm}\n" if hcm >= 3 else "")
             + f"│ ⚖️ Wts: Odds {w.get('odds',0):.0%}  Pois {w.get('poisson',0):.0%}  Str {w.get('strength',0):.0%}\n"
+            + _traj_line
             # AI brain diagnostics
             + _ai_brain_status_line(model)
             # Algorithm reverse-engineering status
