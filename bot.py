@@ -3591,7 +3591,7 @@ def predict_match(home: str, away: str, stats: dict,
     # Dynamic thresholds
     win_margin  = max(8.0,  12.0 + margin_adjust)   # 7→15 range
     draw_margin = max(5.0,   8.0 + margin_adjust)   # 4→12 range
-    draw_thresh = max(28.0, 32.0 - margin_adjust)   # 22→38 range
+    draw_thresh = max(24.0, 28.0 - margin_adjust)   # 18→34 range (was 28→38, too restrictive)
 
     home_bar = win_margin  + _outcome_margin_boost("HOME")
     away_bar = win_margin  + _outcome_margin_boost("AWAY")
@@ -3601,7 +3601,7 @@ def predict_match(home: str, away: str, stats: dict,
         tip, icon = "HOME WIN",     "🏠"
     elif aw_pct >= hw_pct + away_bar and aw_pct >= dw_pct + draw_bar:
         tip, icon = "AWAY WIN",     "✈️"
-    elif dw_pct >= draw_thresh and abs(hw_pct - aw_pct) <= 10:
+    elif dw_pct >= draw_thresh and abs(hw_pct - aw_pct) <= 14:
         tip, icon = "DRAW / CLOSE", "🤝"
     elif hw_pct > aw_pct:
         tip, icon = "HOME WIN",     "🏠"
@@ -7096,7 +7096,7 @@ def _bootstrap_learning(bot_data: dict, league_id: int,
             _get_model(bot_data, league_id).get("_bootstrap_rounds", 0) + 1
         _learn_algo_signals(_get_model(bot_data, league_id), predictions, results, round_id_int=0)
         _ai_postmatch_analysis(_get_model(bot_data, league_id), predictions, results,
-                               standings=None, round_id=0)
+                               standings=None, round_id=0, is_bootstrap=True)
 
         # Add this round to cumulative pool for next iteration
         cumulative_events += scored
@@ -7519,6 +7519,7 @@ def _ai_postmatch_analysis(
     results: list[dict],
     standings: dict | None,
     round_id: int = 0,
+    is_bootstrap: bool = False,
 ) -> None:
     """
     AI BRAIN — POST-MATCH LEARNING ENGINE.
@@ -7815,9 +7816,10 @@ def _ai_postmatch_analysis(
         if len(mem) > 30:
             _recent10   = mem[-10:]
             _wrong_rate = sum(1 for r in _recent10 if not r["correct"]) / len(_recent10)
-            if _wrong_rate >= 0.70:
+            if _wrong_rate >= 0.70 and not is_bootstrap:
                 # Chronically wrong — clear this fixture's memory entirely.
-                # The next appearance will start fresh with no prior bias.
+                # Suppressed during bootstrap: synthetic early-round predictions are
+                # unreliable and would wipe every fixture before it can reach maturity.
                 log.debug(
                     f"🧹 AI fixture_mem wiped [{fk}]: "
                     f"{_wrong_rate:.0%} wrong in last 10 — clearing for fresh start"
