@@ -9815,6 +9815,13 @@ async def _learning_job(context):
                     else:
                         preds     = pred_entry   # legacy: plain list
                         _p_season = ""
+                    # FIX: guard malformed entries — preds must be list-of-dicts or learning crashes
+                    # with 'list object has no attribute get', blocking standings + card updates
+                    if not isinstance(preds, list) or (preds and not isinstance(preds[0], dict)):
+                        log.warning(f"Dropping malformed pred_entry lid={league_id} rid={round_id} "
+                                    f"(expected list-of-dicts, got {type(preds).__name__})")
+                        del rounds[round_id]
+                        continue
                     # If season_id was not stored, recover it from the API lookup
                     if not _p_season:
                         _p_season = _season_lookup.get(str(round_id), "")
@@ -11237,6 +11244,7 @@ async def _run_auto_post(bot, bot_data: dict):
                             "lid":        lid,
                             "round_id":   _prev_rid,
                             "scores":     _prev_scores,
+                            "queued_at":  time.time(),
                         }
                         log.info(f"📊 Queued result update for lid={lid} prev_rid={_prev_rid} "
                                  f"({len(_prev_scores)} scores)")
@@ -11926,8 +11934,9 @@ async def _run_auto_post(bot, bot_data: dict):
                     # Store message IDs per chat for editing
                     for chat2 in send_targets:
                         _c2msgs = msg_ids.setdefault(str(chat2), {})
+                        # FIX: use chat2's own stored IDs — str(chat) was wrong for channels/other users
                         _c2msgs[f"{_lid_str}_prev_cards_{_rid_str}"] = \
-                            msg_ids.get(str(chat), {}).get(f"{_lid_str}_cards", [])
+                            msg_ids.get(str(chat2), {}).get(f"{_lid_str}_cards", [])
 
                 any_sent = True
                 log.info(f"📨 New picks posted → {chat} ({sum(len(s.get('match_cards',[])) for s in sections)} matches, round_key={round_key})")
@@ -12000,6 +12009,14 @@ async def _run_auto_post(bot, bot_data: dict):
             _upd_rid    = _upd.get("round_id")
             _upd_scores = _upd.get("scores", {})
             if not _upd_scores:
+                _done_keys.append(_upd_key)
+                continue
+
+            # FIX: expire stale entries that have been retrying >30 min (cards never stored)
+            _upd_age = time.time() - _upd.get("queued_at", time.time())
+            if _upd_age > 1800:
+                log.warning(f"result_update: expiring stale entry lid={_upd_lid} rid={_upd_rid} "
+                            f"(age={_upd_age/60:.0f}min)")
                 _done_keys.append(_upd_key)
                 continue
 
