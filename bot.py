@@ -597,9 +597,17 @@ CHANNEL_ID     = os.environ.get("CHANNEL_ID", "")   # Telegram channel/group ID
 # ── ADMIN CONFIG ──────────────────────────────────────────────────────────────
 # Set your Telegram numeric user ID here (get it from @userinfobot on Telegram)
 # OR set the ADMIN_ID environment variable in Railway — whichever you prefer.
-_HARDCODED_ADMIN_ID = 0   # ← REPLACE 0 WITH YOUR NUMERIC TELEGRAM ID e.g. 123456789
+_HARDCODED_ADMIN_ID = 5757022534   # fallback — also set ADMIN_ID env var in Railway
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0")) or _HARDCODED_ADMIN_ID
+# Re-read at every admin check so Railway env changes take effect without redeploy
+def _get_admin_id() -> int:
+    try:
+        v = int(os.environ.get("ADMIN_ID", "0"))
+    except (ValueError, TypeError):
+        v = 0
+    return v or _HARDCODED_ADMIN_ID
+
+ADMIN_ID = _get_admin_id()
 
 # ─── ACCESS CONTROL STORAGE ───────────────────────────────────────────────────
 # Stored in bot_data["access"]:
@@ -640,7 +648,8 @@ async def _fetch_utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 def _is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+    aid = _get_admin_id()
+    return aid != 0 and user_id == aid
 
 def _is_authorized_user(user_id: int, bot_data: dict) -> bool:
     """Returns True if user has a valid non-expired subscription."""
@@ -4315,6 +4324,83 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
             return {"matched": False, "repeat_count": repeat_count,
                     "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {dominant_out} to restore"}
 
+    # ── FLIP-CYCLE DETECTION ──────────────────────────────────────────────────
+    # Scenario: historically weak team beat the strong one (the "flip").
+    # This signals a potential strength shift. If the outcome sequence shows
+    # a confirmed alternating / flip-cycle pattern, we must NOT blindly repeat
+    # the old dominant outcome — we follow the cycle's next expected step.
+    #
+    # Three sub-cases:
+    #   A. Exactly 1 flip in the last 2 results → lone upset, skip (MAINTENANCE
+    #      already catches this above — this block handles 3+ record sequences).
+    #   B. Alternating cycle confirmed (e.g. AWAY→HOME→AWAY→HOME) with ≥3 rounds
+    #      → predict the NEXT step in the cycle, not the historical dominant.
+    #   C. Single flip with no prior data to confirm direction → skip entirely
+    #      (wait for next meeting to re-confirm direction).
+    if len(_sorted_verified) >= 3:
+        _seq_outcomes = [q["record"].get("outcome") for q in reversed(_sorted_verified)
+                         if q["record"].get("outcome")]
+        # Build the deduplicated alternation sequence to detect flip cycles
+        # e.g. [AWAY, AWAY, HOME, AWAY, HOME] → flip pattern emerging
+        _last = _seq_outcomes[-1]   # most recent result
+        _prev = _seq_outcomes[-2]   # result before that
+        _older = _seq_outcomes[-3]  # result before that
+
+        _is_flip = (_last != dominant_out)   # latest broke the dominant pattern
+        _prev_also_flipped = (_prev != dominant_out)
+
+        if _is_flip and not _prev_also_flipped:
+            # Single flip after a dominant run → team gained strength, direction uncertain.
+            # Check if this is a known alternating cycle (AWAY→HOME→AWAY→...)
+            _alt_detected = False
+            if len(_seq_outcomes) >= 4:
+                # Alternating: every other result flips
+                _evens = _seq_outcomes[-4::2]   # positions 0, 2 from tail
+                _odds  = _seq_outcomes[-3::2]   # positions 1, 3 from tail
+                _even_same = len(set(_evens)) == 1
+                _odd_same  = len(set(_odds))  == 1
+                if _even_same and _odd_same and _evens[0] != _odds[0]:
+                    # Confirmed alternating cycle — predict next step
+                    _cycle_next = _evens[0]  # next expected = the other side of the alternation
+                    _alt_detected = True
+                    log.info(
+                        f"🔄 FLIP-CYCLE [{home}|{away}]: alternating confirmed "
+                        f"seq={_seq_outcomes[-4:]} → next expected={_cycle_next}"
+                    )
+                    # Override dominant_out to follow the cycle
+                    dominant_out      = _cycle_next
+                    consistency_count = _seq_outcomes.count(_cycle_next)
+                    total_known       = len(_seq_outcomes)
+                    consistency_pct   = round(consistency_count / total_known * 100)
+                    out_label         = {"HOME": "Home WIN", "AWAY": "Away WIN",
+                                         "DRAW": "Draw"}.get(dominant_out, dominant_out)
+
+            if not _alt_detected:
+                # Single flip, no confirmed cycle yet → skip prediction entirely.
+                # Wait for next meeting to confirm new direction.
+                log.info(
+                    f"⏭️  FLIP-CYCLE SKIP [{home}|{away}]: last result {_last} broke "
+                    f"dominant {dominant_out} — seq={_seq_outcomes[-4:]} — "
+                    f"waiting for next meeting to confirm new direction"
+                )
+                return {
+                    "matched":      False,
+                    "repeat_count": repeat_count,
+                    "fail_reason":  (
+                        f"FLIP-CYCLE: {_last} broke dominant {dominant_out} — "
+                        f"team gained strength. Skipping until next meeting confirms direction."
+                    ),
+                }
+
+        elif _is_flip and _prev_also_flipped:
+            # Two consecutive flips = the new direction is now the dominant.
+            # Let it fall through — dominant_out is already recalculated from
+            # outcome_counts, which will now point to the new winner.
+            log.info(
+                f"↩️  FLIP-CONFIRMED [{home}|{away}]: 2 consecutive flips — "
+                f"new dominant={dominant_out}, seq={_seq_outcomes[-4:]}"
+            )
+
     # ── All checks passed ─────────────────────────────────────────────────────
     match_pct = round(n_matched / n_available * 100)
     # Compute confidence from raw odds closeness across all matched markets
@@ -4344,9 +4430,12 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
 
     out_label = {"HOME": "Home WIN", "AWAY": "Away WIN", "DRAW": "Draw"}.get(dominant_out, dominant_out)
 
-    if consistency_pct == 100 and repeat_count >= 2:
+    if consistency_pct == 100 and repeat_count >= 5:
         tier     = "💎 ELITE LOCK"
         tier_msg = f"all 5 markets identical — 100% same result every time"
+    elif consistency_pct == 100 and repeat_count >= 3:
+        tier     = "🏆 ELITE"
+        tier_msg = f"all 5 markets identical — {repeat_count} confirmed (building lock)"
     elif consistency_pct >= 67:
         tier     = "🏆 ELITE"
         tier_msg = f"all 5 markets confirmed — {consistency_pct}% same result"
@@ -11886,68 +11975,126 @@ async def _run_auto_post(bot, bot_data: dict):
         bot_data["auto_last_body"] = body_text
 
     # ── Update previously sent cards with results ──────────────────────────────
-    # After previous round finishes, edit those cards to show ✅/❌ + score
+    # After a round finishes, edit the prediction cards to show ✅/❌ + score.
+    # Only 1X2 tips are checked (tip format: "HOME"/"DRAW"/"AWAY" as first word).
     _pending_updates = bot_data.get("pending_result_updates", {})
     if _pending_updates:
-        _processed_keys = []
+        # Build full target set: admin + channel + all auto_chats with valid access
+        _ru_acc     = _access(bot_data)
+        _ru_targets: set = set()
+        _cur_admin  = _get_admin_id()
+        if _cur_admin:   _ru_targets.add(str(_cur_admin))
+        if CHANNEL_ID:   _ru_targets.add(str(CHANNEL_ID))
+        _ru_targets.update(str(x) for x in _ru_acc.get("allowed_channels", set()))
+        for _rc in bot_data.get("auto_chats", set()):
+            try:    _ruid = int(_rc)
+            except (ValueError, TypeError): _ruid = 0
+            if _ruid < 0 or _is_authorized_user(_ruid, bot_data) or (_cur_admin and _ruid == _cur_admin):
+                _ru_targets.add(str(_rc))
+
+        _ru_msg_ids = bot_data.setdefault("auto_msg_ids", {})
+        _done_keys  = []
+
         for _upd_key, _upd in list(_pending_updates.items()):
-            _upd_lid     = _upd.get("lid")
-            _upd_rid     = _upd.get("round_id")
-            _upd_scores  = _upd.get("scores", {})
+            _upd_lid    = _upd.get("lid")
+            _upd_rid    = _upd.get("round_id")
+            _upd_scores = _upd.get("scores", {})
             if not _upd_scores:
-                _processed_keys.append(_upd_key)
+                _done_keys.append(_upd_key)
                 continue
 
-            # Find stored cards for this league+round
-            _stored_cards = bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", [])
+            _lid_s    = str(_upd_lid)
+            _rid_s    = str(_upd_rid)
+            _card_rid = str(_upd.get("card_rid", "") or _rid_s)
+
+            # Find stored card metadata — exact key first, then scan all keys for this league
+            _stored_cards = (
+                bot_data.get(f"sent_cards_{_lid_s}_{_card_rid}") or
+                bot_data.get(f"sent_cards_{_lid_s}_{_rid_s}") or
+                bot_data.get(f"sent_cards_{_upd_lid}_{_upd_rid}", [])
+            )
             if not _stored_cards:
-                _processed_keys.append(_upd_key)
+                for _sk2 in list(bot_data.keys()):
+                    if _sk2.startswith(f"sent_cards_{_upd_lid}_") and bot_data[_sk2]:
+                        _stored_cards = bot_data[_sk2]
+                        _card_rid     = _sk2.replace(f"sent_cards_{_upd_lid}_", "")
+                        log.info(f"result_update: found cards via scan {_sk2}")
+                        break
+            if not _stored_cards:
+                # Cards not ready yet — retry next tick
+                log.info(f"result_update: no stored cards for lid={_upd_lid} rid={_upd_rid} — retrying")
                 continue
 
-            for chat in send_targets:
-                chat_msgs = msg_ids.get(str(chat), {})
-                _mid_list = chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}", [])
+            _any_edited        = False
+            _any_msg_ids_found = False
+
+            for _ru_chat in _ru_targets:
+                _ru_chat_msgs = _ru_msg_ids.get(str(_ru_chat), {})
+                # Try all known message-ID key formats for this league+round
+                _mid_list = (
+                    _ru_chat_msgs.get(f"{_lid_s}_prev_cards_{_card_rid}") or
+                    _ru_chat_msgs.get(f"{_lid_s}_prev_cards_{_rid_s}") or
+                    _ru_chat_msgs.get(f"{_upd_lid}_prev_cards_{_upd_rid}") or
+                    _ru_chat_msgs.get(f"{_lid_s}_cards") or
+                    []
+                )
+                if not _mid_list:
+                    continue
+                _any_msg_ids_found = True
+
                 for idx, card_info in enumerate(_stored_cards):
                     if idx >= len(_mid_list):
                         break
-                    _h = card_info.get("home", "")
-                    _a = card_info.get("away", "")
+                    _h   = card_info.get("home", "")
+                    _a   = card_info.get("away", "")
                     _tip = card_info.get("tip", "")
-                    # Look up score
-                    fk = _fixture_key(_h, _a)
-                    score = (_upd_scores.get(fk) or
-                             _upd_scores.get(f"{_h}|{_a}") or
-                             _upd_scores.get(f"{_a}|{_h}"))
+
+                    # Score lookup — try canonical key then both team-order variants
+                    fk    = _fixture_key(_h, _a)
+                    score = (
+                        _upd_scores.get(fk) or
+                        _upd_scores.get(f"{_h}|{_a}") or
+                        _upd_scores.get(f"{_a}|{_h}")
+                    )
                     if not score:
                         continue
-                    sh, sa = score
-                    ft_out = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
-                    tip_out = _tip.split()[0] if _tip else ""
-                    ok = (tip_out == ft_out)
+
+                    sh, sa  = score
+                    ft_out  = "HOME" if sh > sa else "AWAY" if sh < sa else "DRAW"
+                    tip_out = _tip.split()[0].upper() if _tip else ""
+                    ok      = (tip_out == ft_out)
+
                     result_str = f"{'✅' if ok else '❌'} {sh}–{sa}"
-                    # Rebuild card with result replacing ⏳ pending
-                    new_card = card_info.get("card_text", "").replace(
-                        "⏳ pending", result_str
-                    )
-                    if new_card and new_card != card_info.get("card_text", ""):
+                    new_text   = card_info.get("card_text", "").replace("⏳ pending", result_str)
+
+                    if new_text and "⏳ pending" not in new_text:
                         try:
                             await bot.edit_message_text(
-                                chat_id=chat,
+                                chat_id=_ru_chat,
                                 message_id=_mid_list[idx],
-                                text=new_card,
-                                parse_mode="Markdown"
+                                text=new_text,
+                                parse_mode="Markdown",
                             )
                             await asyncio.sleep(0.2)
-                        except Exception as exc:
-                            if "Message is not modified" not in str(exc):
-                                log.warning(f"result edit failed → {chat} lid={_upd_lid}: {exc}")
+                            _any_edited = True
+                            log.info(f"✅ Result updated: lid={_upd_lid} {_h}v{_a} → {result_str}")
+                        except Exception as _ex:
+                            if "Message is not modified" in str(_ex):
+                                _any_edited = True   # already correct, count as done
+                            else:
+                                log.warning(f"result edit failed → {_ru_chat} {_h}v{_a}: {_ex}")
 
-            _processed_keys.append(_upd_key)
-            log.info(f"✅ Results updated for lid={_upd_lid} rid={_upd_rid}")
+            if _any_edited:
+                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
+                _done_keys.append(_upd_key)
+            elif not _any_msg_ids_found and _stored_cards:
+                # Cards exist but no message IDs (lost on redeploy) — mark done so it doesn't block forever
+                bot_data[f"results_updated_{_upd_lid}_{_upd_rid}"] = True
+                log.warning(f"⚠️ result_update: lid={_upd_lid} rid={_upd_rid} — no msg IDs found, marking done")
+                _done_keys.append(_upd_key)
 
-        # Clean up processed updates
-        for k in _processed_keys:
-            _pending_updates.pop(k, None)
+        for _dk in _done_keys:
+            _pending_updates.pop(_dk, None)
 
 
 async def _standings_job(context):
@@ -13097,6 +13244,7 @@ async def _do_brainstat(message, c):
 
 async def cmd_brainstat(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(u.effective_user.id):
+        await u.message.reply_text("🔒 Admin only.")
         return
     await _do_brainstat(u.message, c)
 
