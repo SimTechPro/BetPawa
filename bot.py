@@ -3667,14 +3667,25 @@ def predict_match(home: str, away: str, stats: dict,
     conf = round(min(97.0, blended_conf * agree_mult + all_agree_bonus + lock_bonus + _algo_bonus), 1)
 
     # ── Margin band calibration: what % of picks at THIS confidence level were correct? ──
+    # Advisory: "A true 90% model should hit ~85-90%, not 45%."
+    # Fix: make band correction MUCH stronger when miscalibrated.
     margin_acc  = model.get("margin_acc", {}) if model else {}
     conf_bucket = str(int(conf // 5) * 5)
     band_rec    = margin_acc.get(conf_bucket, [0, 0])
     if band_rec[1] >= 10:
         band_acc    = band_rec[0] / band_rec[1]
-        # If this band has been right 70%+, small boost. If below 45%, pull down.
-        band_nudge  = (band_acc - 0.55) * 15   # -1.5 to +6.75 pts
-        conf        = round(min(97.0, max(50.0, conf + band_nudge)), 1)
+        # STRONGER calibration: if this band's actual accuracy is far below the
+        # confidence level, pull confidence DOWN toward reality aggressively.
+        # Previous: nudge ±1.5 to +6.75 pts — too weak for 45% actual at 90% conf.
+        # New: use a proportional pull — confidence approaches actual accuracy
+        # weighted by how much data we have (more data = stronger pull).
+        data_weight = min(1.0, band_rec[1] / 50.0)   # 0→50+ samples: 0→1.0
+        # Pull conf toward band_acc * 100, with strength proportional to data
+        target_conf  = band_acc * 100.0
+        pull_strength = data_weight * 0.45   # up to 45% pull at 50+ samples
+        conf = round(min(97.0, max(45.0,
+                         conf * (1 - pull_strength) + target_conf * pull_strength
+                         )), 1)
 
     # ── Learning velocity bonus: recent 10 rounds doing better than overall? ──
     recent_10_acc = model.get("recent_10_acc", 0.0) if model else 0.0
@@ -3696,6 +3707,19 @@ def predict_match(home: str, away: str, stats: dict,
         conf = round(max(50.0, conf - calib * 0.30), 1)
     elif calib < -3:
         conf = round(min(97.0, conf - calib * 0.15), 1)
+
+    # ── Confidence decay: reduce aggression when system is underperforming ──
+    # Advisory: "If system is losing: reduce aggression automatically"
+    # When recent-10 accuracy drops >5% below overall → apply a decay factor
+    # that pulls confidence toward a more conservative level.
+    if model and r10_total >= 20:
+        _overall_acc_now = model.get("outcome_acc", 0.0)
+        _decay_gap = _overall_acc_now - recent_10_acc   # positive = recent worse than overall
+        if _decay_gap > 0.05:
+            # System is underperforming recently — scale down confidence
+            _decay_factor = min(0.15, _decay_gap * 1.5)   # up to 15% reduction
+            conf = round(max(50.0, conf * (1.0 - _decay_factor)), 1)
+            log.debug(f"📉 Confidence decay applied: gap={_decay_gap:.1%} → conf reduced by {_decay_factor:.0%}")
 
     # ── 9. Side markets — use odds if available, else blend stats + learned rates ─
     p  = hst["p"] or 1
@@ -3840,6 +3864,22 @@ def predict_match(home: str, away: str, stats: dict,
         _confirm_checks = _checks
         _confirm_rate   = (sum(1 for _, ok in _checks if ok) / len(_checks)
                            if _checks else 0.0)
+
+        # ── Trap detection: all signals too perfect → suspicious ──────────────
+        # Advisory: "All markets high confidence → reduce confidence (possible trap)"
+        # When ALL 4 checks agree AND confidence is very high, reduce slightly.
+        # The "too obvious" result is historically less reliable than a split result.
+        _n_checks_total = len(_checks)
+        _n_checks_agree = sum(1 for _, ok in _checks if ok)
+        if (_n_checks_total >= 3 and _n_checks_agree == _n_checks_total and conf >= 80):
+            # All signals unanimous AND very high confidence — potential trap
+            # Apply a small trap penalty (not a block — just a nudge toward reality)
+            _trap_reduction = min(5.0, (conf - 75) * 0.25)
+            conf = round(max(60.0, conf - _trap_reduction), 1)
+            log.debug(
+                f"🚨 All-agree trap: {home} v {away} — "
+                f"{_n_checks_agree}/{_n_checks_total} signals, conf={conf}%"
+            )
 
     return dict(
         hsc=hsc, asc=asc,
@@ -7133,6 +7173,207 @@ LEARNING_RATE   = 0.04   # how fast weights shift per round (smaller = more stab
 MIN_WEIGHT      = 0.05   # no signal ever drops below this
 MAX_WEIGHT      = 0.70   # no single signal dominates above this
 
+# ─── MARKET CONFIDENCE SCORE ENGINE ──────────────────────────────────────────
+# Dynamically selects the best-performing market for each prediction.
+# Uses rolling accuracy × stability factor, with a penalty when a market
+# has recently degraded. Implements the advisory's "Market Selection Engine".
+#
+# Markets: "1x2", "btts_yes", "over25", "dc"
+# Score = model_confidence × historical_accuracy × stability_factor × recency_weight
+# If best score < MARKET_MIN_EDGE → skip the match (NO BET)
+
+MARKET_MIN_EDGE = 0.48   # minimum final score to publish any market pick
+                          # (prevents publishing when no market has real edge)
+
+def _market_rolling_acc(model: dict, market: str) -> tuple[float, int]:
+    """
+    Returns (rolling_accuracy, sample_size) for a given market using a
+    weighted blend: 60% recent-10, 30% recent-50, 10% all-time.
+    Markets: '1x2', 'btts_yes', 'btts_no', 'over25', 'under25'.
+    Falls back to all-time only when recent data is thin.
+    """
+    ai = model.get("ai_brain", {})
+    mkt_acc = ai.get("market_acc", {})
+    cum     = model.get("cumulative", {})
+
+    if market == "1x2":
+        # Use signal_acc odds as proxy for 1X2 accuracy
+        sig_acc = model.get("signal_acc", {})
+        rec = sig_acc.get("odds", {"correct": 0, "total": 0})
+        total   = rec.get("total", 0)
+        correct = rec.get("correct", 0)
+        recent  = rec.get("recent", [])  # last 50 outcomes (1/0)
+        if total == 0:
+            return 0.38, 0
+        # r10: last 10 entries in recent list
+        r10_data = recent[-10:] if len(recent) >= 10 else recent
+        r50_data = recent[-50:] if len(recent) >= 50 else recent
+        r10_acc  = (sum(r10_data) / len(r10_data)) if r10_data else (correct / total)
+        r50_acc  = (sum(r50_data) / len(r50_data)) if r50_data else (correct / total)
+        all_acc  = correct / total
+        blended  = 0.6 * r10_acc + 0.3 * r50_acc + 0.1 * all_acc
+        return blended, total
+
+    elif market in ("btts_yes", "btts_no", "over25", "under25"):
+        rec = mkt_acc.get(market, {"correct": 0, "total": 0})
+        total   = rec.get("total", 0)
+        correct = rec.get("correct", 0)
+        if total == 0:
+            # Fall back to cumulative BTTS/O25 acc
+            if "btts" in market:
+                bt = cum.get("btts_total", 0); bc = cum.get("btts_correct", 0)
+                return (bc / bt if bt > 0 else 0.50), bt
+            else:
+                ot = cum.get("over25_total", 0); oc = cum.get("over25_correct", 0)
+                return (oc / ot if ot > 0 else 0.50), ot
+        return correct / total, total
+
+    return 0.38, 0
+
+
+def _market_stability(sample_size: int) -> float:
+    """
+    Returns a stability factor 0.0–1.0.
+    Small samples are unreliable → low stability.
+    100+ samples → fully stable.
+    """
+    return min(1.0, sample_size / 100.0)
+
+
+def _market_recency_penalty(model: dict, market: str) -> float:
+    """
+    Returns a penalty multiplier 0.7–1.0.
+    If a market's recent-10 accuracy has dropped >10% vs its long-run average,
+    apply a penalty to its selection score (market switching logic).
+    """
+    ai = model.get("ai_brain", {})
+    mkt_acc = ai.get("market_acc", {})
+    sig_acc = model.get("signal_acc", {})
+
+    if market == "1x2":
+        rec = sig_acc.get("odds", {"correct": 0, "total": 0, "recent": []})
+        recent  = rec.get("recent", [])
+        total   = rec.get("total", 0)
+        correct = rec.get("correct", 0)
+        if total < 20 or len(recent) < 10:
+            return 1.0
+        long_run = correct / total
+        r10_acc  = sum(recent[-10:]) / 10
+        drop = long_run - r10_acc
+    else:
+        rec   = mkt_acc.get(market, {"correct": 0, "total": 0})
+        total = rec.get("total", 0)
+        if total < 20:
+            return 1.0
+        long_run = rec.get("correct", 0) / total
+        # For non-1X2 markets we don't have recent[] — use 1.0 (no penalty)
+        return 1.0
+
+    # If recent dropped more than 10% → apply penalty
+    if drop > 0.10:
+        penalty = min(0.30, drop * 1.5)   # up to 30% penalty
+        return 1.0 - penalty
+    return 1.0
+
+
+def _compute_market_scores(model: dict, p: dict) -> dict[str, float]:
+    """
+    Compute a composite score for each market for this specific match.
+    Score = model_confidence × historical_accuracy × stability × recency_mult
+
+    Returns dict: {"1x2": 0.41, "btts_yes": 0.57, "over25": 0.54, ...}
+    The caller picks the market with the highest score (if above MARKET_MIN_EDGE).
+    """
+    scores = {}
+
+    # ── 1X2 ───────────────────────────────────────────────────────────────────
+    conf_1x2 = p.get("conf", 50.0) / 100.0
+    acc_1x2, n_1x2 = _market_rolling_acc(model, "1x2")
+    stab_1x2  = _market_stability(n_1x2)
+    rcnt_1x2  = _market_recency_penalty(model, "1x2")
+    # Signal agreement bonus: how many of odds/fp/momentum agree?
+    n_agree_1x2 = sum(1 for _, ok in p.get("confirm_checks", []) if ok)
+    n_total_chk = len(p.get("confirm_checks", [])) or 1
+    agree_mult  = 0.85 + 0.15 * (n_agree_1x2 / n_total_chk)
+    scores["1x2"] = conf_1x2 * acc_1x2 * stab_1x2 * rcnt_1x2 * agree_mult
+
+    # ── BTTS YES ──────────────────────────────────────────────────────────────
+    btts_prob = p.get("btts", 50.0)
+    if btts_prob >= 55:
+        conf_btts = btts_prob / 100.0
+        acc_btts, n_btts = _market_rolling_acc(model, "btts_yes")
+        stab_btts  = _market_stability(n_btts)
+        rcnt_btts  = _market_recency_penalty(model, "btts_yes")
+        scores["btts_yes"] = conf_btts * acc_btts * stab_btts * rcnt_btts
+    else:
+        scores["btts_yes"] = 0.0
+
+    # ── BTTS NO ───────────────────────────────────────────────────────────────
+    if btts_prob <= 40:
+        conf_btts_no = (100.0 - btts_prob) / 100.0
+        acc_btts_no, n_btts_no = _market_rolling_acc(model, "btts_no")
+        stab_btts_no = _market_stability(n_btts_no)
+        scores["btts_no"] = conf_btts_no * acc_btts_no * stab_btts_no
+    else:
+        scores["btts_no"] = 0.0
+
+    # ── OVER 2.5 ─────────────────────────────────────────────────────────────
+    over25_prob = p.get("over25", 50.0)
+    if over25_prob >= 55:
+        conf_ou = over25_prob / 100.0
+        acc_ou, n_ou = _market_rolling_acc(model, "over25")
+        stab_ou  = _market_stability(n_ou)
+        rcnt_ou  = _market_recency_penalty(model, "over25")
+        scores["over25"] = conf_ou * acc_ou * stab_ou * rcnt_ou
+    else:
+        scores["over25"] = 0.0
+
+    # ── UNDER 2.5 ────────────────────────────────────────────────────────────
+    if over25_prob <= 40:
+        conf_u25 = (100.0 - over25_prob) / 100.0
+        acc_u25, n_u25 = _market_rolling_acc(model, "under25")
+        scores["under25"] = conf_u25 * acc_u25 * _market_stability(n_u25)
+    else:
+        scores["under25"] = 0.0
+
+    return scores
+
+
+def _best_market(model: dict, p: dict) -> tuple[str | None, float, str]:
+    """
+    Returns (market_key, score, label) for the best market, or (None, 0, '')
+    if no market clears MARKET_MIN_EDGE (→ skip this match).
+
+    market_key: '1x2', 'btts_yes', 'btts_no', 'over25', 'under25'
+    label:      display string e.g. 'BTTS YES  62%  📈 edge'
+    """
+    scores  = _compute_market_scores(model, p)
+    best_mkt = max(scores, key=scores.get)
+    best_score = scores[best_mkt]
+
+    # Multi-market agreement bonus: if 2+ markets score well, raise confidence
+    above_edge = [m for m, s in scores.items() if s >= MARKET_MIN_EDGE]
+    if len(above_edge) >= 2:
+        best_score = min(best_score * 1.05, 0.99)
+
+    if best_score < MARKET_MIN_EDGE:
+        return None, best_score, ""
+
+    labels = {
+        "1x2":      f"1X2",
+        "btts_yes": f"BTTS YES",
+        "btts_no":  f"BTTS NO",
+        "over25":   f"OVER 2.5",
+        "under25":  f"UNDER 2.5",
+    }
+    label = labels.get(best_mkt, best_mkt.upper())
+    return best_mkt, best_score, label
+
+
+def _signal_agreement_count(p: dict) -> int:
+    """Count how many signals agree with the predicted tip direction."""
+    return sum(1 for _, ok in p.get("confirm_checks", []) if ok)
+
 
 def _get_model(bot_data: dict, league_id: int) -> dict:
     """Get the current learned model for a league, or defaults.
@@ -7429,30 +7670,53 @@ def _apply_algo_signals(hw: float, dw: float, aw: float,
 
     # ── Engine 2: Fixture Cycle Detector ─────────────────────────────────────
     # Same teams meeting repeatedly may cycle: HOME→DRAW→AWAY→HOME→...
+    # Advisory: "if pattern occurs < 3 times → IGNORE" — prevents overfitting
+    # rare cycles. Also apply recency weighting: recent patterns > old patterns.
     fk = _fixture_key(home, away)
     pm = model.get("pattern_memory", {}).get(fk, {})
     outcome_seq = pm.get("outcome_seq", [])
+    # Minimum frequency guard: need at least 6 data points to detect a cycle
+    # (3 full cycles of length 2, or 2 full cycles of length 3).
+    # Advisory: "if pattern occurs < 3 times → IGNORE — you're currently overfitting rare cycles."
+    _pm_total = pm.get("n", 0) if isinstance(pm, dict) else len(outcome_seq)
+    if _pm_total < 6:
+        outcome_seq = []   # not enough data — suppress cycle detection
     cycle_len, cycle_conf = _detect_cycle(outcome_seq)
     if cycle_len > 0 and cycle_conf >= 0.80:
-        # Next in cycle
-        next_pos = len(outcome_seq) % cycle_len
-        pattern  = outcome_seq[-cycle_len:]
-        predicted = pattern[next_pos]
-        # Weight the cycle prediction by confidence
-        cycle_weight = (cycle_conf - 0.75) * 4   # 0.80 → 0.20, 0.95 → 0.80
-        if predicted == "HOME":
-            hw = hw * (1 - cycle_weight) + 1.0 * cycle_weight
-            dw = dw * (1 - cycle_weight)
-            aw = aw * (1 - cycle_weight)
-        elif predicted == "DRAW":
-            dw = dw * (1 - cycle_weight) + 1.0 * cycle_weight
-            hw = hw * (1 - cycle_weight)
-            aw = aw * (1 - cycle_weight)
-        else:  # AWAY
-            aw = aw * (1 - cycle_weight) + 1.0 * cycle_weight
-            hw = hw * (1 - cycle_weight)
-            dw = dw * (1 - cycle_weight)
-        algo_bonus += cycle_conf * 10   # up to +9.5 pts when cycle_conf=0.95
+        # Recency check: verify the cycle held in the LAST 3 occurrences specifically.
+        # If the last 3 don't fit the pattern, the cycle may have broken → reduce weight.
+        _recent3 = outcome_seq[-3:] if len(outcome_seq) >= 3 else outcome_seq
+        _pattern = outcome_seq[-cycle_len:]
+        _recent_hits = sum(
+            1 for i, o in enumerate(outcome_seq[-3:])
+            if o == _pattern[(len(outcome_seq) - 3 + i) % cycle_len]
+        )
+        _recency_ok = _recent_hits >= 2   # at least 2 of last 3 match → cycle still active
+        if not _recency_ok:
+            cycle_conf *= 0.60   # penalise stale cycle heavily
+        if cycle_conf < 0.80:
+            # After recency penalty the cycle is no longer trustworthy — skip
+            pass
+        else:
+            # Next in cycle
+            next_pos = len(outcome_seq) % cycle_len
+            pattern  = outcome_seq[-cycle_len:]
+            predicted = pattern[next_pos]
+            # Weight the cycle prediction by confidence
+            cycle_weight = (cycle_conf - 0.75) * 4   # 0.80 → 0.20, 0.95 → 0.80
+            if predicted == "HOME":
+                hw = hw * (1 - cycle_weight) + 1.0 * cycle_weight
+                dw = dw * (1 - cycle_weight)
+                aw = aw * (1 - cycle_weight)
+            elif predicted == "DRAW":
+                dw = dw * (1 - cycle_weight) + 1.0 * cycle_weight
+                hw = hw * (1 - cycle_weight)
+                aw = aw * (1 - cycle_weight)
+            else:  # AWAY
+                aw = aw * (1 - cycle_weight) + 1.0 * cycle_weight
+                hw = hw * (1 - cycle_weight)
+                dw = dw * (1 - cycle_weight)
+            algo_bonus += cycle_conf * 10   # up to +9.5 pts when cycle_conf=0.95
 
     # ── Engine 3: Round-ID Modulo Pattern ────────────────────────────────────
     # If PRNG is seeded from round_id, then (round_id % N) may correlate with outcomes.
@@ -7660,6 +7924,26 @@ def _ai_postmatch_analysis(
         elif over25_prob <= 40:
             market_acc["under25"]["total"] += 1
             if not actual_over25: market_acc["under25"]["correct"] += 1
+
+        # ── 4b. Best-market selection accuracy ───────────────────────────────
+        # Track whether the Market Confidence Engine's chosen market was correct.
+        # This feeds back into the engine's own calibration over time.
+        _best_mkt_chosen = pred.get("best_market")
+        if _best_mkt_chosen:
+            _mkt_sel_acc = ai.setdefault("market_sel_acc", {})
+            _mkt_rec = _mkt_sel_acc.setdefault(_best_mkt_chosen, {"correct": 0, "total": 0})
+            _mkt_rec["total"] += 1
+            # Determine if best_market prediction was correct
+            if _best_mkt_chosen == "1x2":
+                if correct: _mkt_rec["correct"] += 1
+            elif _best_mkt_chosen == "btts_yes":
+                if actual_btts: _mkt_rec["correct"] += 1
+            elif _best_mkt_chosen == "btts_no":
+                if not actual_btts: _mkt_rec["correct"] += 1
+            elif _best_mkt_chosen == "over25":
+                if actual_over25: _mkt_rec["correct"] += 1
+            elif _best_mkt_chosen == "under25":
+                if not actual_over25: _mkt_rec["correct"] += 1
 
         # ── 5. Per-fixture memory record ──────────────────────────────────────
         # Every piece of data about this match is saved. The AI uses 6-10+ records
@@ -9299,17 +9583,23 @@ def _learn_from_round(bot_data: dict, league_id: int,
 
         # ── Signal accuracy tracking ──────────────────────────────────────────
         sa = model.setdefault("signal_acc", {
-            "odds":     {"correct": 0, "total": 0},
-            "poisson":  {"correct": 0, "total": 0},
-            "strength": {"correct": 0, "total": 0},
+            "odds":     {"correct": 0, "total": 0, "recent": []},
+            "poisson":  {"correct": 0, "total": 0, "recent": []},
+            "strength": {"correct": 0, "total": 0, "recent": []},
         })
         for sig_name in ("odds", "poisson", "strength"):
             tip = pred.get(f"{sig_name}_tip")
             if tip:
-                sa.setdefault(sig_name, {"correct": 0, "total": 0})
+                sa.setdefault(sig_name, {"correct": 0, "total": 0, "recent": []})
                 sa[sig_name]["total"] += 1
-                if tip == ft_out:
+                _hit = (tip == ft_out)
+                if _hit:
                     sa[sig_name]["correct"] += 1
+                # Maintain rolling recent[] list (last 50) for r10/r50 blending
+                _recent = sa[sig_name].setdefault("recent", [])
+                _recent.append(1 if _hit else 0)
+                if len(_recent) > 50:
+                    _recent.pop(0)
 
     if n_matches == 0:
         return
@@ -9352,15 +9642,26 @@ def _learn_from_round(bot_data: dict, league_id: int,
     fp_count = sum(len(v) for v in fp_db.values())
 
     # ── Update signal weights from accumulated signal_acc data ───────────────
-    # Once any signal has ≥50 samples its accuracy drives weight adjustment.
-    # More accurate signal gets more weight; less accurate gets trimmed.
+    # Advisory: "Use dynamic weighting based on recent performance (r10):
+    #             weight = recent_accuracy * stability"
+    # Blended accuracy = 60% r10 + 40% all-time for each signal.
     # Weights are bounded: MIN_WEIGHT(5%) to MAX_WEIGHT(70%).
     sa = model.get("signal_acc", {})
     _sa_accs = {}
     for _sig in ("odds", "poisson", "strength"):
-        _rec = sa.get(_sig, {"correct": 0, "total": 0})
-        if _rec["total"] >= 50:
-            _sa_accs[_sig] = _rec["correct"] / _rec["total"]
+        _rec = sa.get(_sig, {"correct": 0, "total": 0, "recent": []})
+        _total = _rec.get("total", 0)
+        if _total >= 20:   # lowered from 50 — respond faster to recent changes
+            _all_time = _rec["correct"] / _total
+            _recent50 = _rec.get("recent", [])[-50:]
+            _r10      = _recent50[-10:] if len(_recent50) >= 10 else _recent50
+            _r10_acc  = (sum(_r10) / len(_r10)) if _r10 else _all_time
+            _r50_acc  = (sum(_recent50) / len(_recent50)) if _recent50 else _all_time
+            # Blend: 60% r10 + 30% r50 + 10% all-time (advisory formula)
+            _stability = min(1.0, _total / 100.0)
+            _blended   = 0.60 * _r10_acc + 0.30 * _r50_acc + 0.10 * _all_time
+            # Stability multiplier: small samples → closer to prior; large → trust blended
+            _sa_accs[_sig] = _blended * _stability + _all_time * (1 - _stability)
 
     if len(_sa_accs) >= 2:
         weights = model.setdefault("weights", dict(DEFAULT_WEIGHTS))
@@ -9383,7 +9684,7 @@ def _learn_from_round(bot_data: dict, league_id: int,
                 for _sig in ("odds", "poisson", "strength"):
                     weights[_sig] = round(weights.get(_sig, 0) / _wsum, 4)
             log.info(
-                f"⚖️  [{league_id}] Weights updated: "
+                f"⚖️  [{league_id}] Weights updated (r10-blended): "
                 f"Odds={weights.get('odds',0):.0%} "
                 f"Pois={weights.get('poisson',0):.0%} "
                 f"Str={weights.get('strength',0):.0%}"
@@ -11707,6 +12008,47 @@ async def _run_auto_post(bot, bot_data: dict):
                     if not (_top_fire and _overall_confirms and _htft_agrees and _mom_ok):
                         continue  # ❌ Direction-confirm filter — skip this match
 
+                    # ── Market Confidence Score Engine ─────────────────────────
+                    # Dynamically pick the best-performing market.
+                    # If no market clears the minimum edge threshold → skip.
+                    _best_mkt, _best_mkt_score, _best_mkt_label = _best_market(league_model, p)
+                    if _best_mkt is None:
+                        log.info(
+                            f"auto_post [{lid}]: {m['home']} v {m['away']} — "
+                            f"NO BET (best market score {_best_mkt_score:.3f} < "
+                            f"{MARKET_MIN_EDGE:.2f} threshold)"
+                        )
+                        continue  # ❌ No market has sufficient edge — skip
+
+                    # Signal agreement check: require ≥ 1 agreeing signal
+                    # (the odds signal alone counts — it's the primary driver)
+                    _n_agree = _signal_agreement_count(p)
+                    if _n_agree == 0 and len(p.get("confirm_checks", [])) >= 2:
+                        log.info(
+                            f"auto_post [{lid}]: {m['home']} v {m['away']} — "
+                            f"NO BET (0/{len(p.get('confirm_checks', []))} signals agree)"
+                        )
+                        continue  # ❌ All signals disagree → reject
+
+                    # Store best market for learning
+                    round_preds[-1]["best_market"]       = _best_mkt
+                    round_preds[-1]["best_market_score"] = round(_best_mkt_score, 3)
+
+                    # Build market score display line
+                    _mkt_scores_all = _compute_market_scores(league_model, p)
+                    _mkt_display_parts = []
+                    for _mk_k in ("1x2", "btts_yes", "over25"):
+                        _mk_s = _mkt_scores_all.get(_mk_k, 0.0)
+                        if _mk_s > 0.30:
+                            _mk_icon = "🔥" if _mk_k == _best_mkt else ("✅" if _mk_s >= MARKET_MIN_EDGE else "")
+                            _mk_names = {"1x2": "1X2", "btts_yes": "BTTS", "over25": "O2.5"}
+                            _mkt_display_parts.append(f"{_mk_icon}{_mk_names[_mk_k]}:{_mk_s:.2f}")
+                    _mkt_score_line = (
+                        f"┆ 📊 Mkt: {' │ '.join(_mkt_display_parts)}  "
+                        f"→ *{_best_mkt_label}* selected\n"
+                        if _mkt_display_parts else ""
+                    )
+
                     # ── Gate scores summary line ───────────────────────────────
                     _gate_line = (
                         f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -11714,7 +12056,8 @@ async def _run_auto_post(bot, bot_data: dict):
                         f"┆ G2 Band:  {_g2_label}\n"
                         f"┆ G3 Hist:  {_g3_label}\n"
                         f"┆ G4 Form:  {_g4_label}\n"
-                        f"┆ 🎯 Overall: *{_overall}%* — {_overall_label}\n"
+                        + _mkt_score_line
+                        + f"┆ 🎯 Overall: *{_overall}%* — {_overall_label}\n"
                         f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
 
@@ -12751,6 +13094,22 @@ def _ai_brain_status_line(model: dict) -> str:
         r10 = f" r10={sum(recent[-10:])/10:.0%}" if len(recent) >= 10 else ""
         return f"{c/t:.0%}({c}/{t}){r10}"
 
+    # Market selection accuracy (from Market Confidence Engine)
+    _mkt_sel = ai.get("market_sel_acc", {})
+    _mkt_sel_str_parts = []
+    for _ms_k, _ms_label in (("1x2","1X2"),("btts_yes","BTTS"),("over25","O2.5"),("under25","U2.5")):
+        _ms_rec = _mkt_sel.get(_ms_k, {})
+        _ms_t   = _ms_rec.get("total", 0)
+        _ms_c   = _ms_rec.get("correct", 0)
+        if _ms_t >= 3:
+            _ms_dot = "🟢" if _ms_c/_ms_t >= 0.58 else "🟡" if _ms_c/_ms_t >= 0.45 else "🔴"
+            _mkt_sel_str_parts.append(f"{_ms_dot}{_ms_label}:{_ms_c}/{_ms_t}={_ms_c/_ms_t:.0%}")
+    _mkt_sel_block = (
+        f"│ 🎰 *Market Engine (selected accuracy)*\n"
+        f"│    {' │ '.join(_mkt_sel_str_parts)}\n│\n"
+        if _mkt_sel_str_parts else ""
+    )
+
     line = (
         f"│ 🤖 *AI BRAIN — What it has learned*\n"
         f"│{'─'*38}\n"
@@ -12773,6 +13132,7 @@ def _ai_brain_status_line(model: dict) -> str:
         f"│    {wstr}\n"
         + (f"│    (last AI re-evaluation: round #{ai_evals})\n" if ai_evals else "")
         + f"│\n"
+        + _mkt_sel_block
         + (f"│ 🎯 *Odds-band accuracy*\n" + "\n".join(band_lines) + "\n│\n" if band_lines else "")
         + (f"│ 🏆 *Tier-pair accuracy*\n" + "\n".join(tier_pair_lines) + "\n│\n" if tier_pair_lines else "")
         + (f"│ 🔴 *Recent mistakes (AI is learning from these)*\n" + "\n".join(recent_wrong_lines) + "\n" if recent_wrong_lines else "")
@@ -13241,6 +13601,35 @@ async def _do_brainstat(message, c):
         _traj_line = (f"│ 🔬 Trajectory: {' · '.join(_traj_parts)}\n"
                       if _traj_parts else "│ 🔬 Trajectory: building (need 5+ samples)\n")
 
+        # ── Market confidence score summary ───────────────────────────────────
+        # Show each market's rolling accuracy × stability score so admin can
+        # see which market the engine is currently favouring / penalising.
+        _mkt_score_parts = []
+        for _mkt_k, _mkt_label in (("1x2","1X2"), ("btts_yes","BTTS"), ("over25","O2.5")):
+            _mkt_rolling, _mkt_n = _market_rolling_acc(model, _mkt_k)
+            _mkt_stab  = _market_stability(_mkt_n)
+            _mkt_rcnt  = _market_recency_penalty(model, _mkt_k)
+            _mkt_raw   = _mkt_rolling * _mkt_stab * _mkt_rcnt
+            _mkt_dot   = "🟢" if _mkt_rolling >= 0.58 else "🟡" if _mkt_rolling >= 0.48 else "🔴"
+            _mkt_score_parts.append(
+                f"{_mkt_dot}{_mkt_label}:{_mkt_rolling:.0%}(n={_mkt_n},stab={_mkt_stab:.1f})"
+            )
+        # Market selection accuracy (from best_market learning)
+        _ai_data_ms = model.get("ai_brain", {})
+        _mkt_sel_acc_data = _ai_data_ms.get("market_sel_acc", {})
+        _mkt_sel_parts = []
+        for _ms_k, _ms_label in (("1x2","1X2"),("btts_yes","BTTS"),("over25","O2.5")):
+            _ms_rec = _mkt_sel_acc_data.get(_ms_k, {})
+            _ms_t   = _ms_rec.get("total", 0)
+            _ms_c   = _ms_rec.get("correct", 0)
+            if _ms_t >= 5:
+                _ms_dot = "🟢" if _ms_c/_ms_t >= 0.58 else "🟡" if _ms_c/_ms_t >= 0.45 else "🔴"
+                _mkt_sel_parts.append(f"{_ms_dot}{_ms_label}:{_ms_c}/{_ms_t}={_ms_c/_ms_t:.0%}")
+        _mkt_sel_line = (f"│ 🎰 Mkt sel acc: {' │ '.join(_mkt_sel_parts)}\n"
+                         if _mkt_sel_parts else "")
+        _mkt_line = (f"│ 📊 Mkt scores: {' │ '.join(_mkt_score_parts)}\n"
+                     + _mkt_sel_line) if _mkt_score_parts else ""
+
         league_lines.append(
             f"┌ {linfo['flag']} *{linfo['name']}*  {_status_icon(ts)} *{ts*100:.0f}%*\n"
             f"│ {_bar(ts)} → 100%\n"
@@ -13258,6 +13647,7 @@ async def _do_brainstat(message, c):
             + (f"│ ⚠️ High-conf mistakes: {hcm}\n" if hcm >= 3 else "")
             + f"│ ⚖️ Wts: Odds {w.get('odds',0):.0%}  Pois {w.get('poisson',0):.0%}  Str {w.get('strength',0):.0%}\n"
             + _traj_line
+            + _mkt_line
             # AI brain diagnostics
             + _ai_brain_status_line(model)
             # Algorithm reverse-engineering status
