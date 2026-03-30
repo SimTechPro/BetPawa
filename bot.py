@@ -3089,10 +3089,14 @@ def _strategy_analyze_match(home: str, away: str,
     )
 
     # Determine cycle type for learning
+    # NOTE: reason strings use "STRONG lost" and "WEAK won" (all caps) but also
+    # "Weak {team} ... won" (capital-W-only) — must match both forms.
     _cycle_type = None
-    if "STRONG lost" in reason or "strong_lost" in reason:
+    _reason_lower = reason.lower()
+    if "strong lost" in _reason_lower or "strong_lost" in _reason_lower:
         _cycle_type = "strong_lost"
-    elif "WEAK won" in reason or "weak_won" in reason:
+    elif "weak won" in _reason_lower or "weak_won" in _reason_lower or (
+         "weak" in _reason_lower and " won" in _reason_lower):
         _cycle_type = "weak_won"
 
     return {
@@ -12490,15 +12494,20 @@ async def _data_collector_job(context):
                                 ev_odds, league_model
                             )
                             preds.append({
-                                "home":           nm["home"],
-                                "away":           nm["away"],
-                                "tip":            p["tip"],
-                                "conf":           p.get("conf", 50.0),
-                                "btts_pred":      p.get("btts", 50.0) >= 50,
-                                "btts_prob":      p.get("btts", 50.0),
-                                "over25_pred":    p.get("over25", 50.0) >= 50,
-                                "over25_prob":    p.get("over25", 50.0),
-                                "_odds_snapshot": ev_odds,
+                                "home":                   nm["home"],
+                                "away":                   nm["away"],
+                                "tip":                    p["tip"],
+                                "conf":                   p.get("conf", 50.0),
+                                "btts_pred":              p.get("btts", 50.0) >= 50,
+                                "btts_prob":              p.get("btts", 50.0),
+                                "over25_pred":            p.get("over25", 50.0) >= 50,
+                                "over25_prob":            p.get("over25", 50.0),
+                                "_odds_snapshot":         ev_odds,
+                                # Trajectory: tag so backfill updates trajectory_stats
+                                "trajectory_cycle_type":  _get_collector_trajectory_cycle(
+                                    nm["home"], nm["away"], league_model,
+                                    bot_data.get(f"standings_{lid}", {})
+                                ),
                             })
                             ht_h, ht_a = _extract_ht_score(e)
                             results.append({
