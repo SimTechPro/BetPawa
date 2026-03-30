@@ -10286,19 +10286,14 @@ async def _run_auto_post(bot, bot_data: dict):
                     if _tip_g == "DRAW":
                         continue
 
-                    # ── ODDS REPEAT — SOFT GATE ───────────────────────────────
-                    # Primary: matched repeat → full TRIPLE-CONFIRM applies.
-                    # Fallback: no repeat data yet (sparse history) → allow through
-                    # but TRIPLE-CONFIRM will apply a lighter check (fire + momentum
-                    # only). This keeps predictions flowing while fp_db/odds_store
-                    # fills up. Once history is rich enough, repeat will start
-                    # matching and the full strict gate re-engages automatically.
+                    # ── ODDS REPEAT — HARD GATE ───────────────────────────────
                     _fp_db_gate = league_model.get("fingerprint_db", {})
                     _repeat_chk = _detect_odds_repeat(
                         _fp_db_gate, m["home"], m["away"], ev_odds,
                         league_id=lid, bot_data=bot_data
                     )
-                    _has_repeat = _repeat_chk.get("matched", False)
+                    if not _repeat_chk.get("matched"):
+                        continue  # ❌ No odds repeat — skip this match
 
                     # ── INFO: Strategy (view only, never blocks) ──────────────
                     _strat_standings = bot_data.get(f"standings_{lid}", {})
@@ -10621,31 +10616,17 @@ async def _run_auto_post(bot, bot_data: dict):
                         else:                _overall_label = "🔴 WEAK SIGNAL"
 
                     # ── TRIPLE-CONFIRM FILTER (direction-agnostic) ───────────
-                    # When odds repeat is found (rich history):
-                    #   ALL four conditions must pass — full strict mode.
+                    # Only post picks where ALL confirm the tip direction:
                     #   1. Top-line has 🔥
                     #   2. Repeat dominant outcome matches tip (HOME or AWAY)
                     #   3. HT/FT verified in repeat AND outcome matches tip
                     #   4. Momentum: predicted winner win% >= 60 (stable/rising)
                     #               predicted loser  win% <= 30 (stable/falling)
-                    #
-                    # When no repeat match yet (sparse history / building up):
-                    #   Lighter gate — only 🔥 + momentum required.
-                    #   Repeat-dependent checks (2 & 3) are bypassed until history
-                    #   fills in. This is progressive: as fp_db/odds_store grows,
-                    #   matches will start hitting the repeat check and the full
-                    #   strict mode re-engages automatically without any code change.
                     _repeat_outcome   = _repeat.get("outcome", "")   # "HOME" / "AWAY"
                     _htft_in_repeat   = "HT/FT" in _repeat.get("markets_matched", [])
                     _top_fire         = bool(_fire)
-                    if _has_repeat:
-                        # Full strict gate — repeat data available
-                        _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
-                        _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
-                    else:
-                        # Lightweight fallback — no repeat data yet, bypass repeat checks
-                        _overall_confirms = True
-                        _htft_agrees      = True
+                    _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
+                    _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
                     # Momentum gate — based on each team's own win%, not tip direction
                     if _has_mom:
                         if _tip_g == "HOME":
