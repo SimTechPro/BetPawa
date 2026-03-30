@@ -10653,17 +10653,44 @@ async def _run_auto_post(bot, bot_data: dict):
                         f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
 
-                    # ── Final card ────────────────────────────────────────────
+                    # ── Tip odds (1X2 price for the predicted outcome) ────────
+                    _1x2_odds = ev_odds.get("1x2", {})
+                    if _tip_g == "HOME":
+                        _tip_price = _1x2_odds.get("1")
+                    elif _tip_g == "AWAY":
+                        _tip_price = _1x2_odds.get("2")
+                    else:
+                        _tip_price = _1x2_odds.get("X")
+                    _odds_str = f"  {p['icon']}{_tip_price:.2f}" if _tip_price else ""
+
+                    # ── Scores from repeat block ──────────────────────────────
+                    _scores_str = ""
+                    if _repeat.get("matched") and _repeat.get("score_history"):
+                        _sl = _repeat["score_history"]
+                        _scores_display = "  ·  ".join(_sl[:3])
+                        if len(_sl) > 3:
+                            _scores_display += f"  (+{len(_sl)-3} more)"
+                        _scores_str = f"┆ 📊 Scores (HT/FT): `{_scores_display}`\n"
+
+                    # ── Elite/repeat tier line (1 line only) ──────────────────
+                    _tier_line = ""
+                    if _repeat.get("matched"):
+                        _tier      = _repeat.get("tier", "")
+                        _cons_pct  = _repeat.get("consistency_pct", 0)
+                        _tier_line = f"┆ {_tier} — {_cons_pct}%\n" if _tier else ""
+
+                    # ── Final card (minimized) ────────────────────────────────
                     card = (
                         f"*{m['home']}  v  {m['away']}*\n"
-                        f"{p['icon']} *{p['tip']}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
-                        f"🏠{p['hw']:.0f}%  🤝{p['dw']:.0f}%  ✈️{p['aw']:.0f}%\n"
-                        + market_lines
-                        + _fc_line
-                        + _mom_line
-                        + _strategy_line
-                        + _repeat_line
-                        + _gate_line
+                        f"{p['icon']} *{p['tip']}{_fire}*  {p['conf']:.0f}%{_hist_tag}\n"
+                        f"{_odds_str} {_fc_line.strip()}\n"
+                        f"┆\n"
+                        + _tier_line
+                        + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        + _scores_str
+                        + f"┆\n"
+                        + f"┆ 🎯 Overall: {_overall}% — {_overall_label}\n"
+                        + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                         + f"{result_str}\n"
                     )
                     body += card + "─────────────────\n"
