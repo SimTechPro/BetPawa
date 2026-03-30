@@ -4350,100 +4350,171 @@ def _detect_odds_repeat(fp_db: dict, home: str, away: str,
         return {"matched": False, "repeat_count": repeat_count,
                 "fail_reason": f"CROSS-CHECK 3 FAILED: {consistency_pct}% consistent (need 67%+)"}
 
-    # ── RECENCY CHECK: detect if pattern has cycled ──────────────────────────
-    # ── MAINTENANCE CHECK ──────────────────────────────────────────────────
-    # A fixture goes under maintenance the moment its most recent result
-    # contradicts the dominant outcome. It only returns to predictions when
-    # the 2 most recent results BOTH match the dominant outcome — confirming
-    # the direction is genuinely restored, not just a one-off recovery.
+    # ── WIN-CYCLE + GOAL-GAP DETECTION ───────────────────────────────────────
+    #
+    # TWO signals tracked together for every same-odds fixture:
+    #
+    #  1. WIN DIRECTION — HOME / AWAY per meeting (goals don't change this:
+    #     0-2 and 1-4 are both AWAY wins — same slot in the win cycle).
+    #
+    #  2. GOAL GAP — abs(score_h - score_a).  A shrinking gap while the
+    #     dominant team is still winning is a STRENGTH-SHIFT WARNING: the
+    #     underdog is closing in and may reverse the next time same odds appear.
+    #
+    # Five cases (checked in priority order):
+    #
+    #  CASE E — Strict alternating cycle (A→B→A→B) confirmed → predict next flip.
+    #
+    #  CASE B — Gap compressing: dominant still winning BUT margin consistently
+    #            shrinking toward 0 (last 3+ gaps trending down, final gap ≤ 1).
+    #            → SKIP. After next meeting re-evaluate fresh.
+    #
+    #  CASE A — Stable: win direction solid AND gap not compressing → allow.
+    #
+    #  CASE C — Single win broke dominant (run_len == 1), no prior gap compression
+    #            → lone upset → SKIP, wait for ≥2 consecutive in new direction.
+    #
+    #  CASE D — ≥2 consecutive wins in new direction → shift confirmed → follow.
+    #
+    # Your example:
+    #   Meetings:  0-2  1-4  1-3  |  2-2  1-2  2-3  4-4
+    #   Wins:      AWAY AWAY AWAY  |  DRAW AWAY AWAY DRAW
+    #   Gaps:        2    3    2   |   0    1    1    0
+    #   Last 4 gaps = [2,0,1,0]: more drops than rises, final=0 → COMPRESS → SKIP.
+    #   Next meeting HOME wins → run_len=1 → CASE C: still skip.
+    #   Meeting after: HOME wins again → run_len=2 → CASE D: predict HOME. ✅
+
     _sorted_verified = sorted(
         [q for q in verified if q["record"].get("outcome")],
         key=lambda q: int(q["record"].get("round_id", 0) or 0),
         reverse=True
     )
-    if len(_sorted_verified) >= 2:
-        _r1 = _sorted_verified[0]["record"].get("outcome")
-        _r2 = _sorted_verified[1]["record"].get("outcome")
-        if not (_r1 == dominant_out and _r2 == dominant_out):
-            return {"matched": False, "repeat_count": repeat_count,
-                    "fail_reason": f"MAINTENANCE: last 2 [{_r1},{_r2}] — need both {dominant_out} to restore"}
 
-    # ── FLIP-CYCLE DETECTION ──────────────────────────────────────────────────
-    # Scenario: historically weak team beat the strong one (the "flip").
-    # This signals a potential strength shift. If the outcome sequence shows
-    # a confirmed alternating / flip-cycle pattern, we must NOT blindly repeat
-    # the old dominant outcome — we follow the cycle's next expected step.
-    #
-    # Three sub-cases:
-    #   A. Exactly 1 flip in the last 2 results → lone upset, skip (MAINTENANCE
-    #      already catches this above — this block handles 3+ record sequences).
-    #   B. Alternating cycle confirmed (e.g. AWAY→HOME→AWAY→HOME) with ≥3 rounds
-    #      → predict the NEXT step in the cycle, not the historical dominant.
-    #   C. Single flip with no prior data to confirm direction → skip entirely
-    #      (wait for next meeting to re-confirm direction).
-    if len(_sorted_verified) >= 3:
-        _seq_outcomes = [q["record"].get("outcome") for q in reversed(_sorted_verified)
-                         if q["record"].get("outcome")]
-        # Build the deduplicated alternation sequence to detect flip cycles
-        # e.g. [AWAY, AWAY, HOME, AWAY, HOME] → flip pattern emerging
-        _last = _seq_outcomes[-1]   # most recent result
-        _prev = _seq_outcomes[-2]   # result before that
-        _older = _seq_outcomes[-3]  # result before that
+    # Build parallel sequences oldest → newest
+    _seq     = []   # "HOME" / "AWAY" / "DRAW"
+    _gap_seq = []   # abs goal difference, or None if scores missing
+    for _q in reversed(_sorted_verified):
+        _rec = _q["record"]
+        _out = _rec.get("outcome")
+        if not _out:
+            continue
+        _seq.append(_out)
+        _sh = _rec.get("score_h")
+        _sa = _rec.get("score_a")
+        if _sh is not None and _sa is not None:
+            try:
+                _gap_seq.append(abs(int(_sh) - int(_sa)))
+            except (TypeError, ValueError):
+                _gap_seq.append(None)
+        else:
+            _gap_seq.append(None)
 
-        _is_flip = (_last != dominant_out)   # latest broke the dominant pattern
-        _prev_also_flipped = (_prev != dominant_out)
+    if not _seq:
+        return {"matched": False, "repeat_count": repeat_count,
+                "fail_reason": "WIN-CYCLE: no confirmed outcomes in sequence"}
 
-        if _is_flip and not _prev_also_flipped:
-            # Single flip after a dominant run → team gained strength, direction uncertain.
-            # Check if this is a known alternating cycle (AWAY→HOME→AWAY→...)
-            _alt_detected = False
-            if len(_seq_outcomes) >= 4:
-                # Alternating: every other result flips
-                _evens = _seq_outcomes[-4::2]   # positions 0, 2 from tail
-                _odds  = _seq_outcomes[-3::2]   # positions 1, 3 from tail
-                _even_same = len(set(_evens)) == 1
-                _odd_same  = len(set(_odds))  == 1
-                if _even_same and _odd_same and _evens[0] != _odds[0]:
-                    # Confirmed alternating cycle — predict next step
-                    _cycle_next = _evens[0]  # next expected = the other side of the alternation
-                    _alt_detected = True
-                    log.info(
-                        f"🔄 FLIP-CYCLE [{home}|{away}]: alternating confirmed "
-                        f"seq={_seq_outcomes[-4:]} → next expected={_cycle_next}"
-                    )
-                    # Override dominant_out to follow the cycle
-                    dominant_out      = _cycle_next
-                    consistency_count = _seq_outcomes.count(_cycle_next)
-                    total_known       = len(_seq_outcomes)
-                    consistency_pct   = round(consistency_count / total_known * 100)
-                    out_label         = {"HOME": "Home WIN", "AWAY": "Away WIN",
-                                         "DRAW": "Draw"}.get(dominant_out, dominant_out)
+    _last  = _seq[-1]
+    _n_seq = len(_seq)
 
-            if not _alt_detected:
-                # Single flip, no confirmed cycle yet → skip prediction entirely.
-                # Wait for next meeting to confirm new direction.
-                log.info(
-                    f"⏭️  FLIP-CYCLE SKIP [{home}|{away}]: last result {_last} broke "
-                    f"dominant {dominant_out} — seq={_seq_outcomes[-4:]} — "
-                    f"waiting for next meeting to confirm new direction"
-                )
-                return {
-                    "matched":      False,
-                    "repeat_count": repeat_count,
-                    "fail_reason":  (
-                        f"FLIP-CYCLE: {_last} broke dominant {dominant_out} — "
-                        f"team gained strength. Skipping until next meeting confirms direction."
-                    ),
-                }
+    # Current consecutive run at the tail (win direction)
+    _run_dir = _last
+    _run_len = 0
+    for _o in reversed(_seq):
+        if _o == _run_dir:
+            _run_len += 1
+        else:
+            break
 
-        elif _is_flip and _prev_also_flipped:
-            # Two consecutive flips = the new direction is now the dominant.
-            # Let it fall through — dominant_out is already recalculated from
-            # outcome_counts, which will now point to the new winner.
+    # ── Goal-gap compression check ────────────────────────────────────────────
+    # Compressing = last 3+ known gaps trend downward AND most recent gap ≤ 1.
+    def _gap_compressing(gaps):
+        known = [g for g in gaps if g is not None]
+        if len(known) < 3:
+            return False
+        recent = known[-4:]
+        if recent[-1] > 1:
+            return False   # final gap still wide — no real compression
+        drops = sum(1 for i in range(1, len(recent)) if recent[i] < recent[i-1])
+        rises = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
+        return drops > rises
+
+    _gap_compress = _gap_compressing(_gap_seq)
+
+    # ── CASE E: Strict alternating cycle — highest priority ───────────────────
+    _alt_detected = False
+    if _n_seq >= 4:
+        _evens = _seq[-4::2]
+        _odds  = _seq[-3::2]
+        if (len(set(_evens)) == 1 and len(set(_odds)) == 1
+                and _evens[0] != _odds[0]):
+            _next_alt = _evens[0]
+            _alt_detected = True
             log.info(
-                f"↩️  FLIP-CONFIRMED [{home}|{away}]: 2 consecutive flips — "
-                f"new dominant={dominant_out}, seq={_seq_outcomes[-4:]}"
+                f"🔄 WIN-CYCLE ALTERNATING [{home}|{away}]: "
+                f"seq={_seq[-4:]} gaps={_gap_seq[-4:]} → next={_next_alt}"
             )
+            dominant_out      = _next_alt
+            consistency_count = _seq.count(_next_alt)
+            total_known       = _n_seq
+            consistency_pct   = round(consistency_count / total_known * 100)
+
+    if not _alt_detected:
+
+        if _gap_compress and _run_dir == dominant_out:
+            # CASE B: dominant still winning but goal gap compressing → SKIP
+            log.info(
+                f"⏭️  WIN-CYCLE GAP-COMPRESS [{home}|{away}]: "
+                f"dominant={dominant_out} winning but margin shrinking — "
+                f"win seq={_seq[-6:]} gaps={_gap_seq[-6:]} — skip until confirmed"
+            )
+            return {
+                "matched":      False,
+                "repeat_count": repeat_count,
+                "fail_reason":  (
+                    f"WIN-CYCLE GAP-COMPRESS: {dominant_out} still winning but "
+                    f"goal gap compressing (recent gaps={_gap_seq[-4:]}). "
+                    f"Underdog gaining strength — skipping. Re-evaluate after "
+                    f"next meeting confirms direction."
+                ),
+            }
+
+        elif _run_dir == dominant_out:
+            # CASE A: stable, no compression — predict dominant direction
+            log.info(
+                f"✅ WIN-CYCLE STABLE [{home}|{away}]: "
+                f"run={_run_len}x {_run_dir} gaps={_gap_seq[-4:]} seq={_seq[-6:]}"
+            )
+            # dominant_out already correct — fall through
+
+        elif _run_len == 1:
+            # CASE C: single break, no prior compression → lone upset → SKIP
+            log.info(
+                f"⏭️  WIN-CYCLE UNCONFIRMED [{home}|{away}]: "
+                f"last={_last} broke dominant={dominant_out}, run_len=1 — "
+                f"seq={_seq[-6:]} gaps={_gap_seq[-6:]} — need ≥2 to confirm"
+            )
+            return {
+                "matched":      False,
+                "repeat_count": repeat_count,
+                "fail_reason":  (
+                    f"WIN-CYCLE UNCONFIRMED: {_last} broke dominant {dominant_out}. "
+                    f"Only 1 result in new direction — need ≥2 consecutive to confirm. "
+                    f"Skipping until next meeting confirms direction."
+                ),
+            }
+
+        else:
+            # CASE D: ≥2 consecutive in new direction → shift confirmed
+            log.info(
+                f"↩️  WIN-CYCLE SHIFT [{home}|{away}]: "
+                f"{_run_len}x {_run_dir} confirmed — "
+                f"old dominant={dominant_out} → new={_run_dir} "
+                f"seq={_seq[-6:]} gaps={_gap_seq[-6:]}"
+            )
+            dominant_out      = _run_dir
+            consistency_count = _run_len
+            total_known       = _n_seq
+            consistency_pct   = round(_run_len / _n_seq * 100)
 
     # ── All checks passed ─────────────────────────────────────────────────────
     match_pct = round(n_matched / n_available * 100)
@@ -7274,6 +7345,42 @@ def _market_recency_penalty(model: dict, market: str) -> float:
         penalty = min(0.30, drop * 1.5)   # up to 30% penalty
         return 1.0 - penalty
     return 1.0
+
+
+def _league_dominant_market(model: dict) -> tuple[str, float] | tuple[None, None]:
+    """
+    Dynamically determines THIS league's currently strongest market.
+    Evaluated live from the model on every call — the result can flip each time
+    the learning engine updates (1X2 strong this week → BTTS leads next week →
+    O2.5 takes over the week after).  Each league is evaluated independently.
+
+    Returns (market_key, composite_score) where market_key is:
+        '1x2'      → league is currently best at win/draw/loss calls
+        'btts_yes' → league is currently best at both-teams-score calls
+        'over25'   → league is currently best at over-2.5-goals calls
+
+    composite_score = rolling_accuracy × stability  (0.0 – 1.0)
+
+    Returns (None, None) only when there is insufficient data (< 50 samples).
+
+    Used in the auto-post gate layer: after a prediction passes ALL gates, the
+    final market attached is whichever this specific league is best at RIGHT NOW
+    — provided the match-level probability also qualifies (≥ 55% threshold).
+    This is per-league, not global: Germany can favour BTTS while England favours
+    1X2 in the same round.
+    """
+    candidates = {}
+    for mkt in ("1x2", "btts_yes", "over25"):
+        acc, n = _market_rolling_acc(model, mkt)
+        if n < 50:      # too thin to trust
+            continue
+        candidates[mkt] = acc * _market_stability(n)
+
+    if not candidates:
+        return None, None
+
+    best = max(candidates, key=candidates.get)
+    return best, round(candidates[best], 4)
 
 
 def _compute_market_scores(model: dict, p: dict) -> dict[str, float]:
@@ -12009,43 +12116,75 @@ async def _run_auto_post(bot, bot_data: dict):
                         continue  # ❌ Direction-confirm filter — skip this match
 
                     # ── Market Confidence Score Engine ─────────────────────────
-                    # Dynamically pick the best-performing market.
-                    # If no market clears the minimum edge threshold → skip.
+                    # This prediction has PASSED ALL GATES for this league.
+                    # Now select the market to publish it under:
+                    #
+                    # Step 1 — Check which market this league is CURRENTLY strongest
+                    #           in (dynamic: can be 1X2 one round, BTTS next, O2.5
+                    #           after that — changes as the model learns each round).
+                    # Step 2 — If that dominant market also has a valid match-level
+                    #           probability (btts ≥55% or over25 ≥55%), use it —
+                    #           the prediction earned it by passing all gates AND
+                    #           the league confirms strength in that market right now.
+                    # Step 3 — Otherwise fall back to _best_market (highest per-match
+                    #           composite score across all markets).
+                    # Step 4 — If nothing clears MARKET_MIN_EDGE → skip (no bet).
+                    _dom_mkt_league, _dom_mkt_score = _league_dominant_market(league_model)
+                    _mkt_scores_raw = _compute_market_scores(league_model, p)
+
+                    # Always pick the best per-match market — dominant market is NOT
+                    # a gate, it is used only as a confirmation annotation below.
                     _best_mkt, _best_mkt_score, _best_mkt_label = _best_market(league_model, p)
+                    _dom_applied = False  # kept for display-compat; never drives selection
+
+                    # Market engine: info-only, never a hard gate.
+                    # A prediction reaching here has already passed Odds Repeat
+                    # (≥4 markets ±5%, ≥67% consistency, win-cycle confirmed) and
+                    # TRIPLE-CONFIRM (🔥 fp_db, HT/FT, direction, momentum).
+                    # That IS "earned it". The market scorer needs ~100 rounds to
+                    # stabilise — blocking before that discards real signals on a
+                    # data-volume technicality. Fall back to 1X2 when model is cold.
                     if _best_mkt is None:
                         log.info(
                             f"auto_post [{lid}]: {m['home']} v {m['away']} — "
-                            f"NO BET (best market score {_best_mkt_score:.3f} < "
-                            f"{MARKET_MIN_EDGE:.2f} threshold)"
+                            f"market engine cold (score {_best_mkt_score:.3f}), "
+                            f"defaulting to 1X2 — prediction earned via cycle+gate"
                         )
-                        continue  # ❌ No market has sufficient edge — skip
+                        _best_mkt       = "1x2"
+                        _best_mkt_score = p.get("conf", 50.0) / 100.0
+                        _best_mkt_label = "1X2"
 
-                    # Signal agreement check: require ≥ 1 agreeing signal
-                    # (the odds signal alone counts — it's the primary driver)
-                    _n_agree = _signal_agreement_count(p)
-                    if _n_agree == 0 and len(p.get("confirm_checks", [])) >= 2:
-                        log.info(
-                            f"auto_post [{lid}]: {m['home']} v {m['away']} — "
-                            f"NO BET (0/{len(p.get('confirm_checks', []))} signals agree)"
-                        )
-                        continue  # ❌ All signals disagree → reject
+                    # Signal agreement: shown on card, not a blocking gate.
+                    _n_agree = _signal_agreement_count(p)  # card display only
 
                     # Store best market for learning
                     round_preds[-1]["best_market"]       = _best_mkt
                     round_preds[-1]["best_market_score"] = round(_best_mkt_score, 3)
 
                     # Build market score display line
-                    _mkt_scores_all = _compute_market_scores(league_model, p)
+                    # _mkt_scores_raw already computed above — reuse it
                     _mkt_display_parts = []
+                    _dom_names = {"btts_yes": "BTTS", "over25": "O2.5", "1x2": "1X2"}
                     for _mk_k in ("1x2", "btts_yes", "over25"):
-                        _mk_s = _mkt_scores_all.get(_mk_k, 0.0)
+                        _mk_s = _mkt_scores_raw.get(_mk_k, 0.0)
                         if _mk_s > 0.30:
                             _mk_icon = "🔥" if _mk_k == _best_mkt else ("✅" if _mk_s >= MARKET_MIN_EDGE else "")
                             _mk_names = {"1x2": "1X2", "btts_yes": "BTTS", "over25": "O2.5"}
-                            _mkt_display_parts.append(f"{_mk_icon}{_mk_names[_mk_k]}:{_mk_s:.2f}")
+                            # ⭐ marks the league's current dominant market
+                            _dom_tag = "⭐" if _mk_k == _dom_mkt_league else ""
+                            _mkt_display_parts.append(f"{_mk_icon}{_dom_tag}{_mk_names[_mk_k]}:{_mk_s:.2f}")
+                    # Show dominant market as a confirmation tag — never drives selection
+                    _dom_note = (
+                        f" _(✅ league dom: {_dom_names.get(_dom_mkt_league, '?')} confirms)_"
+                        if _dom_mkt_league and _dom_mkt_league == _best_mkt
+                        else (
+                            f" _(ℹ️ league dom: {_dom_names.get(_dom_mkt_league, '?')})_"
+                            if _dom_mkt_league else ""
+                        )
+                    )
                     _mkt_score_line = (
                         f"┆ 📊 Mkt: {' │ '.join(_mkt_display_parts)}  "
-                        f"→ *{_best_mkt_label}* selected\n"
+                        f"→ *{_best_mkt_label}* selected{_dom_note}\n"
                         if _mkt_display_parts else ""
                     )
 
