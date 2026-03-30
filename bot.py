@@ -12248,18 +12248,65 @@ async def _run_auto_post(bot, bot_data: dict):
                             _traj_conf_line += f"┆ 🔄 Trajectory: {_tdot} {_ta:.0%}, {_all_tt} samples\n"
                         # else: hide — not enough data yet
 
-                    # ── Final card ────────────────────────────────────────────
+                    # ── FILTER: only post 100% All agree predictions ──────────
+                    if _crate < 1.0:
+                        log.info(
+                            f"auto_post [{lid}]: {m['home']} v {m['away']} — "
+                            f"skipped (confirm_rate={_crate:.0%}, not 100% All agree)"
+                        )
+                        continue
+
+                    # ── Final card (simplified) ───────────────────────────────
+                    # Build repeat/elite lock line (compact)
+                    _repeat_info = ""
+                    if _repeat_line:
+                        # Extract the odds value for the tip direction
+                        _o1x2_tip = odds.get("1x2", {})
+                        _tip_odd  = (
+                            _o1x2_tip.get("1") if _tip_g == "HOME" else
+                            _o1x2_tip.get("2") if _tip_g == "AWAY" else
+                            _o1x2_tip.get("X")
+                        )
+                        _tip_dir_icon = (
+                            "🏠" if _tip_g == "HOME" else
+                            "✈️" if _tip_g == "AWAY" else
+                            "🤝"
+                        )
+                        _odd_str  = f"{_tip_dir_icon}{_tip_odd}  " if _tip_odd else ""
+                        _fp_res2  = p.get("fp_result", {}) or {}
+                        _rep_n    = _fp_res2.get("n_samples", 0)
+                        _rep_pct  = round(_fp_res2.get("pool_vote_rate", 0) * 100)
+                        _repeat_info = f"┆ {_odd_str}💎 ELITE LOCK — {_rep_pct}%\n"
+
+                    # Build score history line (compact, max 3 scores shown)
+                    _score_hist_line = ""
+                    _fp_res3 = p.get("fp_result", {}) or {}
+                    _sc_list = _fp_res3.get("score_samples", [])
+                    if _sc_list:
+                        _sc_strs = []
+                        for _sc in _sc_list[:3]:
+                            _sh2 = _sc.get("score_h"); _sa2 = _sc.get("score_a")
+                            _hh2 = _sc.get("ht_h");    _ha2 = _sc.get("ht_a")
+                            if _sh2 is not None and _sa2 is not None:
+                                if _hh2 is not None and _ha2 is not None:
+                                    _sc_strs.append(f"{_hh2}-{_ha2}({_sh2}-{_sa2})")
+                                else:
+                                    _sc_strs.append(f"{_sh2}-{_sa2}")
+                        _extra = len(_sc_list) - 3
+                        if _sc_strs:
+                            _sc_line = "  ·  ".join(_sc_strs)
+                            if _extra > 0:
+                                _sc_line += f"  (+{_extra} more)"
+                            _score_hist_line = f"┆    📊 Scores (HT/FT): {_sc_line}\n"
+
                     card = (
-                        f"*{m['home']}  v  {m['away']}*\n"
-                        f"{p['icon']} *{p['tip']}{_fire}*  {p['conf']:.0f}%{_hist_tag}{_svw_tag}\n"
-                        f"🏠{p['hw']:.0f}%  🤝{p['dw']:.0f}%  ✈️{p['aw']:.0f}%\n"
-                        + market_lines
-                        + _fc_line
-                        + _mom_line
-                        + _strategy_line
-                        + _repeat_line
-                        + _traj_conf_line
-                        + _gate_line
+                        f"{p['icon']} *{p['tip']}{_fire}*  {p['conf']:.0f}%{_hist_tag}\n"
+                        + (_repeat_info if _repeat_info else "")
+                        + "┆\n"
+                        + _score_hist_line
+                        + f"┆ 🔍 Confirm: █████ 100%  🟢 All agree\n"
+                        + f"┆ 🎯 Overall: *{_overall}%* — {_overall_label}\n"
+                        + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                         + f"{result_str}\n"
                     )
                     body += card + "─────────────────\n"
