@@ -12248,14 +12248,6 @@ async def _run_auto_post(bot, bot_data: dict):
                             _traj_conf_line += f"┆ 🔄 Trajectory: {_tdot} {_ta:.0%}, {_all_tt} samples\n"
                         # else: hide — not enough data yet
 
-                    # ── FILTER: only post 100% All agree predictions ──────────
-                    if _crate < 1.0:
-                        log.info(
-                            f"auto_post [{lid}]: {m['home']} v {m['away']} — "
-                            f"skipped (confirm_rate={_crate:.0%}, not 100% All agree)"
-                        )
-                        continue
-
                     # ── Final card (simplified) ───────────────────────────────
                     # Build repeat/elite lock line (compact)
                     _repeat_info = ""
@@ -12304,7 +12296,6 @@ async def _run_auto_post(bot, bot_data: dict):
                         + (_repeat_info if _repeat_info else "")
                         + "┆\n"
                         + _score_hist_line
-                        + f"┆ 🔍 Confirm: █████ 100%  🟢 All agree\n"
                         + f"┆ 🎯 Overall: *{_overall}%* — {_overall_label}\n"
                         + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                         + f"{result_str}\n"
