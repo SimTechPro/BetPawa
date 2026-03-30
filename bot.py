@@ -10688,6 +10688,7 @@ async def _run_auto_post(bot, bot_data: dict):
                         + _tier_line
                         + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
                         + _scores_str
+                        + _mom_line
                         + f"┆\n"
                         + f"┆ 🎯 Overall: {_overall}% — {_overall_label}\n"
                         + f"┆ ━━━━━━━━━━━━━━━━━━━━━━━\n"
