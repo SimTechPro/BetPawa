@@ -10400,7 +10400,8 @@ async def _run_auto_post(bot, bot_data: dict):
                         _winner_trend = _at_g; _loser_trend = _ht_g
                     if _has_mom:
                         _mom_gap = _winner_mom - _loser_mom
-                        # RISING=60+  FALLING=30-  STABLE=31-59
+                        # G4 gate uses momentum SCORE (0–100) — already incorporates
+                        # opponent quality + match order from the momentum engine
                         if _winner_mom >= 60 and _mom_gap >= 25:
                             _g4_score = round(min(65 + _mom_gap * 0.3, 92))
                             _g4_label = f"✅ {_winner_mom:.0f}% vs {_loser_mom:.0f}% (+{_mom_gap:.0f}%)"
@@ -10547,25 +10548,17 @@ async def _run_auto_post(bot, bot_data: dict):
                         _htr = _hmom.get("trend", "STABLE")
                         _atr = _amom.get("trend", "STABLE")
 
-                        # Strict trend thresholds:
-                        # RISING  = 60%+  FALLING = 30%-  STABLE = 31-59%
-                        if _hwp >= 60:
-                            _hti = "📈 rising"
-                        elif _hwp <= 30:
-                            _hti = "📉 falling"
-                        else:
-                            _hti = "➡️ stable"
-
-                        if _awp >= 60:
-                            _ati = "📈 rising"
-                        elif _awp <= 30:
-                            _ati = "📉 falling"
-                        else:
-                            _ati = "➡️ stable"
+                        # Use quality-weighted trend from momentum engine (not raw win%)
+                        # trend = RISING/FALLING/STABLE based on second_half vs first_half
+                        # quality points — this correctly captures match ORDER and
+                        # opponent strength, not just cumulative win percentage.
+                        _TREND_ICON = {"RISING": "📈", "FALLING": "📉", "STABLE": "➡️"}
+                        _hti = f"{_TREND_ICON.get(_htr, '➡️')} {_htr.lower()}"
+                        _ati = f"{_TREND_ICON.get(_atr, '➡️')} {_atr.lower()}"
 
                         _mom_line = (
-                            f"┆ {m['home']} → {_hti} {_hwp:.0f}% wins\n"
-                            f"┆ {m['away']} → {_ati} {_awp:.0f}% wins\n"
+                            f"┆ {m['home']} → {_hti} ({_hwp:.0f}% wins)\n"
+                            f"┆ {m['away']} → {_ati} ({_awp:.0f}% wins)\n"
                         )
 
                     # ── Strategy analysis ─────────────────────────────────────
