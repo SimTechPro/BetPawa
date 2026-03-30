@@ -10620,15 +10620,29 @@ async def _run_auto_post(bot, bot_data: dict):
                     _top_fire         = bool(_fire)
                     _overall_confirms = (_tip_g in ("HOME", "AWAY")) and (_repeat_outcome == _tip_g)
                     _htft_agrees      = _htft_in_repeat and (_repeat_outcome == _tip_g)
-                    # Momentum gate — based on each team's own win%, not tip direction
+                    # Momentum gate — uses quality-weighted score + trend direction,
+                    # consistent with the card display (not raw win%).
+                    # Rules:
+                    #   winner must have score >= 45 OR trend != FALLING
+                    #   loser  must have score <= 65 OR trend != RISING
+                    # Prevents: rising underdog with 17% wins from being wrongly blocked,
+                    # and falling favourite with 83% wins from passing unfairly.
                     if _has_mom:
                         if _tip_g == "HOME":
-                            _winner_wp = _hm_g.get("win_pct", 0)
-                            _loser_wp  = _am_g.get("win_pct", 0)
+                            _winner_score  = _hm_g.get("score", 50)
+                            _winner_trnd_g = _hm_g.get("trend", "STABLE")
+                            _loser_score   = _am_g.get("score", 50)
+                            _loser_trnd_g  = _am_g.get("trend", "STABLE")
                         else:
-                            _winner_wp = _am_g.get("win_pct", 0)
-                            _loser_wp  = _hm_g.get("win_pct", 0)
-                        _mom_ok = (_winner_wp >= 60) and (_loser_wp <= 30)
+                            _winner_score  = _am_g.get("score", 50)
+                            _winner_trnd_g = _am_g.get("trend", "STABLE")
+                            _loser_score   = _hm_g.get("score", 50)
+                            _loser_trnd_g  = _hm_g.get("trend", "STABLE")
+                        # Winner must not be in freefall: score OK or at least not FALLING
+                        _winner_ok = (_winner_score >= 45) or (_winner_trnd_g != "FALLING")
+                        # Loser must not be surging: score OK or at least not RISING
+                        _loser_ok  = (_loser_score  <= 65) or (_loser_trnd_g  != "RISING")
+                        _mom_ok = _winner_ok and _loser_ok
                     else:
                         _mom_ok = True  # no momentum data yet — allow through
 
