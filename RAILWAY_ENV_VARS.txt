@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RAILWAY ENVIRONMENT VARIABLES — Sports Go Bot
+#  Add these in Railway → Your Project → Variables
+#  Lines starting with # are comments — do NOT paste them into Railway.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ── REQUIRED ──────────────────────────────────────────────────────────────────
+
+# Your Telegram bot token from @BotFather
+BOT_TOKEN=123456789:ABCdefGhIjKlmNoPqRsTuVwXyZ
+
+# Your Telegram numeric user ID (get it from @userinfobot on Telegram)
+# This makes you the admin — you can add/remove subscribers, see stats, etc.
+ADMIN_ID=987654321
+
+# Secret key shared between the Android app and the bot server.
+# The app sends this in the x-app-key header on every API request.
+# Make it long and random — e.g. generate with: python -c "import secrets; print(secrets.token_hex(32))"
+APP_API_KEY=your_random_secret_key_here
+
+
+# ── OPTIONAL BUT RECOMMENDED ──────────────────────────────────────────────────
+
+# Your Telegram channel or group ID where the bot posts predictions.
+# Get it by adding @userinfobot to your channel, or forward a message to it.
+# Use a negative number for groups/channels, e.g. -1001234567890
+CHANNEL_ID=-1001234567890
+
+# betPawa session cookie — needed for some authenticated API endpoints.
+# Get it from your browser DevTools → Application → Cookies → betpawa.ug
+# Copy the full cookie string (everything after "Cookie: ")
+# If left empty the bot still works but some endpoints may return 401.
+BETPAWA_COOKIE=__cf_bm=...; _ga=...; session=...
+
+# Port the bot's HTTP server listens on. Railway maps this automatically.
+# Default is 8080 — only change if you have a specific reason.
+APP_HTTP_PORT=8080
+
+
+# ── FIREBASE (optional — enables cloud backup & restore) ──────────────────────
+# Without Firebase the bot still works fully; it just saves state to disk only.
+# With Firebase: subscriptions, devices, predictions survive Railway restarts.
+
+# Option A — paste your Firebase service account JSON as a single-line string.
+# Get it from Firebase Console → Project Settings → Service Accounts → Generate new private key
+# Then minify the JSON: python -c "import json,sys; print(json.dumps(json.load(open('serviceAccount.json'))))"
+FIREBASE_KEY_JSON={"type":"service_account","project_id":"...","private_key_id":"...","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n","client_email":"...","client_id":"...","auth_uri":"...","token_uri":"...","auth_provider_x509_cert_url":"...","client_x509_cert_url":"..."}
+
+# Option B — path to service account JSON file (if you mount it as a volume).
+# Leave blank if using FIREBASE_KEY_JSON above.
+# FIREBASE_KEY_PATH=/app/serviceAccount.json
+
+# Encryption key for Firebase payload (optional extra security layer).
+# If blank, the bot uses BOT_TOKEN as the encryption key.
+# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+FB_ENCRYPT_KEY=another_random_secret_here
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  QUICK SETUP CHECKLIST
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  Minimum to get the bot running:
+#    ✅ BOT_TOKEN       — from @BotFather
+#    ✅ ADMIN_ID        — your Telegram numeric ID
+#    ✅ APP_API_KEY     — any long random string
+#
+#  To post predictions to a channel:
+#    ✅ CHANNEL_ID      — your channel/group ID
+#
+#  To enable betPawa live data:
+#    ✅ BETPAWA_COOKIE  — from your browser session
+#
+#  To survive Railway restarts (recommended for production):
+#    ✅ FIREBASE_KEY_JSON — from Firebase service account
+#
+#  The Android app's AppConfig.java must have:
+#    SERVER_URL   = "https://<your-railway-domain>"
+#    API_KEY      = same value as APP_API_KEY above
+#
+# ═══════════════════════════════════════════════════════════════════════════════
